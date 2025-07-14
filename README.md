@@ -19,6 +19,8 @@ Tired of paying for sync or trusting a third-party service with your private not
 ---
 
 ## How It Works
+Network Use Disclosure: To facilitate the initial P2P connection, this plugin connects to a public PeerJS signaling server. This server's only job is to help your devices find each other on the network (a process called "signaling"). Your actual notes and data are never sent to or stored on this server; they are transferred directly and securely between your own devices.
+
 Obsidian Decentralized uses **WebRTC** (the technology behind most modern video-conferencing apps) via the **PeerJS** library to establish direct, encrypted data channels between your devices.
 
 When you connect to one peer, a smart **"gossip" protocol** kicks in. Your devices exchange information about other known peers in the network, allowing them to quickly form a fully-connected mesh. This means that even if the initial device you connected to goes offline, sync continues seamlessly between the remaining devices.
