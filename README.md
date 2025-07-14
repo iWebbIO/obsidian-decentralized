@@ -28,12 +28,12 @@ When you connect to one peer, a smart **"gossip" protocol** kicks in. Your devic
 ---
 
 ### Installation
-%% #### From Obsidian's Community Plugin Browser (Recommended)
+#### From Obsidian's Community Plugin Browser (Recommended) [COMING SOON]
 
 1.  Open Obsidian's `Settings`.
 2.  Go to `Community plugins` and ensure "Restricted mode" is turned **off**.
 3.  Click `Browse` and search for "Obsidian Decentralized".
-4.  Click `Install`, and then once it's finished, click `Enable`. %%
+4.  Click `Install`, and then once it's finished, click `Enable`.
 
 #### Manual Installation
 
