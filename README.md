@@ -7,7 +7,7 @@ Tired of paying for sync or trusting a third-party service with your private not
 
 ---
 
-### Key Features
+## Key Features
 *   **💻 True Peer-to-Peer Sync:** Your data is never stored on an intermediary server. It travels directly between your devices.
 *   **🏠 Local-First:** Designed to be exceptionally fast and reliable on your local network.
 *   **🤖 Companion Mode:** "Set it and forget it." Permanently pair two devices (like your desktop and phone) for automatic, resilient connections whenever they're on the same network.
@@ -18,7 +18,7 @@ Tired of paying for sync or trusting a third-party service with your private not
 
 ---
 
-### How It Works
+## How It Works
 Obsidian Decentralized uses **WebRTC** (the technology behind most modern video-conferencing apps) via the **PeerJS** library to establish direct, encrypted data channels between your devices.
 
 When you connect to one peer, a smart **"gossip" protocol** kicks in. Your devices exchange information about other known peers in the network, allowing them to quickly form a fully-connected mesh. This means that even if the initial device you connected to goes offline, sync continues seamlessly between the remaining devices.
@@ -27,15 +27,15 @@ When you connect to one peer, a smart **"gossip" protocol** kicks in. Your devic
 
 ---
 
-### Installation
-#### From Obsidian's Community Plugin Browser (Recommended) [COMING SOON]
+## Installation
+### From Obsidian's Community Plugin Browser (Coming soon ...)
 
 1.  Open Obsidian's `Settings`.
 2.  Go to `Community plugins` and ensure "Restricted mode" is turned **off**.
 3.  Click `Browse` and search for "Obsidian Decentralized".
 4.  Click `Install`, and then once it's finished, click `Enable`.
 
-#### Manual Installation
+### Manual Installation
 
 1.  Download the latest release ZIP file from the [Releases](https://github.com/iWebbIO/obsidian-decentralized/releases) page.
 2.  Unzip the contents into your vault's plugin folder: `<YourVault>/.obsidian/plugins/`.
