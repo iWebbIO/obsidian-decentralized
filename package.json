@@ -1,0 +1,27 @@
+{
+  "name": "obsidian-easy-local-sync",
+  "version": "1.0.0",
+  "description": "A decentralized, P2P sync plugin for Obsidian.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "rollup --config rollup.config.js -w",
+    "build": "rollup --config rollup.config.js --environment BUILD:production"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^18.0.0",
+    "@rollup/plugin-node-resolve": "^11.2.1",
+    "@rollup/plugin-typescript": "^8.2.1",
+    "@types/diff-match-patch": "^1.0.32",
+    "@types/node": "^16.11.6",
+    "@types/qrcode": "^1.5.0",
+    "obsidian": "latest",
+    "rollup": "^2.3.4",
+    "tslib": "^2.3.1",
+    "typescript": "^4.7.4"
+  },
+  "dependencies": {
+    "diff-match-patch": "^1.0.5",
+    "peerjs": "^1.4.7",
+    "qrcode": "^1.5.1"
+  }
+}
