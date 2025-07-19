@@ -48,9 +48,9 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
 
 class LANDiscovery {
     private socket: any | null = null;
-    private broadcastInterval: NodeJS.Timeout | null = null;
+    private broadcastInterval: number | null = null;
     private discoveredPeers: Map<string, PeerInfo> = new Map();
-    private peerTimeouts: Map<string, NodeJS.Timeout> = new Map();
+    private peerTimeouts: Map<string, number> = new Map();
     private discoveryTimeoutMs: number = 5000;
     private _emitter: any;
 
@@ -108,7 +108,7 @@ class LANDiscovery {
                         this.emit('discover', data.peerInfo);
                     }
                     
-                    const timeout = setTimeout(() => {
+                    const timeout = window.setTimeout(() => {
                         this.discoveredPeers.delete(peerId);
                         this.peerTimeouts.delete(peerId);
                         this.emit('lose', data.peerInfo);
@@ -137,7 +137,7 @@ class LANDiscovery {
         };
         
         sendBeacon(); 
-        this.broadcastInterval = setInterval(sendBeacon, 2000); 
+        this.broadcastInterval = window.setInterval(sendBeacon, 2000); 
     }
     
     public stopBroadcasting() {
@@ -178,7 +178,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private pendingDeletions: string[] = [];
     private conflictCenter: ConflictCenter;
     public joinPin: string | null = null;
-    private companionConnectionInterval: NodeJS.Timeout | null = null;
+    private companionConnectionInterval: number | null = null;
 
     async onload() {
         if (!Platform.isMobile) {
@@ -362,7 +362,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         };
     
         attemptConnection();
-        this.companionConnectionInterval = setInterval(attemptConnection, 15000);
+        this.companionConnectionInterval = window.setInterval(attemptConnection, 15000);
+        this.registerInterval(this.companionConnectionInterval);
     }
     
     public async forgetCompanion() {
