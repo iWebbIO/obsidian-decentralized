@@ -3,6 +3,8 @@ import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
 import QRCode from 'qrcode';
 
+// --- Constants and Core Types ---
+
 const DISCOVERY_PORT = 41234;
 const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
 
@@ -33,6 +35,7 @@ interface ObsidianDecentralizedSettings {
     useCustomPeerServer: boolean;
     customPeerServerConfig: PeerServerConfig;
 }
+
 const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     deviceId: `device-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`,
     friendlyName: 'My New Device',
@@ -46,7 +49,38 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     }
 };
 
-class LANDiscovery {
+// --- Platform-Specific Abstraction for LAN Discovery ---
+
+/**
+ * Defines the public interface for LAN Discovery functionality.
+ * This allows us to use a real implementation on Desktop and a dummy one on Mobile
+ * without the rest of the plugin needing to know the diference.
+ */
+interface ILANDiscovery {
+    on(event: string, listener: (...args: any[]) => void): this;
+    startBroadcasting(peerInfo: PeerInfo): void;
+    stopBroadcasting(): void;
+    startListening(): void;
+    stop(): void;
+}
+
+/**
+ * A safe implementation for Mobile platforms.
+ * It doesn't include any Node.js specific code so it won't crash on mobile.
+ */
+class DummyLANDiscovery implements ILANDiscovery {
+    on(event: string, listener: (...args: any[]) => void): this { return this; }
+    startBroadcasting(peerInfo: PeerInfo): void {}
+    stopBroadcasting(): void {}
+    startListening(): void {}
+    stop(): void {}
+}
+
+/**
+ * Implementation of LAN Discovery for Desktop platforms ONLY.
+ * It uses Node.js modules like 'dgram', 'os', and 'events'.
+ */
+class DesktopLANDiscovery implements ILANDiscovery {
     private socket: any | null = null;
     private broadcastInterval: number | null = null;
     private discoveredPeers: Map<string, PeerInfo> = new Map();
@@ -115,7 +149,7 @@ class LANDiscovery {
                     }, this.discoveryTimeoutMs);
                     this.peerTimeouts.set(peerId, timeout);
                 }
-            } catch (e) { }
+            } catch (e) { /* Ignore parsing errors */ }
         });
 
         this.socket.bind(DISCOVERY_PORT);
@@ -125,13 +159,13 @@ class LANDiscovery {
         this.stopBroadcasting(); 
         this.createSocket();
         
-        const beacon = Buffer.from(JSON.stringify({
+        const beaconMessage = JSON.stringify({
             type: 'obsidian-decentralized-beacon',
             peerInfo
-        }));
+        });
 
         const sendBeacon = () => {
-            this.socket?.send(beacon, 0, beacon.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
+            this.socket?.send(beaconMessage, 0, beaconMessage.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
                 if (err) console.error("Beacon send error:", err);
             });
         };
@@ -164,13 +198,14 @@ class LANDiscovery {
     }
 }
 
+// --- Main Plugin Class ---
 
 export default class ObsidianDecentralizedPlugin extends Plugin {
     settings: ObsidianDecentralizedSettings;
     peer: Peer | null = null;
     connections: Map<string, DataConnection> = new Map();
     clusterPeers: Map<string, PeerInfo> = new Map();
-    lanDiscovery: LANDiscovery | undefined;
+    lanDiscovery: ILANDiscovery;
     
     private ignoreNextEventForPath: Set<string> = new Set();
     private statusBar: HTMLElement;
@@ -181,8 +216,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private companionConnectionInterval: number | null = null;
 
     async onload() {
-        if (!Platform.isMobile) {
-            this.lanDiscovery = new LANDiscovery();
+        // This is the crucial part: instantiate the correct class for the current platform.
+        if (Platform.isMobile) {
+            this.lanDiscovery = new DummyLANDiscovery();
+        } else {
+            this.lanDiscovery = new DesktopLANDiscovery();
         }
 
         await this.loadSettings();
@@ -205,7 +243,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     onunload() { 
         this.peer?.destroy(); 
         if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
-        this.lanDiscovery?.stop();
+        this.lanDiscovery.stop(); // Safe to call on both dummy and real implementations
     }
     async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
     async saveSettings() { await this.saveData(this.settings); }
@@ -503,6 +541,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 }
 
+// --- UI Components (Modals, Settings Tab) ---
+
 class ConnectionModal extends Modal {
     private discoveredPeers: Map<string, PeerInfo> = new Map();
     
@@ -514,7 +554,7 @@ class ConnectionModal extends Modal {
     }
 
     onClose() { 
-        this.plugin.lanDiscovery?.stop();
+        this.plugin.lanDiscovery.stop();
         this.contentEl.empty();
     }
 
@@ -540,7 +580,7 @@ class ConnectionModal extends Modal {
     }
 
     showInitialOptions() {
-        this.plugin.lanDiscovery?.stop();
+        this.plugin.lanDiscovery.stop();
         const { contentEl } = this;
         this.modalEl.addClass('obsidian-decentralized-connect-modal');
         contentEl.empty();
@@ -551,7 +591,7 @@ class ConnectionModal extends Modal {
     }
 
     showOneTimeConnection() {
-        this.plugin.lanDiscovery?.stop();
+        this.plugin.lanDiscovery.stop();
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl('h2', { text: 'One-Time Connection' });
@@ -565,11 +605,6 @@ class ConnectionModal extends Modal {
     }
 
     showInviteLAN() {
-        if (!this.plugin.lanDiscovery) {
-            new Notice("LAN Discovery is not available on mobile devices.");
-            return;
-        }
-
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl('h2', { text: 'Invite with PIN (LAN)' });
@@ -601,19 +636,19 @@ class ConnectionModal extends Modal {
             const discoveryListEl = contentEl.createDiv({ cls: 'obsidian-decentralized-cluster-list' });
             const noPeersEl = discoveryListEl.createEl('p', { text: 'Searching for devices...' });
             
-            this.plugin.lanDiscovery?.on('discover', (peerInfo: PeerInfo) => {
+            this.plugin.lanDiscovery.on('discover', (peerInfo: PeerInfo) => {
                 noPeersEl.hide();
                 if (peerInfo.deviceId === this.plugin.settings.deviceId) return;
                 this.discoveredPeers.set(peerInfo.deviceId, peerInfo);
                 this.renderDiscoveredPeers(discoveryListEl);
             });
-            this.plugin.lanDiscovery?.on('lose', (peerInfo: PeerInfo) => {
+            this.plugin.lanDiscovery.on('lose', (peerInfo: PeerInfo) => {
                 this.discoveredPeers.delete(peerInfo.deviceId);
                 this.renderDiscoveredPeers(discoveryListEl);
                 if (this.discoveredPeers.size === 0) { noPeersEl.show(); }
             });
 
-            this.plugin.lanDiscovery?.startListening();
+            this.plugin.lanDiscovery.startListening();
         }
 
         contentEl.createEl('h3', { text: 'Manual Connection' });
@@ -651,7 +686,7 @@ class ConnectionModal extends Modal {
     }
 
     showPinPrompt(peer: PeerInfo) {
-        this.plugin.lanDiscovery?.stop();
+        this.plugin.lanDiscovery.stop();
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl('h2', {text: `Connect to ${peer.friendlyName}`});
@@ -677,7 +712,7 @@ class ConnectionModal extends Modal {
     }
     
     showCompanionSetup() {
-        this.plugin.lanDiscovery?.stop();
+        this.plugin.lanDiscovery.stop();
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl('h2', { text: 'Companion Mode' });
@@ -721,7 +756,7 @@ class ConnectionModal extends Modal {
     }
     
     showMyId(backCallback: () => void, title: string, text: string) {
-        this.plugin.lanDiscovery?.stop();
+        this.plugin.lanDiscovery.stop();
         const { contentEl } = this;
         contentEl.empty();
         contentEl.createEl('h2', { text: title });
