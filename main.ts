@@ -1,14 +1,11 @@
+
 import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, Modal, Platform } from 'obsidian';
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
 import QRCode from 'qrcode';
 
-// --- Constants and Core Types ---
+export type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; };
 
-const DISCOVERY_PORT = 41234;
-const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
-
-type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; };
 type DiscoveryBeacon = { type: 'obsidian-decentralized-beacon'; peerInfo: PeerInfo; };
 type HandshakePayload = { type: 'handshake'; peerInfo: PeerInfo; pin?: string; };
 type ClusterGossipPayload = { type: 'cluster-gossip'; peers: PeerInfo[]; };
@@ -21,42 +18,17 @@ type FullSyncCompletePayload = { type: 'full-sync-complete' };
 type CompanionPairPayload = { type: 'companion-pair'; peerInfo: PeerInfo; };
 type SyncData = FileUpdatePayload | FileDeletePayload | FileRenamePayload | FullSyncRequestPayload | FullSyncManifestPayload | FullSyncCompletePayload | HandshakePayload | ClusterGossipPayload | CompanionPairPayload;
 
-interface PeerServerConfig {
-    host: string;
-    port: number;
-    path: string;
-    secure: boolean;
-}
-
-interface ObsidianDecentralizedSettings {
-    deviceId: string;
-    friendlyName: string;
-    companionPeerId?: string;
-    useCustomPeerServer: boolean;
-    customPeerServerConfig: PeerServerConfig;
-}
-
+interface PeerServerConfig { host: string; port: number; path: string; secure: boolean; }
+interface ObsidianDecentralizedSettings { deviceId: string; friendlyName: string; companionPeerId?: string; useCustomPeerServer: boolean; customPeerServerConfig: PeerServerConfig; }
 const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     deviceId: `device-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`,
     friendlyName: 'My New Device',
     companionPeerId: undefined,
     useCustomPeerServer: false,
-    customPeerServerConfig: {
-        host: 'localhost',
-        port: 9000,
-        path: '/myapp',
-        secure: false,
-    }
+    customPeerServerConfig: { host: 'localhost', port: 9000, path: '/myapp', secure: false, }
 };
 
-// --- Platform-Specific Abstraction for LAN Discovery ---
-
-/**
- * Defines the public interface for LAN Discovery functionality.
- * This allows us to use a real implementation on Desktop and a dummy one on Mobile
- * without the rest of the plugin needing to know the diference.
- */
-interface ILANDiscovery {
+export interface ILANDiscovery {
     on(event: string, listener: (...args: any[]) => void): this;
     startBroadcasting(peerInfo: PeerInfo): void;
     stopBroadcasting(): void;
@@ -64,141 +36,13 @@ interface ILANDiscovery {
     stop(): void;
 }
 
-/**
- * A safe implementation for Mobile platforms.
- * It doesn't include any Node.js specific code so it won't crash on mobile.
- */
 class DummyLANDiscovery implements ILANDiscovery {
-    on(event: string, listener: (...args: any[]) => void): this { return this; }
-    startBroadcasting(peerInfo: PeerInfo): void {}
-    stopBroadcasting(): void {}
-    startListening(): void {}
-    stop(): void {}
+    public on(event: string, listener: (...args: any[]) => void): this { return this; }
+    public startBroadcasting(peerInfo: PeerInfo): void {}
+    public stopBroadcasting(): void {}
+    public startListening(): void {}
+    public stop(): void {}
 }
-
-/**
- * Implementation of LAN Discovery for Desktop platforms ONLY.
- * It uses Node.js modules like 'dgram', 'os', and 'events'.
- */
-class DesktopLANDiscovery implements ILANDiscovery {
-    private socket: any | null = null;
-    private broadcastInterval: number | null = null;
-    private discoveredPeers: Map<string, PeerInfo> = new Map();
-    private peerTimeouts: Map<string, number> = new Map();
-    private discoveryTimeoutMs: number = 5000;
-    private _emitter: any;
-
-    constructor() {
-        const { EventEmitter } = require('events');
-        this._emitter = new EventEmitter();
-    }
-
-    public on(event: string, listener: (...args: any[]) => void): this {
-        this._emitter.on(event, listener);
-        return this;
-    }
-
-    private emit(event: string, ...args: any[]): boolean {
-        return this._emitter.emit(event, ...args);
-    }
-
-    private createSocket() {
-        if (this.socket) return;
-        
-        const dgram = require('dgram');
-        this.socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-
-        this.socket.on('error', (err: Error) => {
-            console.error('LAN Discovery Socket Error:', err);
-            this.stop();
-            new Notice('LAN discovery failed. Your firewall might be blocking it.', 10000);
-        });
-
-        this.socket.on('listening', () => {
-            try {
-                this.socket?.addMembership(DISCOVERY_MULTICAST_ADDRESS);
-                this.socket?.setMulticastTTL(128);
-                console.log(`LAN Discovery listening on ${DISCOVERY_MULTICAST_ADDRESS}:${DISCOVERY_PORT}`);
-            } catch (e) {
-                console.error("Error setting up multicast:", e);
-                new Notice("Could not set up multicast. LAN discovery might not work.");
-            }
-        });
-
-        this.socket.on('message', (msg: Buffer, rinfo: any) => {
-            try {
-                const data: DiscoveryBeacon = JSON.parse(msg.toString());
-                if (data.type === 'obsidian-decentralized-beacon' && data.peerInfo?.deviceId) {
-                    const peerId = data.peerInfo.deviceId;
-
-                    if (this.peerTimeouts.has(peerId)) {
-                        clearTimeout(this.peerTimeouts.get(peerId)!);
-                    }
-
-                    const isNew = !this.discoveredPeers.has(peerId);
-                    data.peerInfo.ip = rinfo.address;
-                    this.discoveredPeers.set(peerId, data.peerInfo);
-                    if (isNew) {
-                        this.emit('discover', data.peerInfo);
-                    }
-                    
-                    const timeout = window.setTimeout(() => {
-                        this.discoveredPeers.delete(peerId);
-                        this.peerTimeouts.delete(peerId);
-                        this.emit('lose', data.peerInfo);
-                    }, this.discoveryTimeoutMs);
-                    this.peerTimeouts.set(peerId, timeout);
-                }
-            } catch (e) { /* Ignore parsing errors */ }
-        });
-
-        this.socket.bind(DISCOVERY_PORT);
-    }
-
-    public startBroadcasting(peerInfo: PeerInfo) {
-        this.stopBroadcasting(); 
-        this.createSocket();
-        
-        const beaconMessage = JSON.stringify({
-            type: 'obsidian-decentralized-beacon',
-            peerInfo
-        });
-
-        const sendBeacon = () => {
-            this.socket?.send(beaconMessage, 0, beaconMessage.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
-                if (err) console.error("Beacon send error:", err);
-            });
-        };
-        
-        sendBeacon(); 
-        this.broadcastInterval = window.setInterval(sendBeacon, 2000); 
-    }
-    
-    public stopBroadcasting() {
-        if (this.broadcastInterval) {
-            clearInterval(this.broadcastInterval);
-            this.broadcastInterval = null;
-        }
-    }
-    
-    public startListening() {
-        this.createSocket();
-    }
-
-    public stop() {
-        this.stopBroadcasting();
-        if (this.socket) {
-            this.socket.close();
-            this.socket = null;
-        }
-        this.discoveredPeers.clear();
-        this.peerTimeouts.forEach(timeout => clearTimeout(timeout));
-        this.peerTimeouts.clear();
-        console.log('LAN Discovery stopped.');
-    }
-}
-
-// --- Main Plugin Class ---
 
 export default class ObsidianDecentralizedPlugin extends Plugin {
     settings: ObsidianDecentralizedSettings;
@@ -206,21 +50,30 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     connections: Map<string, DataConnection> = new Map();
     clusterPeers: Map<string, PeerInfo> = new Map();
     lanDiscovery: ILANDiscovery;
+    getLocalIp: () => string | null;
     
     private ignoreNextEventForPath: Set<string> = new Set();
     private statusBar: HTMLElement;
-    private isFullSyncing: boolean = false;
+    private isFullSyncing = false;
     private pendingDeletions: string[] = [];
     private conflictCenter: ConflictCenter;
     public joinPin: string | null = null;
     private companionConnectionInterval: number | null = null;
 
     async onload() {
-        // This is the crucial part: instantiate the correct class for the current platform.
         if (Platform.isMobile) {
             this.lanDiscovery = new DummyLANDiscovery();
+            this.getLocalIp = () => null;
         } else {
-            this.lanDiscovery = new DesktopLANDiscovery();
+            try {
+                const desktopModule = require('./desktop');
+                this.lanDiscovery = new desktopModule.DesktopLANDiscovery();
+                this.getLocalIp = desktopModule.getLocalIp;
+            } catch (e) {
+                console.error("Obsidian Decentralized: Failed to load desktop-specific modules. LAN discovery will be disabled.", e);
+                this.lanDiscovery = new DummyLANDiscovery();
+                this.getLocalIp = () => null;
+            }
         }
 
         await this.loadSettings();
@@ -243,7 +96,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     onunload() { 
         this.peer?.destroy(); 
         if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
-        this.lanDiscovery.stop(); // Safe to call on both dummy and real implementations
+        this.lanDiscovery.stop();
     }
     async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
     async saveSettings() { await this.saveData(this.settings); }
@@ -253,20 +106,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.initializePeer();
     }
 
-    initializePeer(onOpen?: (id: string) => void) {
+    public initializePeer(onOpen?: (id: string) => void) {
         if (this.peer && !this.peer.destroyed) {
             if (onOpen && !this.peer.disconnected) { onOpen(this.peer.id); }
             return;
         }
         
         this.peer?.destroy();
-
         let peerOptions: PeerJSOption = {};
         if (this.settings.useCustomPeerServer) {
             const { host, port, path, secure } = this.settings.customPeerServerConfig;
             peerOptions = { host, port, path, secure };
         }
-
         this.peer = new Peer(this.settings.deviceId, peerOptions);
 
         this.peer.on('open', (id) => {
@@ -275,9 +126,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.tryToConnectToCompanion();
             onOpen?.(id);
         });
-        this.peer.on('connection', (conn) => {
-            this.setupConnection(conn);
-        });
+        this.peer.on('connection', (conn) => this.setupConnection(conn));
         this.peer.on('error', (err) => {
             console.error("PeerJS Error:", err);
             new Notice(`Sync connection error: ${err.type}`);
@@ -289,10 +138,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         });
     }
 
-    setupConnection(conn: DataConnection, pin?: string) {
-        conn.on('open', () => {
-            conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin });
-        });
+    public connectToPeer(peerId: string, pin?: string, isCompanionPairing: boolean = false) {
+        if (!this.peer || this.peer.disconnected) {
+            new Notice("Sync network is not active. Please wait and try again.");
+            return;
+        }
+        const conn = this.peer.connect(peerId);
+        this.setupConnection(conn, pin);
+
+        if (isCompanionPairing) {
+            conn.on('open', () => {
+                conn.send({ type: 'companion-pair', peerInfo: this.getMyPeerInfo() });
+            });
+        }
+    }
+    
+    private setupConnection(conn: DataConnection, pin?: string) {
+        conn.on('open', () => conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin }));
         conn.on('data', (data: SyncData) => this.processIncomingData(data, conn));
         conn.on('close', () => {
             const peerId = conn.peer;
@@ -312,7 +174,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         });
     }
 
-    updateStatus() {
+    private updateStatus() {
         let statusText = "🔄 Sync Idle";
         if (this.peer?.disconnected || !this.peer) {
             statusText = "❌ Sync Offline";
@@ -323,7 +185,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.statusBar.setText(statusText);
     }
 
-    processIncomingData(data: SyncData, conn: DataConnection) {
+    private processIncomingData(data: SyncData, conn: DataConnection) {
         switch (data.type) {
             case 'handshake': this.handleHandshake(data, conn); break;
             case 'cluster-gossip': this.handleClusterGossip(data); break;
@@ -337,13 +199,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
     
-    handleHandshake(data: HandshakePayload, conn: DataConnection) {
+    private handleHandshake(data: HandshakePayload, conn: DataConnection) {
         if (this.joinPin && data.pin !== this.joinPin) {
             new Notice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 10000);
             conn.close();
             return;
         }
-        if(this.joinPin) this.joinPin = null;
+        if (this.joinPin) this.joinPin = null;
 
         new Notice(`🤝 Connected to ${data.peerInfo.friendlyName}`);
         this.connections.set(conn.peer, conn);
@@ -360,43 +222,34 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.broadcastData({ type: 'cluster-gossip', peers: [this.getMyPeerInfo(), data.peerInfo] });
     }
 
-    handleClusterGossip(data: ClusterGossipPayload) {
+    private handleClusterGossip(data: ClusterGossipPayload) {
         data.peers.forEach(peerInfo => {
             if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) return;
             if (this.peer && !this.peer.disconnected) {
-                const conn = this.peer.connect(peerInfo.deviceId);
-                this.setupConnection(conn);
+                this.connectToPeer(peerInfo.deviceId);
             }
         });
     }
 
-    async handleCompanionPair(data: CompanionPairPayload) {
+    private async handleCompanionPair(data: CompanionPairPayload) {
         this.settings.companionPeerId = data.peerInfo.deviceId;
         await this.saveSettings();
         new Notice(`✅ Paired with ${data.peerInfo.friendlyName} as a companion device.`);
         this.tryToConnectToCompanion();
     }
 
-    tryToConnectToCompanion() {
+    public tryToConnectToCompanion() {
         if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
         if (!this.settings.companionPeerId || !this.peer || this.peer.disconnected) return;
     
         const attemptConnection = () => {
             const companionId = this.settings.companionPeerId;
-            if (!companionId) {
+            if (!companionId || (this.connections.has(companionId) || !this.peer || this.peer.disconnected)) {
                 if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
                 this.companionConnectionInterval = null;
                 return;
             }
-
-            if (this.connections.has(companionId) || !this.peer || this.peer.disconnected) {
-                if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
-                this.companionConnectionInterval = null;
-                return;
-            }
-            console.log(`Obsidian Decentralized: Attempting to connect to companion ${companionId}`);
-            const conn = this.peer.connect(companionId);
-            this.setupConnection(conn);
+            this.connectToPeer(companionId);
         };
     
         attemptConnection();
@@ -411,51 +264,42 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         const companionId = this.settings.companionPeerId;
         if (companionId) {
-            const conn = this.connections.get(companionId);
-            conn?.close();
+            this.connections.get(companionId)?.close();
         }
         this.settings.companionPeerId = undefined;
         await this.saveSettings();
         new Notice('Companion link forgotten.');
     }
 
-    broadcastData(data: SyncData) { this.connections.forEach(conn => conn.open && conn.send(data)); }
-    async handleFileModify(file: TFile) { if (this.ignoreNextEventForPath.has(file.path)) { this.ignoreNextEventForPath.delete(file.path); return; } this.broadcastData({ type: 'file-update', path: file.path, content: await this.app.vault.cachedRead(file), mtime: file.stat.mtime }); }
-    handleFileCreate(file: TFile) { this.handleFileModify(file); }
-    handleFileDelete(file: TFile) { if (this.ignoreNextEventForPath.has(file.path)) { this.ignoreNextEventForPath.delete(file.path); return; } this.broadcastData({ type: 'file-delete', path: file.path }); }
-    handleFileRename(file: TFile, oldPath: string) { if (this.ignoreNextEventForPath.has(file.path)) { this.ignoreNextEventForPath.delete(file.path); return; } this.broadcastData({ type: 'file-rename', oldPath: oldPath, newPath: file.path }); }
+    private broadcastData(data: SyncData) { this.connections.forEach(conn => conn.open && conn.send(data)); }
+    private async handleFileModify(file: TFile) { if (this.ignoreNextEventForPath.has(file.path)) { this.ignoreNextEventForPath.delete(file.path); return; } this.broadcastData({ type: 'file-update', path: file.path, content: await this.app.vault.cachedRead(file), mtime: file.stat.mtime }); }
+    private handleFileCreate(file: TFile) { this.handleFileModify(file); }
+    private handleFileDelete(file: TFile) { if (this.ignoreNextEventForPath.has(file.path)) { this.ignoreNextEventForPath.delete(file.path); return; } this.broadcastData({ type: 'file-delete', path: file.path }); }
+    private handleFileRename(file: TFile, oldPath: string) { if (this.ignoreNextEventForPath.has(file.path)) { this.ignoreNextEventForPath.delete(file.path); return; } this.broadcastData({ type: 'file-rename', oldPath: oldPath, newPath: file.path }); }
     
-    requestFullSyncFromPeer(peerId: string) { const conn = this.connections.get(peerId); if (!conn) { new Notice("Peer not found."); return; } new Notice(`Requesting full sync from ${this.clusterPeers.get(peerId)?.friendlyName}...`); this.isFullSyncing = true; conn.send({ type: 'request-full-sync' }); }
-    async handleFullSyncRequest(conn: DataConnection) { new Notice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Sending vault...`); const files = this.app.vault.getMarkdownFiles(); conn.send({ type: 'full-sync-manifest', paths: files.map(f => f.path) }); for (const file of files) { conn.send({ type: 'file-update', path: file.path, content: await this.app.vault.cachedRead(file), mtime: file.stat.mtime }); } conn.send({ type: 'full-sync-complete' }); new Notice("Full sync data sent."); }
+    private requestFullSyncFromPeer(peerId: string) { const conn = this.connections.get(peerId); if (!conn) { new Notice("Peer not found."); return; } new Notice(`Requesting full sync from ${this.clusterPeers.get(peerId)?.friendlyName}...`); this.isFullSyncing = true; conn.send({ type: 'request-full-sync' }); }
+    private async handleFullSyncRequest(conn: DataConnection) { new Notice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Sending vault...`); const files = this.app.vault.getMarkdownFiles(); conn.send({ type: 'full-sync-manifest', paths: files.map(f => f.path) }); for (const file of files) { conn.send({ type: 'file-update', path: file.path, content: await this.app.vault.cachedRead(file), mtime: file.stat.mtime }); } conn.send({ type: 'full-sync-complete' }); new Notice("Full sync data sent."); }
     
-    handleFullSyncManifest(data: FullSyncManifestPayload) { 
+    private handleFullSyncManifest(data: FullSyncManifestPayload) { 
         if (!this.isFullSyncing) { new Notice("Received unexpected sync manifest. Ignoring."); return; }
         const remotePaths = new Set(data.paths); 
         this.pendingDeletions = this.app.vault.getMarkdownFiles().filter(file => !remotePaths.has(file.path)).map(file => file.path); 
     }
 
-    async handleFullSyncComplete() { 
+    private async handleFullSyncComplete() { 
         if (!this.isFullSyncing) return;
         new Notice("Full sync received. Finalizing..."); 
         for (const path of this.pendingDeletions) { 
             const file = this.app.vault.getAbstractFileByPath(path); 
-            if (file) { 
-                try {
-                    this.ignoreNextEventForPath.add(path); 
-                    await this.app.vault.delete(file); 
-                } catch(e) {
-                    console.error(`Error deleting file during full sync: ${path}`, e);
-                }
-            } 
+            if (file) { try { this.ignoreNextEventForPath.add(path); await this.app.vault.delete(file); } catch(e) { console.error(`Error deleting file during full sync: ${path}`, e); } } 
         } 
         this.pendingDeletions = []; 
         this.isFullSyncing = false;
         new Notice("✅ Full sync complete."); 
     }
 
-    async applyFileUpdate(data: FileUpdatePayload) { 
-        if (data.path.startsWith('.obsidian/')) { console.warn(`Ignoring sync attempt for protected path: ${data.path}`); return; }
-
+    private async applyFileUpdate(data: FileUpdatePayload) { 
+        if (data.path.startsWith('.obsidian/')) return;
         const existingFile = this.app.vault.getAbstractFileByPath(data.path); 
         if (existingFile instanceof TFile) { 
             const MTIME_TOLERANCE_MS = 2000;
@@ -464,9 +308,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await this.app.vault.modify(existingFile, data.content); 
                 return; 
             } 
-            if (data.mtime < existingFile.stat.mtime - MTIME_TOLERANCE_MS) {
-                return; 
-            } 
+            if (data.mtime < existingFile.stat.mtime - MTIME_TOLERANCE_MS) return;
             const localContent = await this.app.vault.cachedRead(existingFile); 
             if (localContent !== data.content) { 
                 new Notice(`Conflict detected for: ${data.path}`, 10000); 
@@ -478,85 +320,37 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.ignoreNextEventForPath.add(data.path); 
             try { 
                 const folder = data.path.substring(0, data.path.lastIndexOf('/')); 
-                if (folder && !this.app.vault.getAbstractFileByPath(folder)) {
-                    await this.app.vault.createFolder(folder);
-                }
+                if (folder && !this.app.vault.getAbstractFileByPath(folder)) { await this.app.vault.createFolder(folder); }
                 await this.app.vault.create(data.path, data.content); 
             } catch (e) { console.error("File creation error:", e); new Notice(`Failed to create file: ${data.path}`); } 
         } 
     }
 
-    async applyFileDelete(data: FileDeletePayload) { 
-        if (data.path.startsWith('.obsidian/')) { console.warn(`Ignoring sync delete attempt for protected path: ${data.path}`); return; }
+    private async applyFileDelete(data: FileDeletePayload) { 
+        if (data.path.startsWith('.obsidian/')) return;
         const existingFile = this.app.vault.getAbstractFileByPath(data.path); 
-        if (existingFile) { 
-            try {
-                this.ignoreNextEventForPath.add(data.path); 
-                await this.app.vault.delete(existingFile); 
-            } catch (e) {
-                console.error(`Error deleting file: ${data.path}`, e);
-                new Notice(`Failed to delete file: ${data.path}`);
-            }
-        } 
+        if (existingFile) { try { this.ignoreNextEventForPath.add(data.path); await this.app.vault.delete(existingFile); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); new Notice(`Failed to delete file: ${data.path}`); } } 
     }
     
-    async applyFileRename(data: FileRenamePayload) {
-        if (data.oldPath.startsWith('.obsidian/') || data.newPath.startsWith('.obsidian/')) {
-            console.warn(`Ignoring sync rename attempt for protected path: ${data.oldPath} -> ${data.newPath}`);
-            return;
-        }
+    private async applyFileRename(data: FileRenamePayload) {
+        if (data.oldPath.startsWith('.obsidian/') || data.newPath.startsWith('.obsidian/')) return;
         const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath);
-        if (fileToRename instanceof TFile) {
-            try {
-                this.ignoreNextEventForPath.add(data.newPath);
-                await this.app.vault.rename(fileToRename, data.newPath);
-            } catch (e) {
-                console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e);
-                new Notice(`Failed to rename file: ${data.oldPath}`);
-            }
-        }
+        if (fileToRename instanceof TFile) { try { this.ignoreNextEventForPath.add(data.newPath); await this.app.vault.rename(fileToRename, data.newPath); } catch (e) { console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); new Notice(`Failed to rename file: ${data.oldPath}`); } }
     }
 
-    getConflictPath(originalPath: string): string { const extension = originalPath.split('.').pop() || ''; const base = originalPath.substring(0, originalPath.lastIndexOf('.')); const date = new Date().toISOString().split('T')[0]; return `${base} (conflict on ${date}).${extension}`; }
+    private getConflictPath(originalPath: string): string { const extension = originalPath.split('.').pop() || ''; const base = originalPath.substring(0, originalPath.lastIndexOf('.')); const date = new Date().toISOString().split('T')[0]; return `${base} (conflict on ${date}).${extension}`; }
     
-    getLocalIp(): string | null {
-        if (Platform.isMobile) {
-            return null;
-        }
-
-        try {
-            const os = require('os');
-            const interfaces = os.networkInterfaces();
-            for (const name in interfaces) {
-                for (const net of interfaces[name]!) {
-                    if (net.family === 'IPv4' && !net.internal) return net.address;
-                }
-            }
-        } catch (e) { console.warn("Could not get local IP address.", e); }
-        return null;
-    }
-    
-    getMyPeerInfo(): PeerInfo {
+    public getMyPeerInfo(): PeerInfo {
         return { deviceId: this.peer?.id || this.settings.deviceId, friendlyName: this.settings.friendlyName, ip: this.getLocalIp() };
     }
 }
 
-// --- UI Components (Modals, Settings Tab) ---
-
 class ConnectionModal extends Modal {
     private discoveredPeers: Map<string, PeerInfo> = new Map();
-    
     constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
     
-    onOpen() { 
-        this.injectStyles(); 
-        this.showInitialOptions(); 
-    }
-
-    onClose() { 
-        this.plugin.lanDiscovery.stop();
-        this.contentEl.empty();
-    }
+    onOpen() { this.injectStyles(); this.showInitialOptions(); }
+    onClose() { this.plugin.lanDiscovery.stop(); this.contentEl.empty(); }
 
     injectStyles() {
         const styleId = 'obsidian-decentralized-styles';
@@ -597,9 +391,9 @@ class ConnectionModal extends Modal {
         contentEl.createEl('h2', { text: 'One-Time Connection' });
 
         if (!Platform.isMobile) {
-            new Setting(contentEl).setName("Invite via LAN (No Internet Needed)").setDesc("Broadcast an invitation on your local network. The other device must be on the same Wi-Fi.").addButton(btn => btn.setButtonText("Invite with PIN").onClick(() => this.showInviteLAN()));
+            new Setting(contentEl).setName("Invite via LAN (No Internet Needed)").setDesc("Broadcast an invitation on your local network.").addButton(btn => btn.setButtonText("Invite with PIN").onClick(() => this.showInviteLAN()));
         }
-        new Setting(contentEl).setName("Invite via ID / QR Code").setDesc("The most secure method. Requires an internet or self-hosted server for the initial handshake.").addButton(btn => btn.setButtonText("Show ID").setCta().onClick(() => this.showMyId(() => this.showOneTimeConnection(), 'Invite with ID', 'On your other device, select "Join a Network" and paste the ID below.')));
+        new Setting(contentEl).setName("Invite via ID / QR Code").setDesc("Requires an internet or self-hosted server for the initial handshake.").addButton(btn => btn.setButtonText("Show ID").setCta().onClick(() => this.showMyId(() => this.showOneTimeConnection(), 'Invite with ID', 'On your other device, select "Join a Network" and paste the ID below.')));
         new Setting(contentEl).setName("Join a Network").setDesc("Enter an ID from another device, or discover devices on your LAN.").addButton(btn => btn.setButtonText("Join").onClick(() => this.showJoin()));
         new Setting(contentEl).addButton(btn => btn.setButtonText('Back').onClick(() => this.showInitialOptions()));
     }
@@ -618,7 +412,6 @@ class ConnectionModal extends Modal {
         if (ip) {
             contentEl.createEl('div', { text: `Your IP: ${ip}`, cls: 'obsidian-decentralized-info-display' });
         }
-
         contentEl.createEl('div', { text: `Your PIN is:`, cls: 'obsidian-decentralized-info-display' });
         contentEl.createEl('div', { text: pin, cls: 'pin-display' });
         contentEl.createEl('p', { text: 'This PIN will be required to connect.', cls: 'setting-item-description' });
@@ -659,10 +452,7 @@ class ConnectionModal extends Modal {
         buttonRow.addButton(btn => btn.setButtonText("Back").onClick(() => this.showOneTimeConnection()));
         buttonRow.addButton(btn => btn.setButtonText("Connect with ID").setCta().onClick(() => {
             if (!remoteId.trim()) { new Notice("Please enter a Peer ID."); return; }
-            if (!this.plugin.peer || this.plugin.peer.disconnected) { new Notice("Peer connection is not active."); return; }
-
-            const conn = this.plugin.peer.connect(remoteId.trim());
-            this.plugin.setupConnection(conn);
+            this.plugin.connectToPeer(remoteId.trim());
             this.close();
         }));
     }
@@ -673,12 +463,9 @@ class ConnectionModal extends Modal {
             container.createEl('p', { text: 'Searching for devices...' });
             return;
         }
-
         this.discoveredPeers.forEach(peer => {
             const entry = container.createEl('div', { cls: 'obsidian-decentralized-peer-entry' });
-            entry.onclick = () => {
-                this.showPinPrompt(peer);
-            };
+            entry.onclick = () => this.showPinPrompt(peer);
             const infoDiv = entry.createDiv({ cls: 'peer-info' });
             infoDiv.createEl('div', { text: peer.friendlyName, cls: 'peer-name' });
             infoDiv.createEl('div', { text: `IP: ${peer.ip} | ID: ${peer.deviceId.substring(0,12)}...`, cls: 'peer-details' });
@@ -703,10 +490,7 @@ class ConnectionModal extends Modal {
             .addButton(btn => btn.setButtonText("Back").onClick(() => this.showJoin()))
             .addButton(btn => btn.setButtonText("Connect").setCta().onClick(() => {
                 if (pin.length !== 6) { new Notice("PIN must be 6 digits."); return; }
-                if (!this.plugin.peer || this.plugin.peer.disconnected) { new Notice("Peer connection is not active."); return; }
-                
-                const conn = this.plugin.peer.connect(peer.deviceId);
-                this.plugin.setupConnection(conn, pin);
+                this.plugin.connectToPeer(peer.deviceId, pin);
                 this.close();
             }));
     }
@@ -727,7 +511,7 @@ class ConnectionModal extends Modal {
         }
         
         contentEl.createEl('h3', { text: 'Pair a New Companion' });
-        contentEl.createEl('p', { text: 'Enter the ID from your other device to create a permanent, automatic link. This will replace any existing companion.' });
+        contentEl.createEl('p', { text: 'Enter the ID from your other device to create a permanent, automatic link.' });
         let remoteId = '';
         new Setting(contentEl).setName("Companion's ID").addText(text => text.setPlaceholder("Paste companion's ID...").onChange(value => remoteId = value));
         const buttonRow = new Setting(contentEl);
@@ -738,18 +522,9 @@ class ConnectionModal extends Modal {
             
             this.plugin.settings.companionPeerId = remoteId.trim();
             await this.plugin.saveSettings();
-            new Notice(`Set ${remoteId.trim()} as companion. Sending pair request...`);
+            new Notice(`Setting new companion and attempting to pair...`);
             
-            if (this.plugin.peer && !this.plugin.peer.disconnected) {
-                const conn = this.plugin.peer.connect(remoteId.trim());
-                this.plugin.setupConnection(conn);
-                conn.on('open', () => {
-                    conn.send({ type: 'companion-pair', peerInfo: this.plugin.getMyPeerInfo() });
-                });
-            } else {
-                new Notice("Peer connection is not active. Please wait.");
-            }
-
+            this.plugin.connectToPeer(remoteId.trim(), undefined, true);
             this.plugin.tryToConnectToCompanion();
             this.close();
         }));
@@ -820,11 +595,12 @@ class ConflictCenter {
     private conflicts: Map<string, string> = new Map();
     private ribbonEl: HTMLElement | null = null;
     constructor(private plugin: ObsidianDecentralizedPlugin) {}
-    registerRibbon() { this.ribbonEl = this.plugin.addRibbonIcon('swords', 'Resolve Sync Conflicts', () => this.showConflictList()); this.ribbonEl.hide(); }
-    addConflict(originalPath: string, conflictPath: string) { this.conflicts.set(originalPath, conflictPath); this.updateRibbon(); }
-    resolveConflict(originalPath: string) { this.conflicts.delete(originalPath); this.updateRibbon(); }
-    updateRibbon() { if (!this.ribbonEl) return; if (this.conflicts.size > 0) { this.ribbonEl.show(); this.ribbonEl.setAttribute('aria-label', `Resolve ${this.conflicts.size} sync conflicts`); this.ribbonEl.setText(this.conflicts.size.toString()); } else { this.ribbonEl.hide(); } }
-    showConflictList() { new ConflictListModal(this.plugin.app, this).open(); }
+    public registerRibbon() { this.ribbonEl = this.plugin.addRibbonIcon('swords', 'Resolve Sync Conflicts', () => this.showConflictList()); this.ribbonEl!.hide(); }
+    public addConflict(originalPath: string, conflictPath: string) { this.conflicts.set(originalPath, conflictPath); this.updateRibbon(); }
+    public resolveConflict(originalPath: string) { this.conflicts.delete(originalPath); this.updateRibbon(); }
+    public getConflicts(): Map<string, string> { return this.conflicts; }
+    private updateRibbon() { if (!this.ribbonEl) return; if (this.conflicts.size > 0) { this.ribbonEl.show(); this.ribbonEl.setAttribute('aria-label', `Resolve ${this.conflicts.size} sync conflicts`); this.ribbonEl.setText(this.conflicts.size.toString()); } else { this.ribbonEl.hide(); } }
+    private showConflictList() { new ConflictListModal(this.plugin.app, this).open(); }
 }
 
 class ConflictListModal extends Modal {
@@ -832,7 +608,7 @@ class ConflictListModal extends Modal {
     onOpen() {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Sync Conflicts' });
-        const conflicts: Map<string, string> = (this.conflictCenter as any).conflicts;
+        const conflicts: Map<string, string> = this.conflictCenter.getConflicts();
         if (conflicts.size === 0) { contentEl.createEl('p', { text: 'No conflicts to resolve.' }); return; }
         conflicts.forEach((conflictPath, originalPath) => {
             new Setting(contentEl).setName(originalPath).setDesc(`Conflict file: ${conflictPath}`)
@@ -902,56 +678,21 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Use custom signaling server")
-            .setDesc("For advanced users. Use your own self-hosted PeerJS server for a fully private syncing experience, even over the internet.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.useCustomPeerServer)
-                .onChange(async (value) => {
-                    this.plugin.settings.useCustomPeerServer = value;
-                    await this.plugin.saveSettings();
-                    this.display();
-                }));
+            .setDesc("Use your own self-hosted PeerJS server for a fully private syncing experience.")
+            .addToggle(toggle => toggle.setValue(this.plugin.settings.useCustomPeerServer)
+                .onChange(async (value) => { this.plugin.settings.useCustomPeerServer = value; await this.plugin.saveSettings(); this.display(); }));
 
         if (this.plugin.settings.useCustomPeerServer) {
             const config = this.plugin.settings.customPeerServerConfig;
-            new Setting(containerEl)
-                .setName("Host")
-                .addText(text => text.setValue(config.host).onChange(async (value) => {
-                    config.host = value;
-                    await this.plugin.saveSettings();
-                }));
-            new Setting(containerEl)
-                .setName("Port")
-                .addText(text => text.setValue(config.port.toString()).onChange(async (value) => {
-                    config.port = parseInt(value, 10) || 9000;
-                    await this.plugin.saveSettings();
-                }));
-            new Setting(containerEl)
-                .setName("Path")
-                .addText(text => text.setValue(config.path).onChange(async (value) => {
-                    config.path = value;
-                    await this.plugin.saveSettings();
-                }));
-            new Setting(containerEl)
-                .setName("Secure (SSL)")
-                .addToggle(toggle => toggle.setValue(config.secure).onChange(async (value) => {
-                    config.secure = value;
-                    await this.plugin.saveSettings();
-                }));
-
-            new Setting(containerEl)
-                .addButton(btn => btn
-                    .setButtonText("Apply and Reconnect")
-                    .setWarning()
-                    .onClick(() => {
-                        new Notice("Reconnecting to new PeerJS server...");
-                        this.plugin.reinitializePeer();
-                    }));
+            new Setting(containerEl).setName("Host").addText(text => text.setValue(config.host).onChange(async (value) => { config.host = value; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Port").addText(text => text.setValue(config.port.toString()).onChange(async (value) => { config.port = parseInt(value, 10) || 9000; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Path").addText(text => text.setValue(config.path).onChange(async (value) => { config.path = value; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Secure (SSL)").addToggle(toggle => toggle.setValue(config.secure).onChange(async (value) => { config.secure = value; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).addButton(btn => btn.setButtonText("Apply and Reconnect").setWarning().onClick(() => { new Notice("Reconnecting to new PeerJS server..."); this.plugin.reinitializePeer(); }));
         }
     }
 
-    hide() { 
-        if (this.statusInterval) window.clearInterval(this.statusInterval); 
-    }
+    hide() { if (this.statusInterval) window.clearInterval(this.statusInterval); }
 
     updateStatus(el: HTMLDivElement) {
         if(!el || !el.isConnected) {
@@ -962,26 +703,15 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         el.empty();
         
         const list = el.createDiv();
-        
         const createEntry = (peer: PeerInfo, type: 'self' | 'companion' | 'peer') => {
-            const settingItem = new Setting(list)
-                .setName(peer.friendlyName + (type === 'self' ? ' (This Device)' : ''))
-                .setDesc(`ID: ${peer.deviceId}`);
-
+            const settingItem = new Setting(list).setName(peer.friendlyName + (type === 'self' ? ' (This Device)' : '')).setDesc(`ID: ${peer.deviceId}`);
             if (type === 'companion') {
-                settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(async () => {
-                    await this.plugin.forgetCompanion();
-                    this.updateStatus(el);
-                }));
+                settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(async () => { await this.plugin.forgetCompanion(); this.updateStatus(el); }));
             }
             if (type === 'peer' || type === 'companion') {
                 const conn = this.plugin.connections.get(peer.deviceId);
                 if(conn) {
-                    settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => {
-                        conn.close();
-                        new Notice(`Disconnecting from ${peer.friendlyName}`);
-                        setTimeout(() => this.updateStatus(el), 100);
-                    }));
+                    settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => { conn.close(); new Notice(`Disconnecting from ${peer.friendlyName}`); setTimeout(() => this.updateStatus(el), 100); }));
                 }
             }
         };
@@ -992,9 +722,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             createEntry(this.plugin.clusterPeers.get(companionId)!, 'companion');
         }
         this.plugin.clusterPeers.forEach(peer => {
-            if (peer.deviceId !== companionId) {
-                createEntry(peer, 'peer');
-            }
+            if (peer.deviceId !== companionId) { createEntry(peer, 'peer'); }
         });
 
         if (this.plugin.clusterPeers.size === 0) {

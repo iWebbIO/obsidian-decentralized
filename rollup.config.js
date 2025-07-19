@@ -12,12 +12,16 @@ export default {
   },
   external: ['obsidian'],
 
+  // --- ADD THIS ENTIRE BLOCK ---
+  // This is a more specific fix for the "this is undefined" warning.
+  // It tells Rollup to use 'window' as the context for only the problematic modules.
   moduleContext: (id) => {
     if (id.includes('@msgpack')) {
       return 'window';
     }
-    return 'undefined';
+    return 'undefined'; // The default behavior for all other modules
   },
+  // -----------------------------
 
   plugins: [
     typescript(),

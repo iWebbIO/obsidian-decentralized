@@ -1,0 +1,11 @@
+{
+  "deviceId": "device-wb77h638z0sna29dm3ifhk",
+  "friendlyName": "My New Device",
+  "useCustomPeerServer": false,
+  "customPeerServerConfig": {
+    "host": "localhost",
+    "port": 9000,
+    "path": "/myapp",
+    "secure": false
+  }
+}
