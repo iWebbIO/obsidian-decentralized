@@ -2,9 +2,6 @@ import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, Modal, Platform 
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
 import QRCode from 'qrcode';
-import * as os from 'os';
-import * as dgram from 'dgram';
-import { EventEmitter } from 'events';
 
 const DISCOVERY_PORT = 41234;
 const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
@@ -49,19 +46,35 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     }
 };
 
-class LANDiscovery extends EventEmitter {
-    private socket: dgram.Socket | null = null;
+class LANDiscovery {
+    private socket: any | null = null;
     private broadcastInterval: NodeJS.Timeout | null = null;
     private discoveredPeers: Map<string, PeerInfo> = new Map();
     private peerTimeouts: Map<string, NodeJS.Timeout> = new Map();
     private discoveryTimeoutMs: number = 5000;
+    private _emitter: any;
+
+    constructor() {
+        const { EventEmitter } = require('events');
+        this._emitter = new EventEmitter();
+    }
+
+    public on(event: string, listener: (...args: any[]) => void): this {
+        this._emitter.on(event, listener);
+        return this;
+    }
+
+    private emit(event: string, ...args: any[]): boolean {
+        return this._emitter.emit(event, ...args);
+    }
 
     private createSocket() {
         if (this.socket) return;
         
+        const dgram = require('dgram');
         this.socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
-        this.socket.on('error', (err) => {
+        this.socket.on('error', (err: Error) => {
             console.error('LAN Discovery Socket Error:', err);
             this.stop();
             new Notice('LAN discovery failed. Your firewall might be blocking it.', 10000);
@@ -78,7 +91,7 @@ class LANDiscovery extends EventEmitter {
             }
         });
 
-        this.socket.on('message', (msg, rinfo) => {
+        this.socket.on('message', (msg: Buffer, rinfo: any) => {
             try {
                 const data: DiscoveryBeacon = JSON.parse(msg.toString());
                 if (data.type === 'obsidian-decentralized-beacon' && data.peerInfo?.deviceId) {
@@ -118,7 +131,7 @@ class LANDiscovery extends EventEmitter {
         }));
 
         const sendBeacon = () => {
-            this.socket?.send(beacon, 0, beacon.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err) => {
+            this.socket?.send(beacon, 0, beacon.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
                 if (err) console.error("Beacon send error:", err);
             });
         };
@@ -157,7 +170,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     peer: Peer | null = null;
     connections: Map<string, DataConnection> = new Map();
     clusterPeers: Map<string, PeerInfo> = new Map();
-    lanDiscovery: LANDiscovery;
+    lanDiscovery: LANDiscovery | undefined;
     
     private ignoreNextEventForPath: Set<string> = new Set();
     private statusBar: HTMLElement;
@@ -468,13 +481,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     getConflictPath(originalPath: string): string { const extension = originalPath.split('.').pop() || ''; const base = originalPath.substring(0, originalPath.lastIndexOf('.')); const date = new Date().toISOString().split('T')[0]; return `${base} (conflict on ${date}).${extension}`; }
     
     getLocalIp(): string | null {
+        if (Platform.isMobile) {
+            return null;
+        }
+
         try {
-            if (typeof os !== 'undefined' && os.networkInterfaces) {
-                const interfaces = os.networkInterfaces();
-                for (const name in interfaces) {
-                    for (const net of interfaces[name]!) {
-                        if (net.family === 'IPv4' && !net.internal) return net.address;
-                    }
+            const os = require('os');
+            const interfaces = os.networkInterfaces();
+            for (const name in interfaces) {
+                for (const net of interfaces[name]!) {
+                    if (net.family === 'IPv4' && !net.internal) return net.address;
                 }
             }
         } catch (e) { console.warn("Could not get local IP address.", e); }
@@ -584,19 +600,19 @@ class ConnectionModal extends Modal {
             const discoveryListEl = contentEl.createDiv({ cls: 'obsidian-decentralized-cluster-list' });
             const noPeersEl = discoveryListEl.createEl('p', { text: 'Searching for devices...' });
             
-            this.plugin.lanDiscovery.on('discover', (peerInfo: PeerInfo) => {
+            this.plugin.lanDiscovery?.on('discover', (peerInfo: PeerInfo) => {
                 noPeersEl.hide();
                 if (peerInfo.deviceId === this.plugin.settings.deviceId) return;
                 this.discoveredPeers.set(peerInfo.deviceId, peerInfo);
                 this.renderDiscoveredPeers(discoveryListEl);
             });
-            this.plugin.lanDiscovery.on('lose', (peerInfo: PeerInfo) => {
+            this.plugin.lanDiscovery?.on('lose', (peerInfo: PeerInfo) => {
                 this.discoveredPeers.delete(peerInfo.deviceId);
                 this.renderDiscoveredPeers(discoveryListEl);
                 if (this.discoveredPeers.size === 0) { noPeersEl.show(); }
             });
 
-            this.plugin.lanDiscovery.startListening();
+            this.plugin.lanDiscovery?.startListening();
         }
 
         contentEl.createEl('h3', { text: 'Manual Connection' });
