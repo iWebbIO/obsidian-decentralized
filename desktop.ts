@@ -1,137 +1,159 @@
 import * as dgram from 'dgram';
 import * as os from 'os';
+import * as http from 'http';
 import { EventEmitter } from 'events';
-import type { PeerInfo, ILANDiscovery } from './main';
+import type { PeerInfo, ILANDiscovery, SyncData } from './main';
 
 const DISCOVERY_PORT = 41234;
+const DIRECT_IP_SERVER_PORT = 41236;
 const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
+const PLUGIN_NAME_PREFIX = 'ObsidianDecentralized';
 
 export function getLocalIp(): string | null {
     try {
-        const interfaces = os.networkInterfaces();
-        for (const name in interfaces) {
-            for (const net of interfaces[name]!) {
-                if (net.family === 'IPv4' && !net.internal) {
-                    return net.address;
+        const networkInterfaces = os.networkInterfaces();
+        for (const interfaceName in networkInterfaces) {
+            const nets = networkInterfaces[interfaceName];
+            if (nets) {
+                for (const net of nets) {
+                    if (net.family === 'IPv4' && !net.internal) return net.address;
                 }
             }
         }
-    } catch (e) {
-        console.warn("Could not get local IP address.", e);
-    }
+    } catch (e) { console.warn(`${PLUGIN_NAME_PREFIX}: Could not determine local IP address.`, e); }
     return null;
 }
 
 export class DesktopLANDiscovery implements ILANDiscovery {
     private socket: dgram.Socket | null = null;
-    private broadcastInterval: number | null = null;
+    private broadcastInterval: NodeJS.Timeout | null = null;
     private discoveredPeers: Map<string, PeerInfo> = new Map();
-    private peerTimeouts: Map<string, number> = new Map();
-    private readonly discoveryTimeoutMs: number = 5000;
+    private peerTimeouts: Map<string, NodeJS.Timeout> = new Map();
     private _emitter: EventEmitter;
+    constructor() { this._emitter = new EventEmitter(); }
+    public on(event: 'discover' | 'lose', listener: (peerInfo: PeerInfo) => void): this { this._emitter.on(event, listener); return this; }
+    private emit(event: 'discover' | 'lose', peerInfo: PeerInfo): boolean { return this._emitter.emit(event, peerInfo); }
+    private createSocket() { if (this.socket) return; this.socket = dgram.createSocket({ type: 'udp4', reuseAddr: true }); this.socket.on('error', (err: Error) => { console.error(`${PLUGIN_NAME_PREFIX}: LAN Discovery Socket Error:`, err); this.stop(); }); this.socket.on('listening', () => { if (!this.socket) return; try { this.socket.addMembership(DISCOVERY_MULTICAST_ADDRESS); this.socket.setMulticastTTL(128); } catch (e) { console.error(`${PLUGIN_NAME_PREFIX}: Error setting up multicast.`, e); } }); this.socket.on('message', (msg, rinfo) => { try { const data = JSON.parse(msg.toString()); if (data.type === 'obsidian-decentralized-beacon' && data.peerInfo?.deviceId) { const peerId = data.peerInfo.deviceId; const existingTimeout = this.peerTimeouts.get(peerId); if (existingTimeout) clearTimeout(existingTimeout); const isNewPeer = !this.discoveredPeers.has(peerId); const peerInfo: PeerInfo = { ...data.peerInfo, ip: rinfo.address }; this.discoveredPeers.set(peerId, peerInfo); if (isNewPeer) this.emit('discover', peerInfo); const timeout = setTimeout(() => { this.discoveredPeers.delete(peerId); this.peerTimeouts.delete(peerId); this.emit('lose', peerInfo); }, 5000); this.peerTimeouts.set(peerId, timeout); } } catch (e) {} }); this.socket.bind(DISCOVERY_PORT); }
+    public startBroadcasting(peerInfo: PeerInfo): void { this.stopBroadcasting(); this.createSocket(); const beaconMessage = Buffer.from(JSON.stringify({ type: 'obsidian-decentralized-beacon', peerInfo })); const sendBeacon = () => { this.socket?.send(beaconMessage, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err) => { if (err) console.error(`${PLUGIN_NAME_PREFIX}: Beacon send error:`, err); }); }; sendBeacon(); this.broadcastInterval = setInterval(sendBeacon, 2000); }
+    public stopBroadcasting(): void { if (this.broadcastInterval) { clearInterval(this.broadcastInterval); this.broadcastInterval = null; } }
+    public startListening(): void { this.createSocket(); }
+    public stop(): void { this.stopBroadcasting(); if (this.socket) { this.socket.close(); this.socket = null; } this.peerTimeouts.forEach(timeout => clearTimeout(timeout)); this.peerTimeouts.clear(); this.discoveredPeers.clear(); }
+}
 
-    constructor() {
-        this._emitter = new EventEmitter();
-    }
+export class DirectIpServer {
+    private server: http.Server | null = null;
+    private pin: string | null = null;
+    private connectedClients: Map<string, { lastSeen: number, updateQueue: SyncData[] }> = new Map();
 
-    public on(event: string, listener: (...args: any[]) => void): this {
-        this._emitter.on(event, listener);
-        return this;
-    }
+    constructor(
+        private processDataCallback: (data: SyncData[], sourceDeviceId: string) => void,
+        private onClientConnected: (peerInfo: PeerInfo) => void,
+        private onClientDisconnected: (deviceId: string) => void
+    ) {}
 
-    private emit(event: string, ...args: any[]): boolean {
-        return this._emitter.emit(event, ...args);
-    }
+    public start(pin: string) {
+        if (this.server) this.stop();
+        this.pin = pin;
 
-    private createSocket() {
-        if (this.socket) return;
-        
-        this.socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-
-        this.socket.on('error', (err: Error) => {
-            console.error('LAN Discovery Socket Error:', err);
+        this.server = http.createServer(this.handleRequest.bind(this));
+        this.server.listen(DIRECT_IP_SERVER_PORT, () => {
+            console.log(`${PLUGIN_NAME_PREFIX}: Direct IP Server listening on port ${DIRECT_IP_SERVER_PORT}`);
+        });
+        this.server.on('error', (err) => {
+            console.error(`${PLUGIN_NAME_PREFIX}: Direct IP Server error:`, err);
             this.stop();
         });
 
-        this.socket.on('listening', () => {
-            try {
-                this.socket?.addMembership(DISCOVERY_MULTICAST_ADDRESS);
-                this.socket?.setMulticastTTL(128);
-                console.log(`LAN Discovery listening on ${DISCOVERY_MULTICAST_ADDRESS}:${DISCOVERY_PORT}`);
-            } catch (e) {
-                console.error("Error setting up multicast:", e);
-            }
+        setInterval(() => {
+            const now = Date.now();
+            this.connectedClients.forEach((client, deviceId) => {
+                if (now - client.lastSeen > 30000) {
+                    this.connectedClients.delete(deviceId);
+                    this.onClientDisconnected(deviceId);
+                }
+            });
+        }, 15000);
+    }
+
+    private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
+        const setCorsHeaders = (response: http.ServerResponse) => {
+            response.setHeader('Access-Control-Allow-Origin', '*');
+            response.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+            response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        };
+
+        setCorsHeaders(res);
+        if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+        const body = await new Promise<string>((resolve) => {
+            let data = '';
+            req.on('data', chunk => data += chunk);
+            req.on('end', () => resolve(data));
         });
 
-        this.socket.on('message', (msg: Buffer, rinfo: dgram.RemoteInfo) => {
-            try {
-                const data = JSON.parse(msg.toString());
-                if (data.type === 'obsidian-decentralized-beacon' && data.peerInfo?.deviceId) {
-                    const peerId = data.peerInfo.deviceId;
+        let payload;
+        try {
+            payload = body ? JSON.parse(body) : {};
+        } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid JSON' }));
+            return;
+        }
 
-                    if (this.peerTimeouts.has(peerId)) {
-                        clearTimeout(this.peerTimeouts.get(peerId)!);
-                    }
+        res.setHeader('Content-Type', 'application/json');
 
-                    const isNew = !this.discoveredPeers.has(peerId);
-                    data.peerInfo.ip = rinfo.address;
-                    this.discoveredPeers.set(peerId, data.peerInfo);
-                    if (isNew) {
-                        this.emit('discover', data.peerInfo);
+        switch (req.url) {
+            case '/handshake':
+                if (payload.pin === this.pin) {
+                    const clientDeviceId = payload.peerInfo.deviceId;
+                    this.connectedClients.set(clientDeviceId, { lastSeen: Date.now(), updateQueue: [] });
+                    this.onClientConnected(payload.peerInfo);
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ status: 'ok' }));
+                } else {
+                    res.writeHead(403);
+                    res.end(JSON.stringify({ error: 'Invalid PIN' }));
+                }
+                break;
+            
+            case '/sync':
+                const clientDeviceId = payload.deviceId;
+                if (this.connectedClients.has(clientDeviceId)) {
+                    const client = this.connectedClients.get(clientDeviceId)!;
+                    client.lastSeen = Date.now();
+                    
+                    if (payload.updates && payload.updates.length > 0) {
+                        this.processDataCallback(payload.updates, clientDeviceId);
                     }
                     
-                    const timeout = window.setTimeout(() => {
-                        this.discoveredPeers.delete(peerId);
-                        this.peerTimeouts.delete(peerId);
-                        this.emit('lose', data.peerInfo);
-                    }, this.discoveryTimeoutMs);
-                    this.peerTimeouts.set(peerId, timeout);
+                    const updatesToSend = [...client.updateQueue];
+                    client.updateQueue = [];
+                    res.writeHead(200);
+                    res.end(JSON.stringify({ updates: updatesToSend }));
+                } else {
+                    res.writeHead(401);
+                    res.end(JSON.stringify({ error: 'Not authenticated' }));
                 }
-            } catch (e) { /* Ignore parsing errors */ }
-        });
+                break;
 
-        this.socket.bind(DISCOVERY_PORT);
-    }
-
-    public startBroadcasting(peerInfo: PeerInfo): void {
-        this.stopBroadcasting(); 
-        this.createSocket();
-        
-        const beaconMessage = JSON.stringify({
-            type: 'obsidian-decentralized-beacon',
-            peerInfo
-        });
-
-        const sendBeacon = () => {
-            this.socket?.send(beaconMessage, 0, beaconMessage.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err) => {
-                if (err) console.error("Beacon send error:", err);
-            });
-        };
-        
-        sendBeacon(); 
-        this.broadcastInterval = window.setInterval(sendBeacon, 2000); 
-    }
-    
-    public stopBroadcasting(): void {
-        if (this.broadcastInterval) {
-            clearInterval(this.broadcastInterval);
-            this.broadcastInterval = null;
+            default:
+                res.writeHead(404);
+                res.end(JSON.stringify({ error: 'Not found' }));
         }
     }
-    
-    public startListening(): void {
-        this.createSocket();
+
+    public enqueueUpdate(data: SyncData) {
+        this.connectedClients.forEach(client => {
+            client.updateQueue.push(data);
+        });
     }
 
-    public stop(): void {
-        this.stopBroadcasting();
-        if (this.socket) {
-            this.socket.close();
-            this.socket = null;
+    public stop() {
+        if (this.server) {
+            this.server.close();
+            this.server = null;
+            this.connectedClients.clear();
+            console.log(`${PLUGIN_NAME_PREFIX}: Direct IP Server stopped.`);
         }
-        this.discoveredPeers.clear();
-        this.peerTimeouts.forEach(timeout => clearTimeout(timeout));
-        this.peerTimeouts.clear();
-        console.log('LAN Discovery stopped.');
     }
 }
