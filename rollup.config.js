@@ -17,8 +17,16 @@ export default {
   plugins: [
     typescript(),
     nodeResolve({
-      browser: true
+      browser: true,
     }),
-    commonjs(),
-  ]
+    commonjs({
+      transformMixedEsModules: true,
+    }),
+  ],
+  onwarn(warning, warn) {
+    if (warning.code === 'THIS_IS_UNDEFINED') {
+      return;
+    }
+    warn(warning);
+  }
 };
