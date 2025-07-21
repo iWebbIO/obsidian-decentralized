@@ -1,108 +1,194 @@
 # Obsidian Decentralized
-![GitHub license](https://img.shields.io/github/license/iWebbIO/obsidian-decentralized)
 
-A free, private, and local-first sync solution for Obsidian.md. Your notes travel directly between your devices, with no central server involved.
+![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
-Tired of paying for sync or trusting a third-party service with your private notes? Obsidian Decentralized offers a fast and secure way to synchronize your vaults across multiple devices on the same local network (e.g., your home Wi-Fi). It uses peer-to-peer technology to send changes directly from one device to another, ensuring your data never leaves your control.
+Sync your Obsidian notes across devices **without a central server**. This plugin uses peer-to-peer technologies (WebRTC via PeerJS) to transfer your files directly between your devices, offering a free, private, and local-first alternative to cloud-based sync services.
 
----
-
-## Key Features
-*   **💻 True Peer-to-Peer Sync:** Your data is never stored on an intermediary server. It travels directly between your devices.
-*   **🏠 Local-First:** Designed to be exceptionally fast and reliable on your local network.
-*   **🤖 Companion Mode:** "Set it and forget it." Permanently pair two devices (like your desktop and phone) for automatic, resilient connections whenever they're on the same network.
-*   **🕸️ Self-Healing Mesh Network:** Connect multiple devices, and they will automatically discover each other and form a resilient sync cluster. If one device goes offline, the others remain in sync.
-*   **⚔️ Built-in Conflict Resolution:** If a note is modified on two devices simultaneously, the plugin will detect the conflict, save the remote version as a separate file, and provide a visual diff tool to help you merge the changes.
-*   **📱 Cross-Platform:** Works on Desktop (Windows, macOS, Linux) and Mobile (Android, iOS).
-*   **💸 Free & Open Source:** No fees, no subscriptions. Ever.
+Your notes are your own. This plugin ensures they stay that way.
 
 ---
 
-## How It Works
-Network Use Disclosure: To facilitate the initial P2P connection, this plugin connects to a public PeerJS signaling server. This server's only job is to help your devices find each other on the network (a process called "signaling"). Your actual notes and data are never sent to or stored on this server; they are transferred directly and securely between your own devices.
+## 📋 Table of Contents
 
-Obsidian Decentralized uses **WebRTC** (the technology behind most modern video-conferencing apps) via the **PeerJS** library to establish direct, encrypted data channels between your devices.
-
-When you connect to one peer, a smart **"gossip" protocol** kicks in. Your devices exchange information about other known peers in the network, allowing them to quickly form a fully-connected mesh. This means that even if the initial device you connected to goes offline, sync continues seamlessly between the remaining devices.
-
-**Companion Mode** adds an extra layer of resilience by making your device periodically attempt to reconnect to its designated companion, ensuring your primary devices find each other without any manual intervention.
-
----
-
-## Installation
-### From Obsidian's Community Plugin Browser (Coming soon ...)
-
-1.  Open Obsidian's `Settings`.
-2.  Go to `Community plugins` and ensure "Restricted mode" is turned **off**.
-3.  Click `Browse` and search for "Obsidian Decentralized".
-4.  Click `Install`, and then once it's finished, click `Enable`.
-
-### Manual Installation
-
-1.  Download the latest release ZIP file from the [Releases](https://github.com/iWebbIO/obsidian-decentralized/releases) page.
-2.  Unzip the contents into your vault's plugin folder: `<YourVault>/.obsidian/plugins/`.
-3.  Reload Obsidian (or disable and re-enable the plugin in settings).
+- [Core Features](#-core-features)
+- [How It Works](#-how-it-works)
+- [Manual Installation](#-manual-installation)
+- [🚀 Getting Started: Connecting Your First Devices](#-getting-started-connecting-your-first-devices)
+  - [Method A: LAN Discovery (Easiest, LAN Only)](#method-a-lan-discovery-easiest-lan-only)
+  - [Method B: By ID / QR Code (Works over Internet)](#method-b-by-id--qr-code-works-over-internet)
+  - [Method C: Companion Mode (For Convenience)](#method-c-companion-mode-for-convenience)
+- [⚙️ Configuration & Advanced Features](#️-configuration--advanced-features)
+  - [Selective Sync](#selective-sync)
+  - [Conflict Resolution](#conflict-resolution)
+  - [Syncing Attachments and Config Files](#syncing-attachments-and-config-files)
+  - [Experimental: Direct IP Mode](#experimental-direct-ip-mode)
+  - [Using a Custom Signaling Server](#using-a-custom-signaling-server)
+- [Conflict Center](#-conflict-center)
+- [Security and Privacy](#-security-and-privacy)
+- [Troubleshooting](#-troubleshooting)
+- [Contributing](#-contributing)
+- [License](#-license)
 
 ---
 
-### Getting Started: A Step-by-Step Guide
-The best way to use this plugin is with Companion Mode between your main computer and your phone.
+## ✨ Core Features
 
-#### Setting up Companion Mode (Desktop + Phone)
+-   **🌐 True Peer-to-Peer Sync:** Files are sent directly from one device to another. No cloud storage, no middleman.
+-   **🕵️‍♂️ LAN Discovery:** Automatically find other devices on your local network without needing to copy/paste IDs.
+-   **🤝 Multiple Connection Methods:** Connect via auto-discovery with a PIN, a unique device ID, a QR code, or (experimentally) a direct IP address.
+-   **⚙️ Powerful Sync Engine:**
+    -   Handles file/folder creation, deletion, and renaming.
+    -   Efficiently syncs only the changes.
+    -   Intelligently chunks large files to handle attachments and media.
+-   **⚔️ Conflict Management:**
+    -   Choose your preferred conflict resolution strategy: create a duplicate file (safest), last-write-wins, or attempt to auto-merge changes in Markdown files.
+    -   A dedicated "Conflict Center" in the ribbon helps you review and resolve conflicts.
+-   **🎛️ Granular Control:**
+    -   Selectively include or exclude folders from sync.
+    -   Optionally sync all file types (images, PDFs, etc.).
+    -   Optionally sync your `.obsidian` config folder (use with caution!).
+-   **🏡 Fully Self-Hostable:** For ultimate privacy, you can run your own PeerJS signaling server.
+-   **📱 Cross-Platform:** Works on Desktop (Windows, macOS, Linux) and Mobile (via PeerJS). LAN Discovery is desktop-only.
 
-**On Device 1 (e.g., your Desktop):**
+## 🤔 How It Works
 
-1.  Click the "Connect to a Peer" ribbon icon (looks like two people) in the left sidebar.
-2.  Select `Setup` under **Companion Mode**.
-3.  Click `Show My ID`. A QR code and your unique Device ID will be displayed. Keep this screen open.
+This plugin uses **PeerJS**, which leverages **WebRTC** technology. Think of it like this:
 
-**On Device 2 (e.g., your Phone):**
+1.  **The Matchmaker (Signaling Server):** When you want to connect two devices, they both check in with a public "signaling server." This server is like a switchboard operator; it introduces your devices to each other and helps them establish a direct communication channel.
+2.  **The Direct Line (P2P Connection):** Once the introduction is made, the signaling server steps away. Your devices then communicate **directly** with each other.
+3.  **Data Transfer:** All your files, changes, and deletions are sent over this secure, direct, end-to-end encrypted channel. **Your notes are never stored on any third-party server.**
 
-1.  Open the same vault in Obsidian. Make sure you're on the same Wi-Fi network.
-2.  Click the "Connect to a Peer" ribbon icon.
-3.  Select `Setup` under **Companion Mode**.
-4.  In the "Companion's ID" text box, you can either:
-    *   Manually type the ID from your Desktop's screen.
-    *   (Easier) If your phone can't scan the QR code, use the "Paste" button after copying the ID.
-5.  Click `Pair`.
+For LAN connections, the plugin can also use multicast UDP packets to broadcast its presence, allowing for automatic discovery without relying on an internet-based signaling server.
 
-**That's it!** The two devices are now permanently paired. They will automatically find and connect to each other whenever they are on the same network with Obsidian open. You will see a `🤝 Connected to...` notice.
+## 📥 Manual Installation
 
-#### Using a One-Time Connection
-This is useful for temporarily syncing with a friend's vault or a device you don't use often.
+This plugin must be installed manually.
 
-1.  **On the "Inviting" Device:**
-    *   Click the "Connect to a Peer" ribbon icon.
-    *   Select `Connect` under **One-Time Connection**.
-    *   Choose your method:
-        *   **Invite with ID:** Shows a QR code and ID for the other device to use.
-        *   **Get PIN:** Shows your local IP address and a temporary 4-digit PIN. This is often the easiest method for mobile-to-mobile connections.
+1.  Go to the [**Releases**](https://github.com/iWebbIO/obsidian-decentralized/releases) page on GitHub.
+2.  Download the `main.js`, `manifest.json`, and `styles.css` files from the latest release.
+3.  Navigate to your Obsidian vault's plugins folder. This is typically located at `<YourVault>/.obsidian/plugins/`.
+    -   If you don't see a `.obsidian` folder, you may need to enable "Show hidden files" in your file explorer.
+4.  Create a new folder inside the `plugins` directory. Name it `obsidian-decentralized`.
+5.  Copy the `main.js`, `manifest.json`, and `styles.css` files you downloaded into this new folder.
+6.  Restart Obsidian or reload the plugins by going to `Settings` -> `Community Plugins` and toggling a different plugin off and on.
+7.  Go to `Settings` -> `Community Plugins`. You should now see "Obsidian Decentralized" in the list.
+8.  Click the toggle to **enable** the plugin.
 
-2.  **On the "Joining" Device:**
-    *   Click the "Connect to a Peer" ribbon icon.
-    *   Select `Connect` -> `Join`.
-    *   Choose the corresponding method (ID or IP + PIN) and enter the information from the inviting device.
-    *   Click `Connect`.
+## 🚀 Getting Started: Connecting Your First Devices
 
----
+First, give your device a memorable name in the plugin settings (e.g., "My Desktop," "My Phone"). This makes it easier to identify.
 
-### Resolving Conflicts
-Conflicts are rare but can happen if you modify the same note on two offline devices and then bring them online.
+Then, open the connection helper by clicking the **Connect Devices** button in settings, or the **`users`** icon in the ribbon.
 
-1.  You will see a notice: `Conflict detected for: Your Note.md`.
-2.  The plugin saves the incoming version of the file with a `(conflict on YYYY-MM-DD)` suffix. Your local version remains untouched.
-3.  A "Swords" icon will appear in the left ribbon, showing the number of active conflicts.
-4.  Click the swords icon to see a list of all conflicts.
-5.  Click `Resolve` next to a conflict to open a diff view. You can see the differences side-by-side.
-6.  Choose to `Keep My Version` or `Use Their Version`. The plugin will handle renaming/deleting the files automatically.
+### Method A: LAN Discovery (Easiest, LAN Only)
 
----
+Use this when both devices are on the same Wi-Fi network. This method does not require an internet connection.
 
-### License
-This plugin is released under the [GPL 3.0 License](LICENSE).
-### Acknowledgements
-* [Obsidian Team](https://obsidian.md)
-* [PeerJS](https://peerjs.com/)
-* [QRCode.js](https://github.com/davidshimjs/qrcodejs)
+**On Device A (e.g., your Desktop):**
+1.  Open the Connection Modal.
+2.  Go to `PeerJS Connection` -> `One-Time Connection`.
+3.  Click `Invite with PIN`.
+4.  The modal will display a 4-digit PIN.
 
-made with ❤️ by moreweb
+**On Device B (e.g., your Phone):**
+1.  Open the Connection Modal.
+2.  Go to `PeerJS Connection` -> `One-Time Connection`.
+3.  Click `Join a Network`.
+4.  You should see "Device A" appear in the "Discovered on LAN" list.
+5.  Tap on it and enter the 4-digit PIN from Device A.
+
+You're connected!
+
+### Method B: By ID / QR Code (Works over Internet)
+
+Use this if your devices are on different networks, or if LAN discovery fails.
+
+**On Device A:**
+1.  Open the Connection Modal -> `PeerJS Connection` -> `One-Time Connection`.
+2.  Click `Show ID`. A unique ID and a QR code for your device will be displayed.
+3.  Click `Copy ID`.
+
+**On Device B:**
+1.  Open the Connection Modal -> `PeerJS Connection` -> `One-Time Connection`.
+2.  Click `Join a Network`.
+3.  Paste the ID from Device A into the "Peer ID" field and click `Connect with ID`. (Alternatively, if you're on mobile, you could scan the QR code).
+
+### Method C: Companion Mode (For Convenience)
+
+Set a primary device (like your desktop) as a "companion" for your other devices (like your phone) for automatic reconnection.
+
+1.  **On your main device (e.g., Desktop):** Get its ID using Method B (`Show ID`).
+2.  **On your secondary device (e.g., Phone):**
+    -   Open the Connection Modal -> `PeerJS Connection` -> `Companion Mode`.
+    -   Paste the ID of your main device into the "Companion's ID" field.
+    -   Click `Pair`.
+
+Now, your phone will automatically try to reconnect to your desktop whenever the plugin is active.
+
+> **💡 Pro Tip:** After connecting for the first time, it's a good idea to run a **Force Full Sync**. Click the `refresh-cw` ribbon icon and select the peer you want to sync with. This ensures both vaults are perfectly aligned.
+
+## ⚙️ Configuration & Advanced Features
+
+All options are available in the plugin's settings tab (`Settings` -> `Obsidian Decentralized`). You may need to enable "Experimental Features" to see all options.
+
+### Selective Sync
+
+-   **Included folders:** Only sync folders that are in this list (one path per line). If this is empty, all folders are synced by default.
+-   **Excluded folders:** Never sync folders in this list. This takes priority over the included list.
+
+### Conflict Resolution
+
+When a file is changed on two devices before they have a chance to sync, a conflict occurs. Choose how you want to handle this:
+
+-   **Create Conflict File (Default & Safest):** The incoming change is saved as a new file, e.g., `My Note (conflict on 2023-10-27).md`. You can then manually compare and merge them.
+-   **Last Write Wins:** The version with the newest modification timestamp is kept, and the other is discarded.
+-   **Attempt Auto-Merge:** For Markdown files, the plugin will try to merge the changes automatically. If it can't merge cleanly, it will fall back to creating a conflict file.
+
+### Syncing Attachments and Config Files
+
+-   **Sync all file types:** By default, the plugin focuses on text files. Enable this to sync images, PDFs, audio, and other attachments.
+-   **Sync '.obsidian' configuration folder:** **(DANGEROUS)** Syncs your Obsidian settings, themes, and snippets. This can cause problems if your devices have different plugins, themes, or operating systems. **Always make a backup before enabling this.**
+
+### Experimental: Direct IP Mode
+
+For completely offline, LAN-only environments where even a signaling server is not desired.
+
+1.  One device (usually a desktop) acts as the **Host**.
+2.  Other devices connect as **Clients**.
+3.  Use the `Connect` modal -> `Direct IP` to configure. The Host will display its IP address and a PIN for clients to use.
+
+### Using a Custom Signaling Server
+
+For maximum privacy, you can run your own [PeerServer](https://github.com/peers/peerjs-server). In the plugin's "Advanced Settings," enable "Use custom signaling server" and enter your server's details.
+
+## ⚔️ Conflict Center
+
+If a conflict occurs and a `(conflict)` file is created, a new icon (`swords`) will appear in the left ribbon. This is the Conflict Center.
+
+-   The icon shows a badge with the number of unresolved conflicts.
+-   Clicking it opens a modal listing all conflicts.
+-   Click `Resolve` on any conflict to open a diff view, allowing you to compare your local version with the remote version and choose which one to keep.
+
+## 🛡️ Security and Privacy
+
+-   **End-to-End Encryption:** All data transferred between your devices is encrypted in-transit using DTLS (part of the WebRTC standard).
+-   **No Cloud Storage:** Your notes are never stored on any third-party server. They are only ever on your devices.
+-   **Signaling Server:** The only third-party interaction is with the signaling server, which is used solely to establish the initial P2P connection. It does not see or handle any of your note data. If you use the self-hosted option, you control this component as well.
+
+## ⚠️ Troubleshooting
+
+-   **Plugin doesn't appear in Obsidian:** After manual installation, if the plugin doesn't show up under Community Plugins, double-check that the folder structure is correct: `<YourVault>/.obsidian/plugins/obsidian-decentralized/` and ensure this folder directly contains `main.js` and `manifest.json`.
+-   **Connection Fails:**
+    -   Ensure both devices are connected to the internet (for the default PeerJS mode).
+    -   Check for firewalls or aggressive ad-blockers (like Pi-hole) that might be blocking the connection to the PeerJS signaling server or the P2P connection itself.
+    -   Double-check that you have copied/pasted the Peer ID correctly.
+-   **Status is "❌ Sync Offline":** The plugin couldn't connect to the signaling server. It will automatically keep retrying with an increasing backoff delay. Check your internet connection.
+-   **LAN Discovery Doesn't Work:** This feature requires UDP multicast, which is sometimes blocked by corporate networks, VPNs, or strict firewall rules. In this case, fall back to connecting via ID/QR Code.
+
+## 🤝 Contributing
+
+Contributions, bug reports, and feature requests are welcome! Please feel free to open an issue or submit a pull request on the [GitHub repository](https://github.com/iWebbIO/obsidian-decentralized).
+
+## 📜 License
+
+This plugin is licensed under the **GNU General Public License v3.0**. For the full license text, please see the `LICENSE` file included in the repository.
