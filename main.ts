@@ -54,7 +54,7 @@ type SyncData =
     | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload
     | FileChunkStartPayload | FileChunkDataPayload;
 
-// Interfaces (same as before)
+// Interfaces
 interface PeerServerConfig { host: string; port: number; path: string; secure: boolean; }
 interface DirectIpConfig { host: string; port: number; pin: string; }
 interface ObsidianDecentralizedSettings {
@@ -822,9 +822,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.statusBar.setText(currentStatus);
     }
 }
-
-// --- All Modals, SettingsTab, and other classes remain unchanged from the original provided code ---
-// --- Paste all classes from ConnectionModal downwards here without modification ---
 
 class ConnectionModal extends Modal {
     private discoveredPeers: Map<string, PeerInfo> = new Map();
