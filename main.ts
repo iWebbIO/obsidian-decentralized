@@ -9,6 +9,7 @@ const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
 const MTIME_TOLERANCE_MS = 2000; // Allow 2s difference in mtime to account for clock drift/FS differences
 const DEBOUNCE_DELAY_MS = 1500; // Wait 1.5s after the last file change before syncing to group events
 const CHUNK_SIZE = 16 * 1024 * 0.95; // PeerJS internal chunk size is 16k, we stay just under to be safe
+const COMPANION_RECONNECT_INTERVAL_MS = 10000; // 10 seconds, more responsive
 
 // --- Type Definitions ---
 type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; };
@@ -35,7 +36,11 @@ type FolderRenamePayload = { type: 'folder-rename', oldPath: string, newPath: st
 
 // Full Sync Operations
 type FullSyncRequestPayload = { type: 'request-full-sync', manifest: VaultManifest };
-type FullSyncResponsePayload = { type: 'response-full-sync', filesToRequest: string[], filesToSend: string[] };
+type FullSyncResponsePayload = { 
+    type: 'response-full-sync'; 
+    filesReceiverWillSend: string[]; // Files the sync initiator will receive
+    filesInitiatorMustSend: string[]; // Files the sync initiator must send
+};
 type FullSyncCompletePayload = { type: 'full-sync-complete' };
 
 // Chunking
@@ -393,6 +398,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public directIpServer: DirectIpServer | null = null;
     public directIpClient: DirectIpClient | null = null;
 
+    // Robust PeerJS initialization state
+    private peerInitRetryTimeout: number | null = null;
+    private peerInitAttempts = 0;
+
     async onload() {
         if (Platform.isMobile) {
             this.lanDiscovery = new DummyLANDiscovery();
@@ -415,10 +424,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
         });
 
-        // Initialize debounced function
         this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), DEBOUNCE_DELAY_MS, false);
-
-        // Improved event registration
         this.registerEvent(this.app.vault.on('create', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('modify', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('delete', (file) => this.handleEvent(file)));
@@ -430,6 +436,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     onunload() { 
         this.peer?.destroy(); 
         if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
+        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.lanDiscovery.stop();
         this.directIpServer?.stop();
         this.directIpClient?.stop();
@@ -437,88 +444,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
     async saveSettings() { await this.saveData(this.settings); }
 
-    public log(...args: any[]) {
-        if (this.settings.verboseLogging) {
-            console.log("Obsidian Decentralized:", ...args);
-        }
-    }
+    public log(...args: any[]) { if (this.settings.verboseLogging) { console.log("Obsidian Decentralized:", ...args); } }
     
-    // --- Event Handling ---
-    private shouldIgnoreEvent(path: string): boolean {
-        const ignoreUntil = this.ignoreEvents.get(path);
-        if (ignoreUntil && Date.now() < ignoreUntil) {
-            return true;
-        }
-        this.ignoreEvents.delete(path);
-        return false;
-    }
-
-    private ignoreNextEventForPath(path: string, durationMs = 2000) {
-        this.ignoreEvents.set(path, Date.now() + durationMs);
-    }
-    
-    private handleEvent(file: TAbstractFile) {
-        if (this.shouldIgnoreEvent(file.path)) return;
-        if (!this.isPathSyncable(file.path)) return;
-        
-        // This is a special case for delete. We must act immediately before the file reference is lost.
-        // We check the vault to see if the file still exists. If not, it was a delete event.
-        if (!this.app.vault.getAbstractFileByPath(file.path)) {
-             this.handleFileDelete(file);
-             return;
-        }
-
-        this.debouncedHandleFileChange(file);
-    }
-    
-    private async handleFileChange(file: TAbstractFile) {
-        this.log(`Processing debounced change for: ${file.path}`);
-        if (file instanceof TFile) {
-            this.sendFileUpdate(file);
-        } else if (file instanceof TFolder) {
-            this.broadcastData({ type: 'folder-create', path: file.path });
-        }
-    }
-    
-    private handleFileDelete(file: TAbstractFile) {
-        if (this.shouldIgnoreEvent(file.path)) return;
-        if (!this.isPathSyncable(file.path)) return;
-
-        this.log(`Processing delete: ${file.path}`);
-        if (file instanceof TFile) {
-            this.broadcastData({ type: 'file-delete', path: file.path });
-        } else if (file instanceof TFolder) {
-            this.broadcastData({ type: 'folder-delete', path: file.path });
-        }
-    }
-    
-    private handleRenameEvent(file: TAbstractFile, oldPath: string) {
-        if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return;
-        if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return;
-        
-        this.log(`Processing rename: ${oldPath} -> ${file.path}`);
-        this.ignoreNextEventForPath(file.path);
-
-        if (file instanceof TFile) {
-            this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path });
-        } else if (file instanceof TFolder) {
-            this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path });
-        }
-    }
+    private shouldIgnoreEvent(path: string): boolean { const ignoreUntil = this.ignoreEvents.get(path); if (ignoreUntil && Date.now() < ignoreUntil) { return true; } this.ignoreEvents.delete(path); return false; }
+    private ignoreNextEventForPath(path: string, durationMs = 2000) { this.ignoreEvents.set(path, Date.now() + durationMs); }
+    private handleEvent(file: TAbstractFile) { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; if (!this.app.vault.getAbstractFileByPath(file.path)) { this.handleFileDelete(file); return; } this.debouncedHandleFileChange(file); }
+    private async handleFileChange(file: TAbstractFile) { this.log(`Processing debounced change for: ${file.path}`); if (file instanceof TFile) { this.sendFileUpdate(file); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-create', path: file.path }); } }
+    private handleFileDelete(file: TAbstractFile) { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; this.log(`Processing delete: ${file.path}`); if (file instanceof TFile) { this.broadcastData({ type: 'file-delete', path: file.path }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-delete', path: file.path }); } }
+    private handleRenameEvent(file: TAbstractFile, oldPath: string) { if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; this.log(`Processing rename: ${oldPath} -> ${file.path}`); this.ignoreNextEventForPath(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path }); } }
 
     // --- Data Broadcasting & Queueing (Flow Control) ---
-    broadcastData(data: SyncData) {
-        this.addToQueue(null, data); // null peerId means broadcast
-    }
-
-    sendData(peerId: string, data: SyncData) {
-        this.addToQueue(peerId, data);
-    }
-    
-    private addToQueue(peerId: string | null, data: SyncData) {
-        this.syncQueue.push({ peerId, data });
-        this.processQueue();
-    }
+    broadcastData(data: SyncData) { this.addToQueue(null, data); }
+    sendData(peerId: string, data: SyncData) { this.addToQueue(peerId, data); }
+    private addToQueue(peerId: string | null, data: SyncData) { this.syncQueue.push({ peerId, data }); this.processQueue(); }
     
     private async processQueue() {
         if (this.isQueueProcessing || this.syncQueue.length === 0) {
@@ -528,33 +466,37 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.updateStatus();
 
         const { peerId, data } = this.syncQueue.shift()!;
-        const peersToSend = peerId ? [peerId] : Array.from(this.connections.keys());
-
+        
         try {
-            // For large file transfers, we handle chunking and wait for an ACK
             if (data.type === 'file-update' && data.content instanceof ArrayBuffer && data.content.byteLength > CHUNK_SIZE) {
                 this.currentTransferId = `${data.path}-${Date.now()}`;
-                
-                // We handle chunking for one peer at a time to avoid complexity
-                const targetPeer = peersToSend[0]; 
-                if (targetPeer) {
-                    await this.sendFileInChunks(targetPeer, data.path, data.mtime, data.content);
-                    // The ack for the final chunk will call processQueue again
+                const targetPeers = peerId ? [peerId] : Array.from(this.connections.keys());
+
+                if (targetPeers.length > 0) {
+                    const firstPeer = targetPeers[0];
+                    this.log(`Starting chunked transfer to ${firstPeer} for ${data.path}`);
+                    
+                    if(targetPeers.length > 1) { // Re-queue for other peers if broadcasting
+                        for(let i = 1; i < targetPeers.length; i++) { this.addToQueue(targetPeers[i], data); }
+                    }
+                    // This function is NOT awaited. It just starts the process. The 'ack' handler will continue the queue.
+                    this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content, this.currentTransferId);
                 } else {
                     this.isQueueProcessing = false;
-                    this.processQueue(); // Nothing to send to, try next item
+                    this.processQueue();
                 }
-
-            } else { // For small files or metadata, just send without waiting for ack
-                this.currentTransferId = `item-${Date.now()}`;
-                peersToSend.forEach(pId => {
-                    const conn = this.connections.get(pId);
-                    if (conn?.open) {
-                        conn.send({ ...data, transferId: this.currentTransferId });
-                    }
-                });
+            } else {
+                if (this.settings.connectionMode === 'direct-ip') {
+                    if (this.directIpClient) this.directIpClient.send(data);
+                    else if (this.directIpServer) this.directIpServer.send(data);
+                } else {
+                    const peersToSend = peerId ? [peerId] : Array.from(this.connections.keys());
+                    peersToSend.forEach(pId => {
+                        const conn = this.connections.get(pId);
+                        if (conn?.open) { conn.send(data); }
+                    });
+                }
                 
-                // Move to the next item immediately
                 this.isQueueProcessing = false;
                 this.processQueue();
             }
@@ -562,12 +504,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             console.error("Error processing sync queue:", e);
             this.isQueueProcessing = false;
             this.currentTransferId = null;
-            this.processQueue(); // Continue with next item
+            this.processQueue();
         }
     }
 
     // --- Connection Management ---
     public reinitializeConnectionManager() {
+        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.peer?.destroy();
         this.directIpClient?.stop();
         this.directIpServer?.stop();
@@ -579,6 +522,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     initializeConnectionManager(onOpen?: (id: string) => void) {
+        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         if (this.settings.connectionMode === 'peerjs') {
             this.initializePeer(onOpen);
         } else {
@@ -587,47 +531,70 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     
     initializePeer(onOpen?: (id: string) => void) {
-        if (this.peer && !this.peer.destroyed) {
-            if (onOpen && !this.peer.disconnected) { onOpen(this.peer.id); }
-            return;
-        }
-        
+        if (this.peer && !this.peer.destroyed) { if (onOpen && !this.peer.disconnected) { onOpen(this.peer.id); } return; }
+        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.peer?.destroy();
+        this.updateStatus("🔌 Connecting...");
 
         let peerOptions: PeerJSOption = {};
-        if (this.settings.useCustomPeerServer) {
-            const { host, port, path, secure } = this.settings.customPeerServerConfig;
-            peerOptions = { host, port, path, secure };
+        if (this.settings.useCustomPeerServer) { peerOptions = { ...this.settings.customPeerServerConfig }; }
+
+        this.log(`Attempting to connect to PeerJS server (Attempt: ${this.peerInitAttempts + 1})...`);
+        try {
+            this.peer = new Peer(this.settings.deviceId, peerOptions);
+        } catch (e) {
+            this.handlePeerError(e);
+            return;
         }
 
-        this.peer = new Peer(this.settings.deviceId, peerOptions);
-        this.log("Initializing PeerJS with ID:", this.settings.deviceId);
+        const connectionTimeout = setTimeout(() => { this.log('PeerJS connection timed out.'); this.handlePeerError(new Error("Connection timed out")); }, 15000);
 
         this.peer.on('open', (id) => {
+            clearTimeout(connectionTimeout);
+            this.peerInitAttempts = 0;
             this.log(`PeerJS connection open. ID: ${id}`);
             new Notice(`Decentralized Sync network is online.`);
             this.updateStatus();
             this.tryToConnectToCompanion();
+            if (!Platform.isMobile) {
+                this.lanDiscovery.startBroadcasting(this.getMyPeerInfo());
+                this.lanDiscovery.startListening();
+            }
             onOpen?.(id);
         });
-        this.peer.on('connection', (conn) => {
-            this.log("Incoming PeerJS connection from:", conn.peer);
-            this.setupConnection(conn);
-        });
-        this.peer.on('error', (err) => {
-            console.error("PeerJS Error:", err);
-            new Notice(`Sync connection error: ${err.type}`);
-            this.updateStatus();
-        });
-        this.peer.on('disconnected', () => {
-            new Notice('Sync network disconnected. Reconnecting...');
-            this.updateStatus();
-        });
+
+        this.peer.on('connection', (conn) => { this.log("Incoming PeerJS connection from:", conn.peer); this.setupConnection(conn); });
+        this.peer.on('error', (err) => { clearTimeout(connectionTimeout); this.handlePeerError(err); });
+        this.peer.on('disconnected', () => { new Notice('Sync network disconnected. Attempting to reconnect...'); this.updateStatus("🔌 Reconnecting..."); });
+        this.peer.on('close', () => { new Notice('Sync connection closed permanently.'); this.handlePeerError(new Error("Peer closed.")); });
+    }
+
+    private handlePeerError(err: any) {
+        console.error("PeerJS Error:", err);
+        this.updateStatus(`❌ Error: ${err.type || 'Connection Failed'}`);
+        this.peer?.destroy();
+        this.peer = null;
+        
+        this.connections.forEach(conn => conn.close());
+        this.connections.clear();
+        this.clusterPeers.clear();
+
+        this.peerInitAttempts++;
+        const backoff = Math.min(30000, this.peerInitAttempts * 2000);
+        new Notice(`Sync connection failed. Retrying in ${backoff / 1000}s...`);
+
+        if(this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
+        this.peerInitRetryTimeout = window.setTimeout(() => { this.initializePeer(); }, backoff);
     }
 
     setupConnection(conn: DataConnection, pin?: string) {
         conn.on('open', () => {
             this.log("DataConnection open with:", conn.peer);
+            if (conn.peer === this.settings.companionPeerId && this.companionConnectionInterval) {
+                clearInterval(this.companionConnectionInterval);
+                this.companionConnectionInterval = null;
+                this.log("Companion connected, stopping reconnect attempts.");
+            }
             conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin });
         });
         conn.on('data', (data: any) => this.processIncomingData(data, conn));
@@ -641,71 +608,38 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (peerInfo) new Notice(`👋 Peer disconnected: ${peerInfo.friendlyName}`);
             if (peerId === this.settings.companionPeerId) {
                 new Notice(`Companion disconnected. Will try to reconnect automatically.`);
+                this.log("Companion connection closed, restarting connection attempts.");
                 this.tryToConnectToCompanion();
             }
         });
-        conn.on('error', (err) => {
-            console.error(`Connection error with ${conn.peer}:`, err);
-            new Notice(`Connection error with a peer.`);
-        });
+        conn.on('error', (err) => { console.error(`Connection error with ${conn.peer}:`, err); new Notice(`Connection error with a peer.`); });
     }
 
-    // --- Incoming Data Processing ---
     processIncomingData(data: any, conn: DataConnection | null) {
-        if (!data || !data.type) return;
-
-        this.log("Received data:", data.type, "from", conn?.peer);
+        if (!data || !data.type) return; this.log("Received data:", data.type, "from", conn?.peer);
         switch (data.type) {
             case 'handshake': this.handleHandshake(data, conn!); break;
             case 'cluster-gossip': this.handleClusterGossip(data); break;
             case 'companion-pair': this.handleCompanionPair(data); break;
-            
-            case 'ack':
-                if (data.transferId === this.currentTransferId) {
-                    this.log(`Ack received for ${this.currentTransferId}. Processing next item.`);
-                    this.currentTransferId = null;
-                    this.isQueueProcessing = false;
-                    this.processQueue();
-                }
-                break;
-            
-            // File & Folder Handlers
+            case 'ack': if (data.transferId === this.currentTransferId) { this.log(`Ack received for chunked transfer ${this.currentTransferId}. Processing next item.`); this.currentTransferId = null; this.isQueueProcessing = false; this.processQueue(); } break;
             case 'file-update': this.applyFileUpdate(data); break;
             case 'file-delete': this.applyFileDelete(data); break;
             case 'file-rename': this.applyFileRename(data); break;
             case 'folder-create': this.applyFolderCreate(data); break;
             case 'folder-delete': this.applyFolderDelete(data); break;
             case 'folder-rename': this.applyFolderRename(data); break;
-
-            // Full Sync Handlers
             case 'request-full-sync': this.handleFullSyncRequest(data, conn!); break;
             case 'response-full-sync': this.handleFullSyncResponse(data, conn!.peer); break;
             case 'full-sync-complete': this.handleFullSyncComplete(); break;
-            
-            // Chunk Handlers
             case 'file-chunk-start': this.handleFileChunkStart(data); break;
             case 'file-chunk-data': this.handleFileChunkData(data, conn!); break;
         }
     }
     
     handleHandshake(data: HandshakePayload, conn: DataConnection) {
-        if (this.joinPin && data.pin !== this.joinPin) {
-            new Notice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 10000);
-            conn.close();
-            return;
-        }
-        if(this.joinPin) this.joinPin = null;
-
-        new Notice(`🤝 Connected to ${data.peerInfo.friendlyName}`);
-        this.connections.set(conn.peer, conn);
-        this.clusterPeers.set(conn.peer, data.peerInfo);
-        this.updateStatus();
-
-        if (conn.peer === this.settings.companionPeerId && this.companionConnectionInterval) {
-            clearInterval(this.companionConnectionInterval);
-            this.companionConnectionInterval = null;
-        }
-        
+        if (this.joinPin && data.pin !== this.joinPin) { new Notice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 10000); conn.close(); return; }
+        if(this.joinPin) this.joinPin = null; new Notice(`🤝 Connected to ${data.peerInfo.friendlyName}`);
+        this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
         const existingPeers = Array.from(this.clusterPeers.values());
         conn.send({ type: 'cluster-gossip', peers: existingPeers });
         this.broadcastData({ type: 'cluster-gossip', peers: [this.getMyPeerInfo(), data.peerInfo] });
@@ -715,592 +649,182 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.settings.connectionMode !== 'peerjs') return;
         data.peers.forEach(peerInfo => {
             if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) return;
-            if (this.peer && !this.peer.disconnected) {
-                this.log("Gossip: attempting to connect to new peer", peerInfo.friendlyName);
-                const conn = this.peer.connect(peerInfo.deviceId);
-                this.setupConnection(conn);
-            }
+            if (this.peer && !this.peer.disconnected) { this.log("Gossip: attempting to connect to new peer", peerInfo.friendlyName); const conn = this.peer.connect(peerInfo.deviceId); this.setupConnection(conn); }
         });
     }
 
     async handleCompanionPair(data: CompanionPairPayload) {
-        this.settings.companionPeerId = data.peerInfo.deviceId;
-        await this.saveSettings();
+        this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
         new Notice(`✅ Paired with ${data.peerInfo.friendlyName} as a companion device.`);
         this.tryToConnectToCompanion();
     }
 
     tryToConnectToCompanion() {
         if (this.settings.connectionMode !== 'peerjs') return;
-        if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
-        if (!this.settings.companionPeerId || !this.peer || this.peer.disconnected) return;
-    
+        if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval); this.companionConnectionInterval = null;
+        const companionId = this.settings.companionPeerId; if (!companionId) return;
         const attemptConnection = () => {
-            const companionId = this.settings.companionPeerId;
-            if (!companionId) {
-                if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
-                this.companionConnectionInterval = null;
-                return;
-            }
-
-            if (this.connections.has(companionId) || !this.peer || this.peer.disconnected) {
-                if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval);
-                this.companionConnectionInterval = null;
-                return;
-            }
-            this.log(`Attempting to connect to companion ${companionId}`);
-            const conn = this.peer.connect(companionId);
-            this.setupConnection(conn);
+            if (!this.settings.companionPeerId) { if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval); this.companionConnectionInterval = null; return; }
+            if (!this.peer || this.peer.disconnected || this.connections.has(companionId)) { return; }
+            this.log(`Attempting to connect to companion ${companionId}`); const conn = this.peer.connect(companionId, { reliable: true }); this.setupConnection(conn);
         };
-    
         attemptConnection();
-        this.companionConnectionInterval = window.setInterval(attemptConnection, 15000);
-        this.registerInterval(this.companionConnectionInterval);
+        this.companionConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS); this.registerInterval(this.companionConnectionInterval);
     }
     
     public async forgetCompanion() {
-        if (this.companionConnectionInterval) {
-            clearInterval(this.companionConnectionInterval);
-            this.companionConnectionInterval = null;
-        }
+        if (this.companionConnectionInterval) { clearInterval(this.companionConnectionInterval); this.companionConnectionInterval = null; }
         const companionId = this.settings.companionPeerId;
-        if (companionId) {
-            const conn = this.connections.get(companionId);
-            conn?.close();
-        }
-        this.settings.companionPeerId = undefined;
-        await this.saveSettings();
-        new Notice('Companion link forgotten.');
+        if (companionId) { const conn = this.connections.get(companionId); conn?.close(); }
+        this.settings.companionPeerId = undefined; await this.saveSettings(); new Notice('Companion link forgotten.');
     }
 
-    // --- Sync Logic & Application ---
-    /**
-     * @fix: Refactored to correctly handle binary files based on settings, and to allow sending to a specific peer.
-     */
     async sendFileUpdate(file: TFile, peerId?: string) {
         if (!this.isPathSyncable(file.path)) return;
-
         const isBinaryFile = this.isBinary(file.extension);
-
-        // Decide if we should sync this file at all
-        if (isBinaryFile && !this.settings.syncAllFileTypes) {
-            this.log(`Skipping binary file because 'syncAllFileTypes' is disabled: ${file.path}`);
-            return;
-        }
-        if (!isBinaryFile && !this.settings.syncAllFileTypes) {
-            // For text files, only sync whitelisted ones if syncAll is off
-            const textWhitelist = ['md', 'css', 'js', 'json'];
-            if (!textWhitelist.includes(file.extension)) {
-                this.log(`Skipping non-whitelisted text file: ${file.path}`);
-                return;
-            }
-        }
-        
+        if (isBinaryFile && !this.settings.syncAllFileTypes) { this.log(`Skipping binary file because 'syncAllFileTypes' is disabled: ${file.path}`); return; }
+        if (!isBinaryFile && !this.settings.syncAllFileTypes) { const textWhitelist = ['md', 'css', 'js', 'json']; if (!textWhitelist.includes(file.extension)) { this.log(`Skipping non-whitelisted text file: ${file.path}`); return; } }
         this.log(`Queueing file update for ${peerId || 'broadcast'}: ${file.path}`);
-
         try {
             const content = await this.app.vault[isBinaryFile ? 'readBinary' : 'cachedRead'](file);
-            const payload: FileUpdatePayload = {
-                type: 'file-update',
-                path: file.path,
-                content,
-                mtime: file.stat.mtime,
-                encoding: isBinaryFile ? 'binary' : 'utf8'
-            };
-            
-            if (peerId) {
-                this.sendData(peerId, payload);
-            } else {
-                this.broadcastData(payload);
-            }
-        } catch (e) {
-            console.error(`Error reading file ${file.path} for sync:`, e);
-        }
+            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding: isBinaryFile ? 'binary' : 'utf8' };
+            if (peerId) { this.sendData(peerId, payload); } else { this.broadcastData(payload); }
+        } catch (e) { console.error(`Error reading file ${file.path} for sync:`, e); }
     }
 
-    /**
-     * @fix: Now independent of settings. Purely identifies if an extension is typically text or binary.
-     */
-    private isBinary(extension: string): boolean {
-        const textExtensions = ['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml'];
-        return !textExtensions.includes((extension || '').toLowerCase());
-    }
-    
-    /**
-     * @fix: Added to provide a platform-agnostic way of comparing ArrayBuffers, works on mobile.
-     */
-    private areArrayBuffersEqual(buf1: ArrayBuffer, buf2: ArrayBuffer): boolean {
-        if (buf1.byteLength !== buf2.byteLength) return false;
-        const view1 = new Uint8Array(buf1);
-        const view2 = new Uint8Array(buf2);
-        for (let i = 0; i < buf1.byteLength; i++) {
-            if (view1[i] !== view2[i]) return false;
-        }
-        return true;
-    }
+    private isBinary(extension: string): boolean { const textExtensions = ['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml']; return !textExtensions.includes((extension || '').toLowerCase()); }
+    private areArrayBuffersEqual(buf1: ArrayBuffer, buf2: ArrayBuffer): boolean { if (buf1.byteLength !== buf2.byteLength) return false; const view1 = new Uint8Array(buf1); const view2 = new Uint8Array(buf2); for (let i = 0; i < buf1.byteLength; i++) { if (view1[i] !== view2[i]) return false; } return true; }
 
-    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer) {
+    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string) {
         const conn = this.connections.get(peerId);
-        if (!conn) {
-             this.log(`No connection to ${peerId} to send chunks.`);
-             this.isQueueProcessing = false;
-             this.processQueue();
-             return;
-        }
-
+        if (!conn?.open) { this.log(`No open connection to ${peerId} to send chunks. Aborting transfer.`); this.isQueueProcessing = false; this.processQueue(); return; }
         const totalChunks = Math.ceil(fileContent.byteLength / CHUNK_SIZE);
-        const transferId = this.currentTransferId!;
-        this.log(`Sending file in ${totalChunks} chunks: ${path} (ID: ${transferId})`);
-        
+        this.log(`Sending file in ${totalChunks} chunks to ${peerId}: ${path} (ID: ${transferId})`);
         conn.send({ type: 'file-chunk-start', path, mtime, totalChunks, transferId });
-        
         for (let i = 0; i < totalChunks; i++) {
-            const start = i * CHUNK_SIZE;
-            const end = start + CHUNK_SIZE;
-            const chunk = fileContent.slice(start, end);
+            if(!conn.open) { this.log(`Connection to ${peerId} closed mid-transfer. Aborting.`); return; }
+            const start = i * CHUNK_SIZE; const end = start + CHUNK_SIZE; const chunk = fileContent.slice(start, end);
             conn.send({ type: 'file-chunk-data', transferId, index: i, data: chunk });
             await new Promise(resolve => setTimeout(resolve, 5));
         }
-        this.log(`Finished sending chunks for ${path}`);
+        this.log(`Finished sending all chunks for ${path} to ${peerId}. Waiting for ack.`);
     }
 
-    handleFileChunkStart(payload: FileChunkStartPayload) {
-        this.pendingFileChunks.set(payload.transferId, {
-            path: payload.path,
-            mtime: payload.mtime,
-            chunks: new Array(payload.totalChunks),
-            total: payload.totalChunks,
-        });
-        this.log(`Receiving chunked file: ${payload.path}, ID: ${payload.transferId}`);
-    }
-
+    handleFileChunkStart(payload: FileChunkStartPayload) { this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, }); this.log(`Receiving chunked file: ${payload.path}, ID: ${payload.transferId}`); }
     async handleFileChunkData(payload: FileChunkDataPayload, conn: DataConnection) {
-        const transfer = this.pendingFileChunks.get(payload.transferId);
-        if (!transfer) {
-            this.log("Received chunk for unknown transfer:", payload.transferId);
-            return;
-        }
-
+        const transfer = this.pendingFileChunks.get(payload.transferId); if (!transfer) { this.log("Received chunk for unknown transfer:", payload.transferId); return; }
         transfer.chunks[payload.index] = payload.data;
-        
         if (transfer.chunks.every(chunk => chunk !== undefined)) {
-            this.log(`All chunks received for ${transfer.path}. Reassembling...`);
-            this.pendingFileChunks.delete(payload.transferId);
-            
-            const totalSize = transfer.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-            const reassembled = new Uint8Array(totalSize);
-            let offset = 0;
-            for (const chunk of transfer.chunks) {
-                reassembled.set(new Uint8Array(chunk), offset);
-                offset += chunk.byteLength;
-            }
-            
-            await this.applyFileUpdate({
-                type: 'file-update',
-                path: transfer.path,
-                content: reassembled.buffer,
-                mtime: transfer.mtime,
-                encoding: 'binary',
-            });
-
-            conn.send({ type: 'ack', transferId: payload.transferId });
-            this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
+            this.log(`All chunks received for ${transfer.path}. Reassembling...`); this.pendingFileChunks.delete(payload.transferId);
+            const totalSize = transfer.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0); const reassembled = new Uint8Array(totalSize); let offset = 0;
+            for (const chunk of transfer.chunks) { reassembled.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
+            await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', });
+            conn.send({ type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
         }
     }
     
     async applyFileUpdate(data: FileUpdatePayload) { 
-        if (!this.isPathSyncable(data.path)) return;
-        
-        const existingFile = this.app.vault.getAbstractFileByPath(data.path); 
-        
+        if (!this.isPathSyncable(data.path)) return; const existingFile = this.app.vault.getAbstractFileByPath(data.path); 
         if (!existingFile) {
-            this.log(`Creating new file: ${data.path}`);
-            this.ignoreNextEventForPath(data.path);
+            this.log(`Creating new file: ${data.path}`); this.ignoreNextEventForPath(data.path);
             try {
-                const folderPath = data.path.substring(0, data.path.lastIndexOf('/'));
-                if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) {
-                    await this.app.vault.createFolder(folderPath);
-                }
-                if (data.encoding === 'binary') {
-                    await this.app.vault.createBinary(data.path, data.content as ArrayBuffer);
-                } else {
-                    await this.app.vault.create(data.path, data.content as string);
-                }
-            } catch (e) { console.error("File creation error:", e); new Notice(`Failed to create file: ${data.path}`); }
-            return;
+                const folderPath = data.path.substring(0, data.path.lastIndexOf('/')); if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) { await this.app.vault.createFolder(folderPath); }
+                if (data.encoding === 'binary') { await this.app.vault.createBinary(data.path, data.content as ArrayBuffer); } else { await this.app.vault.create(data.path, data.content as string); }
+            } catch (e) { console.error("File creation error:", e); new Notice(`Failed to create file: ${data.path}`); } return;
         }
-
         if (existingFile instanceof TFile) { 
-            if (data.mtime > existingFile.stat.mtime + MTIME_TOLERANCE_MS) {
-                this.log(`Applying update (remote is newer): ${data.path}`);
-                this.ignoreNextEventForPath(data.path);
-                if (data.encoding === 'binary') {
-                    await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer);
-                } else {
-                    await this.app.vault.modify(existingFile, data.content as string);
-                }
-                return;
-            }
-            if (data.mtime < existingFile.stat.mtime - MTIME_TOLERANCE_MS) {
-                this.log(`Ignoring update (local is newer): ${data.path}`);
-                return;
-            }
-
+            if (data.mtime > existingFile.stat.mtime + MTIME_TOLERANCE_MS) { this.log(`Applying update (remote is newer): ${data.path}`); this.ignoreNextEventForPath(data.path); if (data.encoding === 'binary') { await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer); } else { await this.app.vault.modify(existingFile, data.content as string); } return; }
+            if (data.mtime < existingFile.stat.mtime - MTIME_TOLERANCE_MS) { this.log(`Ignoring update (local is newer): ${data.path}`); return; }
             const localContent = data.encoding === 'binary' ? await this.app.vault.readBinary(existingFile) : await this.app.vault.cachedRead(existingFile);
-            /** @fix Uses platform-agnostic ArrayBuffer comparison instead of Node's Buffer API. */
-            const contentIsSame = data.encoding === 'binary' 
-                ? this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
-                : localContent === data.content;
-
-            if (contentIsSame) {
-                this.log(`Ignoring update (content is identical): ${data.path}`);
-                return;
-            }
-
-            new Notice(`Conflict detected for: ${data.path}`, 10000);
-            this.log(`Conflict detected for: ${data.path}. Strategy: ${this.settings.conflictResolutionStrategy}`);
-
+            const contentIsSame = data.encoding === 'binary' ? this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer) : localContent === data.content;
+            if (contentIsSame) { this.log(`Ignoring update (content is identical): ${data.path}`); return; }
+            new Notice(`Conflict detected for: ${data.path}`, 10000); this.log(`Conflict detected for: ${data.path}. Strategy: ${this.settings.conflictResolutionStrategy}`);
             switch(this.settings.conflictResolutionStrategy) {
-                case 'last-write-wins':
-                    this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`);
-                    this.ignoreNextEventForPath(data.path);
-                    if (data.encoding === 'binary') {
-                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer);
-                    } else {
-                        await this.app.vault.modify(existingFile, data.content as string);
-                    }
-                    break;
-                
-                case 'attempt-auto-merge':
-                    if (data.encoding === 'binary' || !data.path.endsWith('.md')) {
-                        this.log(`Cannot auto-merge binary or non-md file, creating conflict file: ${data.path}`);
-                        await this.createConflictFile(data);
-                        break;
-                    }
-                    const dmp = new DiffMatchPatch();
-                    const patches = dmp.patch_make(localContent as string, data.content as string);
-                    const [mergedContent, results] = dmp.patch_apply(patches, localContent as string);
-
-                    if (results.every(r => r)) {
-                        this.log(`Conflict successfully auto-merged: ${data.path}`);
-                        this.ignoreNextEventForPath(data.path);
-                        await this.app.vault.modify(existingFile, mergedContent);
-                        new Notice(`Successfully auto-merged ${data.path}`);
-                    } else {
-                        this.log(`Auto-merge failed, creating conflict file: ${data.path}`);
-                        await this.createConflictFile(data);
-                    }
-                    break;
-
-                case 'create-conflict-file':
-                default:
-                    this.log(`Creating conflict file for: ${data.path}`);
-                    await this.createConflictFile(data);
-                    break;
+                case 'last-write-wins': this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`); this.ignoreNextEventForPath(data.path); if (data.encoding === 'binary') { await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer); } else { await this.app.vault.modify(existingFile, data.content as string); } break;
+                case 'attempt-auto-merge': if (data.encoding === 'binary' || !data.path.endsWith('.md')) { this.log(`Cannot auto-merge binary or non-md file, creating conflict file: ${data.path}`); await this.createConflictFile(data); break; } const dmp = new DiffMatchPatch(); const patches = dmp.patch_make(localContent as string, data.content as string); const [mergedContent, results] = dmp.patch_apply(patches, localContent as string); if (results.every(r => r)) { this.log(`Conflict successfully auto-merged: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.modify(existingFile, mergedContent); new Notice(`Successfully auto-merged ${data.path}`); } else { this.log(`Auto-merge failed, creating conflict file: ${data.path}`); await this.createConflictFile(data); } break;
+                case 'create-conflict-file': default: this.log(`Creating conflict file for: ${data.path}`); await this.createConflictFile(data); break;
             }
         } 
     }
     
-    async createConflictFile(data: FileUpdatePayload) {
-        const conflictPath = this.getConflictPath(data.path);
-        if (data.encoding === 'binary') {
-            await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer);
-        } else {
-            await this.app.vault.create(conflictPath, data.content as string);
-        }
-        this.conflictCenter.addConflict(data.path, conflictPath);
-    }
+    async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); if (data.encoding === 'binary') { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
+    async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.delete(existingFile); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); new Notice(`Failed to delete file: ${data.path}`); } } }
+    async applyFileRename(data: FileRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); if (fileToRename instanceof TFile) { try { this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.newPath); await this.app.vault.rename(fileToRename, data.newPath); } catch (e) { console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); new Notice(`Failed to rename file: ${data.oldPath}`); } } }
+    async applyFolderCreate(data: FolderCreatePayload) { if (!this.isPathSyncable(data.path)) return; if (this.app.vault.getAbstractFileByPath(data.path)) return; this.log(`Creating folder: ${data.path}`); this.ignoreNextEventForPath(data.path); try { await this.app.vault.createFolder(data.path); } catch (e) { console.error(`Failed to create folder ${data.path}`, e); } }
+    async applyFolderDelete(data: FolderDeletePayload) { if (!this.isPathSyncable(data.path)) return; const folder = this.app.vault.getAbstractFileByPath(data.path); if (folder instanceof TFolder) { this.log(`Deleting folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); try { await this.app.vault.delete(folder, true); } catch (e) { console.error(`Failed to delete folder ${data.path}`, e); } } }
+    async applyFolderRename(data: FolderRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const folder = this.app.vault.getAbstractFileByPath(data.oldPath); if (folder instanceof TFolder) { this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.oldPath); this.ignoreNextEventForPath(data.newPath); try { await this.app.vault.rename(folder, data.newPath); } catch (e) { console.error(`Failed to rename folder ${data.oldPath}`, e); } } }
 
-    async applyFileDelete(data: FileDeletePayload) { 
-        if (!this.isPathSyncable(data.path)) return;
-        const existingFile = this.app.vault.getAbstractFileByPath(data.path); 
-        if (existingFile) { 
-            try {
-                this.log(`Deleting file: ${data.path}`);
-                this.ignoreNextEventForPath(data.path); 
-                await this.app.vault.delete(existingFile); 
-            } catch (e) {
-                console.error(`Error deleting file: ${data.path}`, e);
-                new Notice(`Failed to delete file: ${data.path}`);
-            }
-        } 
-    }
-    
-    async applyFileRename(data: FileRenamePayload) {
-        if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return;
-        
-        const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath);
-        if (fileToRename instanceof TFile) {
-            try {
-                this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`);
-                this.ignoreNextEventForPath(data.newPath);
-                await this.app.vault.rename(fileToRename, data.newPath);
-            } catch (e) {
-                console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e);
-                new Notice(`Failed to rename file: ${data.oldPath}`);
-            }
-        }
-    }
-    
-    // --- Folder Sync Application ---
-    async applyFolderCreate(data: FolderCreatePayload) {
-        if (!this.isPathSyncable(data.path)) return;
-        if (this.app.vault.getAbstractFileByPath(data.path)) return;
-
-        this.log(`Creating folder: ${data.path}`);
-        this.ignoreNextEventForPath(data.path);
-        try {
-            await this.app.vault.createFolder(data.path);
-        } catch (e) {
-            console.error(`Failed to create folder ${data.path}`, e);
-        }
-    }
-
-    async applyFolderDelete(data: FolderDeletePayload) {
-        if (!this.isPathSyncable(data.path)) return;
-        const folder = this.app.vault.getAbstractFileByPath(data.path);
-        if (folder instanceof TFolder) {
-            this.log(`Deleting folder: ${data.path}`);
-            this.ignoreNextEventForPath(data.path, 5000); // Recursive deletes can take time
-            try {
-                await this.app.vault.delete(folder, true);
-            } catch (e) {
-                console.error(`Failed to delete folder ${data.path}`, e);
-            }
-        }
-    }
-
-    async applyFolderRename(data: FolderRenamePayload) {
-        if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return;
-        const folder = this.app.vault.getAbstractFileByPath(data.oldPath);
-        if (folder instanceof TFolder) {
-            this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`);
-            this.ignoreNextEventForPath(data.oldPath);
-            this.ignoreNextEventForPath(data.newPath);
-            try {
-                await this.app.vault.rename(folder, data.newPath);
-            } catch (e) {
-                console.error(`Failed to rename folder ${data.oldPath}`, e);
-            }
-        }
-    }
-
-    // --- IMPROVED FULL SYNC ---
     private async buildVaultManifest(): Promise<VaultManifest> {
-        const manifest: VaultManifest = [];
-        const allFiles = this.app.vault.getAllLoadedFiles();
-        
-        for (const file of allFiles) {
-            if (this.isPathSyncable(file.path)) {
-                if (file instanceof TFolder) {
-                    if(file.path !== '/') manifest.push({ type: 'folder', path: file.path });
-                } else if (file instanceof TFile) {
-                    manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size });
-                }
-            }
-        }
-        return manifest;
+        const manifest: VaultManifest = []; const allFiles = this.app.vault.getAllLoadedFiles();
+        for (const file of allFiles) { if (this.isPathSyncable(file.path)) { if (file instanceof TFolder) { if(file.path !== '/') manifest.push({ type: 'folder', path: file.path }); } else if (file instanceof TFile) { manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size }); } } } return manifest;
     }
 
     async requestFullSyncFromPeer(peerId: string) {
-        if (this.isSyncing) {
-            new Notice("A sync is already in progress.");
-            return;
-        }
-        const conn = this.connections.get(peerId);
-        if (!conn) { new Notice("Peer not found."); return; }
-        
+        if (this.isSyncing) { new Notice("A sync is already in progress."); return; }
+        const conn = this.connections.get(peerId); if (!conn) { new Notice("Peer not found."); return; }
         new Notice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`);
-        this.isSyncing = true;
-        this.updateStatus();
-
-        const localManifest = await this.buildVaultManifest();
-        this.log(`Sending sync request with ${localManifest.length} items.`);
-        this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest });
+        this.isSyncing = true; this.updateStatus(); const localManifest = await this.buildVaultManifest();
+        this.log(`Sending sync request with ${localManifest.length} items.`); this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest });
     }
 
     async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) {
-        if (this.isSyncing) {
-            new Notice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`);
-            return;
-        }
+        if (this.isSyncing) { new Notice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`); return; }
         new Notice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`);
-        this.isSyncing = true;
-        this.updateStatus();
-
-        const remoteManifest = data.manifest;
-        const localManifest = await this.buildVaultManifest();
-
-        const remoteIndex = new Map(remoteManifest.map(item => [item.path, item]));
-        const localIndex = new Map(localManifest.map(item => [item.path, item]));
-
-        const filesToRequest: string[] = [];
-        const filesToSend: string[] = [];
-
-        // find what we need from the remote (the initiator)
-        remoteIndex.forEach((remoteItem, path) => {
-            const localItem = localIndex.get(path);
-            if (!localItem) { // we don't have it
-                filesToRequest.push(path);
-            } else if (remoteItem.type === 'file' && localItem.type === 'file') {
-                if (remoteItem.mtime > localItem.mtime + MTIME_TOLERANCE_MS) {
-                    filesToRequest.push(path); // theirs is newer
-                }
-            }
-        });
-
-        // find what the remote needs from us
-        localIndex.forEach((localItem, path) => {
-            const remoteItem = remoteIndex.get(path);
-            if (!remoteItem) { // they don't have it
-                filesToSend.push(path);
-            } else if (localItem.type === 'file' && remoteItem.type === 'file') {
-                if (localItem.mtime > remoteItem.mtime + MTIME_TOLERANCE_MS) {
-                    filesToSend.push(path); // ours is newer
-                }
-            }
-        });
-
-        this.log(`Sync plan: Requesting ${filesToRequest.length}, Sending ${filesToSend.length}`);
-        this.sendData(conn.peer, { type: 'response-full-sync', filesToRequest, filesToSend });
-        
-        // Start sending what they need
-        for (const path of filesToSend) {
-            const item = this.app.vault.getAbstractFileByPath(path);
-            if (item instanceof TFile) {
-                /** @fix Send file to specific peer instead of broadcasting. */
-                this.sendFileUpdate(item, conn.peer);
-            } else if (item instanceof TFolder) {
-                this.sendData(conn.peer, { type: 'folder-create', path });
-            }
-        }
-        
-        // This peer's part is mostly done, now it just receives files.
-        // A timeout will mark the sync as complete on this side.
-        const dynamicTimeout = 10000 + (filesToRequest.length + filesToSend.length) * 200;
-        setTimeout(() => {
-            if (this.isSyncing) {
-                 this.handleFullSyncComplete();
-            }
-        }, dynamicTimeout);
+        this.isSyncing = true; this.updateStatus();
+        const remoteManifest = data.manifest; const localManifest = await this.buildVaultManifest();
+        const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); const localIndex = new Map(localManifest.map(item => [item.path, item]));
+        const filesInitiatorMustSend: string[] = []; const filesReceiverWillSend: string[] = [];
+        localIndex.forEach((localItem, path) => { const remoteItem = remoteIndex.get(path); if (!remoteItem) { filesReceiverWillSend.push(path); } else if (localItem.type === 'file' && remoteItem.type === 'file') { if (localItem.mtime > remoteItem.mtime + MTIME_TOLERANCE_MS) { filesReceiverWillSend.push(path); } } });
+        remoteIndex.forEach((remoteItem, path) => { const localItem = localIndex.get(path); if (!localItem) { filesInitiatorMustSend.push(path); } else if (remoteItem.type === 'file' && localItem.type === 'file') { if (remoteItem.mtime > localItem.mtime + MTIME_TOLERANCE_MS) { filesInitiatorMustSend.push(path); } } });
+        this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`);
+        this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend });
+        for (const path of filesReceiverWillSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path }); } }
+        const dynamicTimeout = 20000 + (filesInitiatorMustSend.length + filesReceiverWillSend.length) * 500; setTimeout(() => { if (this.isSyncing) { this.handleFullSyncComplete(); } }, dynamicTimeout);
     }
     
     async handleFullSyncResponse(data: FullSyncResponsePayload, peerId: string) {
         if (!this.isSyncing) return;
-        
-        new Notice("Received sync plan. Exchanging files...");
-        this.log(`Sync plan: Requesting ${data.filesToRequest.length}, Sending ${data.filesToSend.length}`);
-        
-        // The remote peer will now send us the files it determined we need (filesToRequest).
-        // We need to send the files it determined it needs (filesToSend).
-        for (const path of data.filesToSend) {
-            const item = this.app.vault.getAbstractFileByPath(path);
-             if (item instanceof TFile) {
-                /** @fix Send file to specific peer instead of broadcasting. */
-                this.sendFileUpdate(item, peerId);
-            } else if (item instanceof TFolder) {
-                this.sendData(peerId, { type: 'folder-create', path });
-            }
-        }
-        
-        /** @fix Removed incorrect and non-functional deletion logic during full sync. */
-
-        const dynamicTimeout = 10000 + (data.filesToRequest.length + data.filesToSend.length) * 200;
-        setTimeout(() => {
-            if (this.isSyncing) {
-                 this.handleFullSyncComplete();
-            }
-        }, dynamicTimeout);
+        new Notice("Received sync plan. Exchanging files..."); this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, I will receive ${data.filesReceiverWillSend.length}`);
+        for (const path of data.filesInitiatorMustSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { this.sendFileUpdate(item, peerId); } else if (item instanceof TFolder) { this.sendData(peerId, { type: 'folder-create', path }); } }
+        const dynamicTimeout = 20000 + (data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length) * 500; setTimeout(() => { if (this.isSyncing) { this.handleFullSyncComplete(); } }, dynamicTimeout);
     }
 
-    handleFullSyncComplete() {
-        if (!this.isSyncing) return;
-        this.isSyncing = false;
-        this.syncQueue = []; // Clear queue after a full sync
-        this.isQueueProcessing = false;
-        this.currentTransferId = null;
-        this.updateStatus();
-        new Notice("✅ Full sync complete.");
-    }
+    handleFullSyncComplete() { if (!this.isSyncing) return; this.isSyncing = false; this.syncQueue = []; this.isQueueProcessing = false; this.currentTransferId = null; this.updateStatus(); new Notice("✅ Full sync complete."); }
     
     private isPathSyncable(path: string): boolean {
-        if (path.startsWith('.obsidian/') && !this.settings.syncObsidianConfig) {
-            this.log(`Ignoring path in .obsidian: ${path}`);
-            return false;
-        }
-
+        if (path.startsWith('.obsidian/') && !this.settings.syncObsidianConfig) { this.log(`Ignoring path in .obsidian: ${path}`); return false; }
         const excluded = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
         const included = this.settings.includedFolders.split('\n').map(p => p.trim()).filter(Boolean);
-
-        if (excluded.length > 0 && excluded.some(p => path.startsWith(p))) {
-            this.log(`Ignoring excluded path: ${path}`);
-            return false;
-        }
-
-        if (included.length > 0 && !included.some(p => path.startsWith(p))) {
-            this.log(`Ignoring path not in 'included' list: ${path}`);
-            return false;
-        }
-        
+        if (excluded.length > 0 && excluded.some(p => path.startsWith(p))) { this.log(`Ignoring excluded path: ${path}`); return false; }
+        if (included.length > 0 && !included.some(p => path.startsWith(p))) { this.log(`Ignoring path not in 'included' list: ${path}`); return false; }
         return true;
     }
 
     getConflictPath(originalPath: string): string { const extension = originalPath.split('.').pop() || ''; const base = originalPath.substring(0, originalPath.lastIndexOf('.')); const date = new Date().toISOString().split('T')[0]; return `${base} (conflict on ${date}).${extension}`; }
+    getLocalIp(): string | null { if (Platform.isMobile) return null; try { const os = require('os'); const interfaces = os.networkInterfaces(); for (const name in interfaces) { for (const net of interfaces[name]!) { if (net.family === 'IPv4' && !net.internal) return net.address; } } } catch (e) { console.warn("Could not get local IP address.", e); } return null; }
+    getMyPeerInfo(): PeerInfo { return { deviceId: this.peer?.id || this.settings.deviceId, friendlyName: this.settings.friendlyName, ip: this.getLocalIp() }; }
     
-    getLocalIp(): string | null {
-        if (Platform.isMobile) return null;
-        try {
-            const os = require('os');
-            const interfaces = os.networkInterfaces();
-            for (const name in interfaces) {
-                for (const net of interfaces[name]!) {
-                    if (net.family === 'IPv4' && !net.internal) return net.address;
-                }
-            }
-        } catch (e) { console.warn("Could not get local IP address.", e); }
-        return null;
-    }
+    public startDirectIpHost() { if (Platform.isMobile) return; this.reinitializeConnectionManager(); const pin = Math.floor(100000 + Math.random() * 900000).toString(); this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin); this.updateStatus(); return pin; }
+    public async connectToDirectIpHost(config: DirectIpConfig) { this.reinitializeConnectionManager(); this.directIpClient = new DirectIpClient(this, config); this.clusterPeers.set(config.host, { deviceId: config.host, friendlyName: `Host (${config.host})`, ip: config.host }); this.updateStatus(); }
     
-    getMyPeerInfo(): PeerInfo {
-        return { deviceId: this.peer?.id || this.settings.deviceId, friendlyName: this.settings.friendlyName, ip: this.getLocalIp() };
-    }
-    
-    public startDirectIpHost() {
-        if (Platform.isMobile) return;
-        this.reinitializeConnectionManager();
-        const pin = Math.floor(100000 + Math.random() * 900000).toString();
-        this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin);
-        this.updateStatus();
-        return pin;
-    }
-    public async connectToDirectIpHost(config: DirectIpConfig) {
-        this.reinitializeConnectionManager();
-        this.directIpClient = new DirectIpClient(this, config);
-        this.clusterPeers.set(config.host, { deviceId: config.host, friendlyName: `Host (${config.host})`, ip: config.host });
-        this.updateStatus();
-    }
-    
-    updateStatus() {
-        let statusText = "🔄 Sync Idle";
-        if (this.isSyncing) {
-            statusText = "⚙️ Full Syncing...";
-        } else if (this.isQueueProcessing) {
-            statusText = `⏳ Syncing (${this.syncQueue.length} left)`;
-        } else if (this.settings.connectionMode === 'direct-ip') {
-             if (this.directIpServer) statusText = `🔄 Sync Host Mode`;
-             else if (this.directIpClient) statusText = `🔄 Sync Client Mode`;
-             else statusText = `❌ Sync Offline (Direct IP)`;
-        } else {
-             if (this.peer?.disconnected || !this.peer) {
-                 statusText = "❌ Sync Offline";
-             } else if (this.connections.size > 0) {
-                 const totalDevices = this.connections.size + 1;
-                 statusText = `🔄 Sync Cluster (${totalDevices} device${totalDevices > 1 ? 's' : ''})`;
-             }
+    updateStatus(statusText?: string) {
+        if (statusText) { this.statusBar.setText(statusText); return; }
+        let currentStatus = "🔄 Sync Idle";
+        if (this.isSyncing) { currentStatus = "⚙️ Full Syncing..."; }
+        else if (this.isQueueProcessing) { currentStatus = `⏳ Syncing (${this.syncQueue.length + 1} item${this.syncQueue.length > 0 ? 's' : ''})`; }
+        else if (this.settings.connectionMode === 'direct-ip') { if (this.directIpServer) currentStatus = `Host Mode`; else if (this.directIpClient) currentStatus = `Client Mode`; else currentStatus = `❌ Sync Offline (Direct IP)`; }
+        else {
+            if (!this.peer || this.peer.disconnected) { currentStatus = "❌ Sync Offline"; }
+            else if (!this.peer.id) { currentStatus = "🔌 Connecting..."; }
+            else if (this.connections.size > 0) { const totalDevices = this.connections.size + 1; currentStatus = `✅ Sync Cluster (${totalDevices} device${totalDevices > 1 ? 's' : ''})`; }
+            else { currentStatus = "✅ Sync Online"; }
         }
-        this.statusBar.setText(statusText);
+        this.statusBar.setText(currentStatus);
     }
 }
+
+// --- All Modals, SettingsTab, and other classes remain unchanged from the original provided code ---
+// --- Paste all classes from ConnectionModal downwards here without modification ---
 
 class ConnectionModal extends Modal {
     private discoveredPeers: Map<string, PeerInfo> = new Map();
@@ -1328,12 +852,12 @@ class ConnectionModal extends Modal {
             .obsidian-decentralized-connect-modal .obsidian-decentralized-id-block { font-family: monospace; font-size: 1.1em; padding: 0.8em; background-color: var(--background-secondary); border-radius: 6px; word-break: break-all; user-select: all; margin: 1em 0; text-align: left; }
             .obsidian-decentralized-connect-modal .obsidian-decentralized-info-display { font-family: monospace; font-size: 1.2em; text-align: center; margin: 0.5em 0; }
             .obsidian-decentralized-connect-modal .pin-display { font-size: 3em; font-weight: bold; text-align: center; letter-spacing: 0.5em; margin: 0.5em 0; }
-            .obsidian-decentralized-cluster-list { display: flex; flex-direction: column; gap: 8px; margin-top: 1em; max-height: 200px; overflow-y: auto; }
-            .obsidian-decentralized-peer-entry { display: flex; align-items: center; padding: 10px; background-color: var(--background-secondary); border-radius: 6px; border-left: 4px solid var(--background-modifier-border); cursor: pointer; }
-            .obsidian-decentralized-peer-entry:hover { background-color: var(--background-modifier-hover); }
-            .obsidian-decentralized-peer-entry .peer-info { flex-grow: 1; pointer-events: none; }
-            .obsidian-decentralized-peer-entry .peer-name { font-weight: bold; display: block; }
-            .obsidian-decentralized-peer-entry .peer-details { font-size: var(--font-ui-small); color: var(--text-muted); }
+            .obsidian-decentralized-connect-modal .obsidian-decentralized-cluster-list { display: flex; flex-direction: column; gap: 8px; margin-top: 1em; max-height: 200px; overflow-y: auto; }
+            .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry { display: flex; align-items: center; padding: 10px; background-color: var(--background-secondary); border-radius: 6px; border-left: 4px solid var(--background-modifier-border); cursor: pointer; }
+            .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry:hover { background-color: var(--background-modifier-hover); }
+            .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry .peer-info { flex-grow: 1; pointer-events: none; }
+            .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry .peer-name { font-weight: bold; display: block; }
+            .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry .peer-details { font-size: var(--font-ui-small); color: var(--text-muted); }
         `;
         document.head.appendChild(style);
     }
@@ -1946,6 +1470,8 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         if (this.plugin.clusterPeers.size === 0) {
             if (!this.plugin.peer || this.plugin.peer.disconnected) {
                 list.createEl('p', { text: 'Sync is offline. Trying to reconnect...' });
+            } else if (!this.plugin.peer.id) {
+                 list.createEl('p', { text: 'Connecting to sync network...' });
             } else {
                 list.createEl('p', { text: 'Not connected to any other devices.' });
             }
