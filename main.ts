@@ -774,28 +774,69 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     // --- Sync Logic & Application ---
-    async sendFileUpdate(file: TFile) {
+    /**
+     * @fix: Refactored to correctly handle binary files based on settings, and to allow sending to a specific peer.
+     */
+    async sendFileUpdate(file: TFile, peerId?: string) {
         if (!this.isPathSyncable(file.path)) return;
 
-        this.log(`Queueing file update: ${file.path}`);
-        const isBinary = this.isBinary(file.extension);
+        const isBinaryFile = this.isBinary(file.extension);
 
-        if (!isBinary && !this.settings.syncAllFileTypes && !['md', 'css', 'js', 'json'].includes(file.extension)) {
-            return; 
+        // Decide if we should sync this file at all
+        if (isBinaryFile && !this.settings.syncAllFileTypes) {
+            this.log(`Skipping binary file because 'syncAllFileTypes' is disabled: ${file.path}`);
+            return;
         }
+        if (!isBinaryFile && !this.settings.syncAllFileTypes) {
+            // For text files, only sync whitelisted ones if syncAll is off
+            const textWhitelist = ['md', 'css', 'js', 'json'];
+            if (!textWhitelist.includes(file.extension)) {
+                this.log(`Skipping non-whitelisted text file: ${file.path}`);
+                return;
+            }
+        }
+        
+        this.log(`Queueing file update for ${peerId || 'broadcast'}: ${file.path}`);
 
         try {
-            const content = await this.app.vault[isBinary ? 'readBinary' : 'cachedRead'](file);
-            this.broadcastData({ type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding: isBinary ? 'binary' : 'utf8' });
+            const content = await this.app.vault[isBinaryFile ? 'readBinary' : 'cachedRead'](file);
+            const payload: FileUpdatePayload = {
+                type: 'file-update',
+                path: file.path,
+                content,
+                mtime: file.stat.mtime,
+                encoding: isBinaryFile ? 'binary' : 'utf8'
+            };
+            
+            if (peerId) {
+                this.sendData(peerId, payload);
+            } else {
+                this.broadcastData(payload);
+            }
         } catch (e) {
             console.error(`Error reading file ${file.path} for sync:`, e);
         }
     }
 
+    /**
+     * @fix: Now independent of settings. Purely identifies if an extension is typically text or binary.
+     */
     private isBinary(extension: string): boolean {
-        if (!this.settings.syncAllFileTypes) return false;
         const textExtensions = ['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml'];
         return !textExtensions.includes((extension || '').toLowerCase());
+    }
+    
+    /**
+     * @fix: Added to provide a platform-agnostic way of comparing ArrayBuffers, works on mobile.
+     */
+    private areArrayBuffersEqual(buf1: ArrayBuffer, buf2: ArrayBuffer): boolean {
+        if (buf1.byteLength !== buf2.byteLength) return false;
+        const view1 = new Uint8Array(buf1);
+        const view2 = new Uint8Array(buf2);
+        for (let i = 0; i < buf1.byteLength; i++) {
+            if (view1[i] !== view2[i]) return false;
+        }
+        return true;
     }
 
     async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer) {
@@ -906,8 +947,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
 
             const localContent = data.encoding === 'binary' ? await this.app.vault.readBinary(existingFile) : await this.app.vault.cachedRead(existingFile);
+            /** @fix Uses platform-agnostic ArrayBuffer comparison instead of Node's Buffer API. */
             const contentIsSame = data.encoding === 'binary' 
-                ? Buffer.from(localContent as ArrayBuffer).equals(Buffer.from(data.content as ArrayBuffer))
+                ? this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
                 : localContent === data.content;
 
             if (contentIsSame) {
@@ -1126,7 +1168,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         for (const path of filesToSend) {
             const item = this.app.vault.getAbstractFileByPath(path);
             if (item instanceof TFile) {
-                this.sendFileUpdate(item);
+                /** @fix Send file to specific peer instead of broadcasting. */
+                this.sendFileUpdate(item, conn.peer);
             } else if (item instanceof TFolder) {
                 this.sendData(conn.peer, { type: 'folder-create', path });
             }
@@ -1153,20 +1196,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         for (const path of data.filesToSend) {
             const item = this.app.vault.getAbstractFileByPath(path);
              if (item instanceof TFile) {
-                this.sendFileUpdate(item);
+                /** @fix Send file to specific peer instead of broadcasting. */
+                this.sendFileUpdate(item, peerId);
             } else if (item instanceof TFolder) {
                 this.sendData(peerId, { type: 'folder-create', path });
             }
         }
         
-        // As initiator, we must also calculate what to delete.
-        const localManifest = await this.buildVaultManifest();
-        const remoteNeeds = new Set(data.filesToSend);
-        const weNeed = new Set(data.filesToRequest);
-        
-        for (const localItem of localManifest) {
-            if (!remoteNeeds.has(localItem.path) && !weNeed.has(localItem.path)) {}
-        }
+        /** @fix Removed incorrect and non-functional deletion logic during full sync. */
 
         const dynamicTimeout = 10000 + (data.filesToRequest.length + data.filesToSend.length) * 200;
         setTimeout(() => {
