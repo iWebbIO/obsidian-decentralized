@@ -4,12 +4,14 @@ import DiffMatchPatch from 'diff-match-patch';
 import * as QRCode from 'qrcode';
 
 // --- Constants ---
+const PLUGIN_VERSION = '1.1.0';
 const DISCOVERY_PORT = 41234;
 const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
 const MTIME_TOLERANCE_MS = 2000; // Allow 2s difference in mtime to account for clock drift/FS differences
 const DEBOUNCE_DELAY_MS = 1500; // Wait 1.5s after the last file change before syncing to group events
 const CHUNK_SIZE = 16 * 1024 * 0.95; // PeerJS internal chunk size is 16k, we stay just under to be safe
 const COMPANION_RECONNECT_INTERVAL_MS = 10000; // 10 seconds, more responsive
+const CHUNK_TRANSFER_TIMEOUT_MS = 30000; // 30 seconds for a chunked transfer to complete
 
 // --- Type Definitions ---
 type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; };
@@ -27,7 +29,7 @@ type CompanionPairPayload = { type: 'companion-pair'; peerInfo: PeerInfo; };
 type AckPayload = { type: 'ack', transferId: string };
 
 // File & Folder Operations
-type FileUpdatePayload = { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary', transferId?: string };
+type FileUpdatePayload = { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary' | 'base64', transferId?: string };
 type FileDeletePayload = { type: 'file-delete'; path: string; transferId?: string };
 type FileRenamePayload = { type: 'file-rename'; oldPath: string; newPath: string; transferId?: string };
 type FolderCreatePayload = { type: 'folder-create', path: string; transferId?: string };
@@ -38,10 +40,13 @@ type FolderRenamePayload = { type: 'folder-rename', oldPath: string, newPath: st
 type FullSyncRequestPayload = { type: 'request-full-sync', manifest: VaultManifest };
 type FullSyncResponsePayload = {
     type: 'response-full-sync';
-    filesReceiverWillSend: string[]; // Files the sync initiator will receive
-    filesInitiatorMustSend: string[]; // Files the sync initiator must send
+    filesReceiverWillSend: string[];    // Files the sync initiator will receive (updates/creations)
+    filesInitiatorMustSend: string[];   // Files the sync initiator must send (updates/creations)
+    filesReceiverMustDelete: string[];  // Files the sync initiator has that the receiver must delete
+    filesInitiatorMustDelete: string[]; // Files the receiver has that the initiator must delete
 };
-type FullSyncCompletePayload = { type: 'full-sync-complete' };
+type FullSyncBatchCompletePayload = { type: 'full-sync-batch-complete' };
+type FullSyncCompletePayload = { type: 'full-sync-complete' }; // Kept for potential future use, but new handshake is primary
 
 // Chunking
 type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: number, totalChunks: number, transferId: string };
@@ -51,7 +56,7 @@ type SyncData =
     | HandshakePayload | ClusterGossipPayload | CompanionPairPayload | AckPayload
     | FileUpdatePayload | FileDeletePayload | FileRenamePayload
     | FolderCreatePayload | FolderDeletePayload | FolderRenamePayload
-    | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload
+    | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload | FullSyncBatchCompletePayload
     | FileChunkStartPayload | FileChunkDataPayload;
 
 // Interfaces
@@ -98,6 +103,25 @@ interface ILANDiscovery {
     stopBroadcasting(): void;
     startListening(): void;
     stop(): void;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+    const binary_string = window.atob(base64);
+    const len = binary_string.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binary_string.charCodeAt(i);
+    }
+    return bytes.buffer;
 }
 
 class DummyLANDiscovery implements ILANDiscovery {
@@ -228,7 +252,7 @@ class DesktopLANDiscovery implements ILANDiscovery {
 
 class DirectIpServer {
     private server: any | null = null;
-    private messageQueue: SyncData[] = [];
+    private messageQueueByDevice: Map<string, SyncData[]> = new Map();
     private pin: string;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
@@ -268,23 +292,24 @@ class DirectIpServer {
         const deviceId = req.headers['x-device-id'];
         const pin = req.headers['x-pin'];
 
-        if (pin !== this.pin) {
+        if (!deviceId || pin !== this.pin) {
             res.writeHead(403, CORS_HEADERS);
-            res.end(JSON.stringify({ error: 'Invalid PIN' }));
+            res.end(JSON.stringify({ error: 'Invalid PIN or missing Device ID' }));
             return;
         }
 
         if (req.url === '/poll' && req.method === 'GET') {
+            const queue = this.messageQueueByDevice.get(deviceId) || [];
             res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(this.messageQueue));
-            this.messageQueue = [];
+            res.end(JSON.stringify(queue));
+            this.messageQueueByDevice.set(deviceId, []);
         } else if (req.url === '/push' && req.method === 'POST') {
             let body = '';
             req.on('data', (chunk: any) => body += chunk.toString());
             req.on('end', () => {
                 try {
                     const data: SyncData = JSON.parse(body);
-                    this.plugin.processIncomingData(data, null);
+                    this.plugin.processIncomingData(data, null, 'direct-ip');
                     res.writeHead(200, CORS_HEADERS);
                     res.end(JSON.stringify({ status: 'ok' }));
                 } catch (e) {
@@ -299,7 +324,14 @@ class DirectIpServer {
     }
 
     send(data: SyncData) {
-        this.messageQueue.push(data);
+        // Broadcast to all connected clients
+        const clientIds = Array.from(this.plugin.clusterPeers.keys());
+        clientIds.forEach(id => {
+            if (!this.messageQueueByDevice.has(id)) {
+                this.messageQueueByDevice.set(id, []);
+            }
+            this.messageQueueByDevice.get(id)!.push(data);
+        });
     }
 
     stop() {
@@ -314,7 +346,7 @@ class DirectIpClient {
     private baseUrl: string;
     private headers: Record<string, string>;
 
-    constructor(private plugin: ObsidianDecentralizedPlugin, config: DirectIpConfig) {
+    constructor(private plugin: ObsidianDecentralizedPlugin, private config: DirectIpConfig) {
         this.baseUrl = `http://${config.host}:${config.port}`;
         this.headers = {
             'Content-Type': 'application/json',
@@ -335,8 +367,13 @@ class DirectIpClient {
             if (response.status === 200) {
                 const messages: SyncData[] = response.json;
                 for (const msg of messages) {
-                    this.plugin.processIncomingData(msg, null);
+                    this.plugin.processIncomingData(msg, null, 'direct-ip');
                 }
+            } else if (response.status === 403) {
+                 new Notice('Direct IP connection rejected: Invalid PIN.');
+                 this.plugin.log('Direct IP Poll Error: 403 Forbidden. Check PIN.');
+                 this.stop();
+                 this.plugin.reinitializeConnectionManager();
             }
         } catch (e) {
             this.plugin.log('Direct IP Poll Error:', e);
@@ -379,7 +416,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     lanDiscovery: ILANDiscovery;
 
     // State Management
-    private isSyncing: boolean = false; // General lock for full sync
     private ignoreEvents: Map<string, number> = new Map(); // Better event ignoring
     private statusBar: HTMLElement;
     private conflictCenter: ConflictCenter;
@@ -387,11 +423,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private companionConnectionInterval: number | null = null;
     private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number }> = new Map();
 
+    private syncState: {
+        isSyncing: boolean;
+        peerId: string | null;
+        sentMyBatchComplete: boolean;
+        receivedPeerBatchComplete: boolean;
+    } = { isSyncing: false, peerId: null, sentMyBatchComplete: false, receivedPeerBatchComplete: false };
+
+
     // Sync Queue for Flow Control
     private syncQueue: { peerId: string | null, data: SyncData }[] = []; // null peerId for broadcast
     private isQueueProcessing: boolean = false;
     private currentTransferId: string | null = null;
-    private chunkTransferTimeout: number | null = null; // <<< FIX: Timeout for chunk transfers
+    private chunkTransferTimeout: number | null = null;
 
     // Debounced handlers
     private debouncedHandleFileChange: (file: TAbstractFile) => void;
@@ -418,7 +462,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.addRibbonIcon('users', 'Connect to a Peer', () => new ConnectionModal(this.app, this).open());
         this.addRibbonIcon('refresh-cw', 'Force Full Sync with Peer', () => {
             if (this.settings.connectionMode === 'direct-ip') {
-                new Notice("Full Sync is not available in Direct IP mode yet.");
+                new Notice("Full Sync is not yet available in Direct IP mode.");
                 return;
             }
             if (this.connections.size === 0) { new Notice("No peers connected."); return; }
@@ -482,37 +526,44 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         for (let i = 1; i < targetPeers.length; i++) { this.addToQueue(targetPeers[i], data); }
                     }
 
-                    // <<< FIX: Add a watchdog timeout for the transfer
                     const transferIdForTimeout = this.currentTransferId;
                     this.chunkTransferTimeout = window.setTimeout(() => {
-                        // This will run if the 'ack' isn't received in time
                         if (this.currentTransferId === transferIdForTimeout) {
                             this.log(`Chunk transfer for ${transferIdForTimeout} timed out. Aborting and continuing queue.`);
                             new Notice(`A file transfer timed out. Check connection.`, 8000);
                             this.currentTransferId = null;
                             this.isQueueProcessing = false;
-                            this.processQueue(); // Un-stick the queue
+                            this.processQueue();
                         }
-                    }, 30000); // 30-second timeout
+                    }, CHUNK_TRANSFER_TIMEOUT_MS);
 
-                    // This function is NOT awaited. It just starts the process. The 'ack' handler will continue the queue.
                     this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content, this.currentTransferId);
                 } else {
                     this.isQueueProcessing = false;
                     this.processQueue();
                 }
             } else {
+                let processedData = data;
+                if (this.settings.connectionMode === 'direct-ip' && data.type === 'file-update' && data.content instanceof ArrayBuffer) {
+                    processedData = { ...data, content: arrayBufferToBase64(data.content), encoding: 'base64' };
+                }
+
                 if (this.settings.connectionMode === 'direct-ip') {
-                    if (this.directIpClient) this.directIpClient.send(data);
-                    else if (this.directIpServer) this.directIpServer.send(data);
+                    if (this.directIpClient) await this.directIpClient.send(processedData);
+                    else if (this.directIpServer) this.directIpServer.send(processedData);
                 } else {
                     const peersToSend = peerId ? [peerId] : Array.from(this.connections.keys());
                     peersToSend.forEach(pId => {
                         const conn = this.connections.get(pId);
-                        if (conn?.open) { conn.send(data); }
+                        if (conn?.open) {
+                            try {
+                                conn.send(processedData);
+                            } catch (e) {
+                                this.log(`Failed to send data to peer ${pId}, it may have disconnected.`, e);
+                            }
+                        }
                     });
                 }
-
                 this.isQueueProcessing = false;
                 this.processQueue();
             }
@@ -543,7 +594,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         if (this.settings.connectionMode === 'peerjs') {
             this.initializePeer(onOpen);
-        } else {
+        } else if (this.settings.connectionMode === 'direct-ip') {
+            if (!Platform.isMobile) {
+                this.log("Direct IP mode is active, but requires user action (Host or Connect) to start.");
+            }
             this.updateStatus();
         }
     }
@@ -583,13 +637,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         this.peer.on('connection', (conn) => { this.log("Incoming PeerJS connection from:", conn.peer); this.setupConnection(conn); });
         this.peer.on('error', (err) => { clearTimeout(connectionTimeout); this.handlePeerError(err); });
-        this.peer.on('disconnected', () => { new Notice('Sync network disconnected. Attempting to reconnect...'); this.updateStatus("🔌 Reconnecting..."); });
+        this.peer.on('disconnected', () => { new Notice('Sync network disconnected. Attempting to reconnect...'); this.updateStatus("🔌 Reconnecting..."); this.reinitializeConnectionManager(); });
         this.peer.on('close', () => { new Notice('Sync connection closed permanently.'); this.handlePeerError(new Error("Peer closed.")); });
     }
 
     private handlePeerError(err: any) {
         console.error("PeerJS Error:", err);
-        // <<< FIX: Status bar shows error first, then transitions to retry status
         this.updateStatus(`❌ Error: ${err.type || 'Connection Failed'}`);
         this.peer?.destroy();
         this.peer = null;
@@ -599,17 +652,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.clusterPeers.clear();
 
         this.peerInitAttempts++;
-        const backoff = Math.min(30000, this.peerInitAttempts * 2000);
+        const backoff = Math.min(30000, 1000 + this.peerInitAttempts * 2000); // Start with shorter backoff
         new Notice(`Sync connection failed. Retrying in ${backoff / 1000}s...`);
 
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
-        // <<< FIX: Update status to show informative retry message
+        
+        setTimeout(() => this.updateStatus(`🔌 Offline (retrying in ${backoff / 1000}s)`), 2000);
+
         this.peerInitRetryTimeout = window.setTimeout(() => {
-            this.updateStatus(`🔌 Offline (retrying in ${backoff / 1000}s)`);
             this.initializePeer();
         }, backoff);
-        // Give a bit of time for the initial error message to be seen before showing the retry countdown
-        setTimeout(() => this.updateStatus(`❌ Offline (retrying in ${backoff / 1000}s)`), 1000);
     }
 
     setupConnection(conn: DataConnection, pin?: string) {
@@ -622,13 +674,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin });
         });
-        conn.on('data', (data: any) => this.processIncomingData(data, conn));
+        conn.on('data', (data: any) => this.processIncomingData(data, conn, 'peerjs'));
         conn.on('close', () => {
             const peerId = conn.peer;
             this.log("DataConnection closed with:", peerId);
             this.connections.delete(peerId);
             const peerInfo = this.clusterPeers.get(peerId);
             this.clusterPeers.delete(peerId);
+            if (this.syncState.isSyncing && this.syncState.peerId === peerId) {
+                new Notice(`Peer disconnected during full sync. Aborting.`);
+                this.resetFullSyncState();
+            }
             this.updateStatus();
             if (peerInfo) new Notice(`👋 Peer disconnected: ${peerInfo.friendlyName}`);
             if (peerId === this.settings.companionPeerId) {
@@ -640,18 +696,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         conn.on('error', (err) => { console.error(`Connection error with ${conn.peer}:`, err); new Notice(`Connection error with a peer.`); });
     }
 
-    processIncomingData(data: any, conn: DataConnection | null) {
-        if (!data || !data.type) return; this.log("Received data:", data.type, "from", conn?.peer);
+    processIncomingData(data: any, conn: DataConnection | null, source: 'peerjs' | 'direct-ip') {
+        if (!data || !data.type) return;
+        this.log("Received data:", data.type, "from", conn?.peer || 'Direct IP');
+        
+        if (source === 'direct-ip' && data.type === 'file-update' && data.encoding === 'base64') {
+            try {
+                data.content = base64ToArrayBuffer(data.content);
+                data.encoding = 'binary';
+            } catch (e) {
+                console.error("Failed to decode Base64 content from Direct IP:", e);
+                return;
+            }
+        }
+
         switch (data.type) {
             case 'handshake': this.handleHandshake(data, conn!); break;
             case 'cluster-gossip': this.handleClusterGossip(data); break;
             case 'companion-pair': this.handleCompanionPair(data); break;
             case 'ack':
                 if (data.transferId === this.currentTransferId) {
-                    // <<< FIX: Clear the transfer timeout on successful ack
                     if (this.chunkTransferTimeout) clearTimeout(this.chunkTransferTimeout);
                     this.chunkTransferTimeout = null;
-
                     this.log(`Ack received for chunked transfer ${this.currentTransferId}. Processing next item.`);
                     this.currentTransferId = null;
                     this.isQueueProcessing = false;
@@ -665,8 +731,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'folder-delete': this.applyFolderDelete(data); break;
             case 'folder-rename': this.applyFolderRename(data); break;
             case 'request-full-sync': this.handleFullSyncRequest(data, conn!); break;
-            case 'response-full-sync': this.handleFullSyncResponse(data, conn!.peer); break;
-            case 'full-sync-complete': this.handleFullSyncComplete(); break;
+            case 'response-full-sync': this.handleFullSyncResponse(data, conn!); break;
+            case 'full-sync-batch-complete': this.handleFullSyncBatchComplete(conn!); break;
+            case 'full-sync-complete': this.handleFullSyncComplete(); break; // Legacy, kept for compatibility
             case 'file-chunk-start': this.handleFileChunkStart(data); break;
             case 'file-chunk-data': this.handleFileChunkData(data, conn!); break;
         }
@@ -685,7 +752,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.settings.connectionMode !== 'peerjs') return;
         data.peers.forEach(peerInfo => {
             if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) return;
-            if (this.peer && !this.peer.disconnected) { this.log("Gossip: attempting to connect to new peer", peerInfo.friendlyName); const conn = this.peer.connect(peerInfo.deviceId); this.setupConnection(conn); }
+            if (this.peer && !this.peer.disconnected) { this.log("Gossip: attempting to connect to new peer", peerInfo.friendlyName); const conn = this.peer.connect(peerInfo.deviceId, { reliable: true }); this.setupConnection(conn); }
         });
     }
 
@@ -717,15 +784,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async sendFileUpdate(file: TFile, peerId?: string) {
         if (!this.isPathSyncable(file.path)) return;
-        const isBinaryFile = this.isBinary(file.extension);
-        if (isBinaryFile && !this.settings.syncAllFileTypes) { this.log(`Skipping binary file because 'syncAllFileTypes' is disabled: ${file.path}`); return; }
-        if (!isBinaryFile && !this.settings.syncAllFileTypes) { const textWhitelist = ['md', 'css', 'js', 'json']; if (!textWhitelist.includes(file.extension)) { this.log(`Skipping non-whitelisted text file: ${file.path}`); return; } }
+        if (!this.isFiletypeSyncable(file.extension)) {
+            this.log(`Skipping file with non-whitelisted extension because syncAllFileTypes is off: ${file.path}`);
+            return;
+        }
+
         this.log(`Queueing file update for ${peerId || 'broadcast'}: ${file.path}`);
         try {
-            const content = await this.app.vault[isBinaryFile ? 'readBinary' : 'cachedRead'](file);
-            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding: isBinaryFile ? 'binary' : 'utf8' };
+            const isBinary = this.isBinary(file.extension);
+            const content = await this.app.vault[isBinary ? 'readBinary' : 'cachedRead'](file);
+            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding: isBinary ? 'binary' : 'utf8' };
             if (peerId) { this.sendData(peerId, payload); } else { this.broadcastData(payload); }
         } catch (e) { console.error(`Error reading file ${file.path} for sync:`, e); }
+    }
+
+    private isFiletypeSyncable(extension: string): boolean {
+        if (this.settings.syncAllFileTypes) {
+            return true;
+        }
+        const textWhitelist = ['md', 'css', 'js', 'json', 'txt', 'html', 'xml', 'csv', 'yaml', 'toml'];
+        return textWhitelist.includes((extension || '').toLowerCase());
     }
 
     private isBinary(extension: string): boolean { const textExtensions = ['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml']; return !textExtensions.includes((extension || '').toLowerCase()); }
@@ -761,30 +839,32 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async applyFileUpdate(data: FileUpdatePayload) {
         if (!this.isPathSyncable(data.path)) return; const existingFile = this.app.vault.getAbstractFileByPath(data.path);
+        const isBinary = data.encoding === 'binary' || data.encoding === 'base64';
+        
         if (!existingFile) {
             this.log(`Creating new file: ${data.path}`); this.ignoreNextEventForPath(data.path);
             try {
                 const folderPath = data.path.substring(0, data.path.lastIndexOf('/')); if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) { await this.app.vault.createFolder(folderPath); }
-                if (data.encoding === 'binary') { await this.app.vault.createBinary(data.path, data.content as ArrayBuffer); } else { await this.app.vault.create(data.path, data.content as string); }
+                if (isBinary) { await this.app.vault.createBinary(data.path, data.content as ArrayBuffer); } else { await this.app.vault.create(data.path, data.content as string); }
             } catch (e) { console.error("File creation error:", e); new Notice(`Failed to create file: ${data.path}`); } return;
         }
         if (existingFile instanceof TFile) {
-            if (data.mtime > existingFile.stat.mtime + MTIME_TOLERANCE_MS) { this.log(`Applying update (remote is newer): ${data.path}`); this.ignoreNextEventForPath(data.path); if (data.encoding === 'binary') { await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer); } else { await this.app.vault.modify(existingFile, data.content as string); } return; }
+            if (data.mtime > existingFile.stat.mtime + MTIME_TOLERANCE_MS) { this.log(`Applying update (remote is newer): ${data.path}`); this.ignoreNextEventForPath(data.path); if (isBinary) { await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer); } else { await this.app.vault.modify(existingFile, data.content as string); } return; }
             if (data.mtime < existingFile.stat.mtime - MTIME_TOLERANCE_MS) { this.log(`Ignoring update (local is newer): ${data.path}`); return; }
-            const localContent = data.encoding === 'binary' ? await this.app.vault.readBinary(existingFile) : await this.app.vault.cachedRead(existingFile);
-            const contentIsSame = data.encoding === 'binary' ? this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer) : localContent === data.content;
+            const localContent = isBinary ? await this.app.vault.readBinary(existingFile) : await this.app.vault.cachedRead(existingFile);
+            const contentIsSame = isBinary ? this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer) : localContent === data.content;
             if (contentIsSame) { this.log(`Ignoring update (content is identical): ${data.path}`); return; }
             new Notice(`Conflict detected for: ${data.path}`, 10000); this.log(`Conflict detected for: ${data.path}. Strategy: ${this.settings.conflictResolutionStrategy}`);
             switch (this.settings.conflictResolutionStrategy) {
-                case 'last-write-wins': this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`); this.ignoreNextEventForPath(data.path); if (data.encoding === 'binary') { await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer); } else { await this.app.vault.modify(existingFile, data.content as string); } break;
-                case 'attempt-auto-merge': if (data.encoding === 'binary' || !data.path.endsWith('.md')) { this.log(`Cannot auto-merge binary or non-md file, creating conflict file: ${data.path}`); await this.createConflictFile(data); break; } const dmp = new DiffMatchPatch(); const patches = dmp.patch_make(localContent as string, data.content as string); const [mergedContent, results] = dmp.patch_apply(patches, localContent as string); if (results.every(r => r)) { this.log(`Conflict successfully auto-merged: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.modify(existingFile, mergedContent); new Notice(`Successfully auto-merged ${data.path}`); } else { this.log(`Auto-merge failed, creating conflict file: ${data.path}`); await this.createConflictFile(data); } break;
+                case 'last-write-wins': this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`); this.ignoreNextEventForPath(data.path); if (isBinary) { await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer); } else { await this.app.vault.modify(existingFile, data.content as string); } break;
+                case 'attempt-auto-merge': if (isBinary || !data.path.endsWith('.md')) { this.log(`Cannot auto-merge binary or non-md file, creating conflict file: ${data.path}`); await this.createConflictFile(data); break; } const dmp = new DiffMatchPatch(); const patches = dmp.patch_make(localContent as string, data.content as string); const [mergedContent, results] = dmp.patch_apply(patches, localContent as string); if (results.every(r => r)) { this.log(`Conflict successfully auto-merged: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.modify(existingFile, mergedContent); new Notice(`Successfully auto-merged ${data.path}`); } else { this.log(`Auto-merge failed, creating conflict file: ${data.path}`); await this.createConflictFile(data); } break;
                 case 'create-conflict-file': default: this.log(`Creating conflict file for: ${data.path}`); await this.createConflictFile(data); break;
             }
         }
     }
 
-    async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); if (data.encoding === 'binary') { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
-    async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.delete(existingFile); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); new Notice(`Failed to delete file: ${data.path}`); } } }
+    async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); const isBinary = data.encoding === 'binary' || data.encoding === 'base64'; if (isBinary) { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
+    async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file/folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); await this.app.vault.delete(existingFile, true); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); new Notice(`Failed to delete file: ${data.path}`); } } }
     async applyFileRename(data: FileRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); if (fileToRename instanceof TFile) { try { this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.newPath); await this.app.vault.rename(fileToRename, data.newPath); } catch (e) { console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); new Notice(`Failed to rename file: ${data.oldPath}`); } } }
     async applyFolderCreate(data: FolderCreatePayload) { if (!this.isPathSyncable(data.path)) return; if (this.app.vault.getAbstractFileByPath(data.path)) return; this.log(`Creating folder: ${data.path}`); this.ignoreNextEventForPath(data.path); try { await this.app.vault.createFolder(data.path); } catch (e) { console.error(`Failed to create folder ${data.path}`, e); } }
     async applyFolderDelete(data: FolderDeletePayload) { if (!this.isPathSyncable(data.path)) return; const folder = this.app.vault.getAbstractFileByPath(data.path); if (folder instanceof TFolder) { this.log(`Deleting folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); try { await this.app.vault.delete(folder, true); } catch (e) { console.error(`Failed to delete folder ${data.path}`, e); } } }
@@ -796,43 +876,166 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async requestFullSyncFromPeer(peerId: string) {
-        if (this.isSyncing) { new Notice("A sync is already in progress."); return; }
+        if (this.syncState.isSyncing) { new Notice("A sync is already in progress."); return; }
         const conn = this.connections.get(peerId); if (!conn) { new Notice("Peer not found."); return; }
+        
         new Notice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`);
-        this.isSyncing = true; this.updateStatus(); const localManifest = await this.buildVaultManifest();
-        this.log(`Sending sync request with ${localManifest.length} items.`); this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest });
+        this.syncState = { isSyncing: true, peerId, sentMyBatchComplete: false, receivedPeerBatchComplete: false };
+        this.updateStatus(); 
+        
+        try {
+            const localManifest = await this.buildVaultManifest();
+            this.log(`Sending sync request with ${localManifest.length} items.`); 
+            this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest });
+        } catch (e) {
+            console.error("Failed to start full sync:", e);
+            new Notice("Error starting full sync. See console for details.");
+            this.resetFullSyncState();
+        }
     }
 
     async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) {
-        if (this.isSyncing) { new Notice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`); return; }
+        if (this.syncState.isSyncing) { new Notice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`); return; }
         new Notice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`);
-        this.isSyncing = true; this.updateStatus();
-        const remoteManifest = data.manifest; const localManifest = await this.buildVaultManifest();
-        const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); const localIndex = new Map(localManifest.map(item => [item.path, item]));
-        const filesInitiatorMustSend: string[] = []; const filesReceiverWillSend: string[] = [];
-        localIndex.forEach((localItem, path) => { const remoteItem = remoteIndex.get(path); if (!remoteItem) { filesReceiverWillSend.push(path); } else if (localItem.type === 'file' && remoteItem.type === 'file') { if (localItem.mtime > remoteItem.mtime + MTIME_TOLERANCE_MS) { filesReceiverWillSend.push(path); } } });
-        remoteIndex.forEach((remoteItem, path) => { const localItem = localIndex.get(path); if (!localItem) { filesInitiatorMustSend.push(path); } else if (remoteItem.type === 'file' && localItem.type === 'file') { if (remoteItem.mtime > localItem.mtime + MTIME_TOLERANCE_MS) { filesInitiatorMustSend.push(path); } } });
-        this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`);
-        this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend });
-        for (const path of filesReceiverWillSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path }); } }
-        const dynamicTimeout = 20000 + (filesInitiatorMustSend.length + filesReceiverWillSend.length) * 500; setTimeout(() => { if (this.isSyncing) { this.handleFullSyncComplete(); } }, dynamicTimeout);
+        this.syncState = { isSyncing: true, peerId: conn.peer, sentMyBatchComplete: false, receivedPeerBatchComplete: false };
+        this.updateStatus();
+
+        try {
+            const remoteManifest = data.manifest; 
+            const localManifest = await this.buildVaultManifest();
+            const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); 
+            const localIndex = new Map(localManifest.map(item => [item.path, item]));
+            
+            const filesInitiatorMustSend: string[] = []; // Files they have that I don't/mine are older
+            const filesReceiverWillSend: string[] = []; // Files I have that they don't/theirs are older
+            const filesInitiatorMustDelete: string[] = []; // Files I have that they don't
+            const filesReceiverMustDelete: string[] = []; // Files they have that I don't
+
+            // Compare local to remote
+            localIndex.forEach((localItem, path) => {
+                const remoteItem = remoteIndex.get(path);
+                if (!remoteItem) {
+                    filesReceiverWillSend.push(path); // I have it, they don't. I'll send it.
+                } else if (localItem.type === 'file' && remoteItem.type === 'file') {
+                    if (localItem.mtime > remoteItem.mtime + MTIME_TOLERANCE_MS) {
+                        filesReceiverWillSend.push(path); // Mine is newer. I'll send it.
+                    }
+                }
+            });
+
+            // Compare remote to local
+            remoteIndex.forEach((remoteItem, path) => {
+                const localItem = localIndex.get(path);
+                if (!localItem) {
+                    filesInitiatorMustSend.push(path); // They have it, I don't. They must send it.
+                } else if (remoteItem.type === 'file' && localItem.type === 'file') {
+                    if (remoteItem.mtime > localItem.mtime + MTIME_TOLERANCE_MS) {
+                        filesInitiatorMustSend.push(path); // Theirs is newer. They must send it.
+                    }
+                }
+            });
+
+            // Calculate deletions. A file is deleted if it exists on one manifest but not the other *after* update calculations.
+            // This logic is tricky. Let's simplify: deletions are handled if a file exists on one but not the other.
+            const allLocalPaths = new Set(localManifest.map(i => i.path));
+            const allRemotePaths = new Set(remoteManifest.map(i => i.path));
+
+            allLocalPaths.forEach(path => {
+                if (!allRemotePaths.has(path)) filesInitiatorMustDelete.push(path); // I have it, they don't -> they should delete it.
+            });
+            allRemotePaths.forEach(path => {
+                if (!allLocalPaths.has(path)) filesReceiverMustDelete.push(path); // They have it, I don't -> I should delete it.
+            });
+
+            this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}. They delete ${filesReceiverMustDelete.length}, I delete ${filesInitiatorMustDelete.length}`);
+            this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend, filesInitiatorMustDelete, filesReceiverMustDelete });
+
+            // This device (the receiver) starts its work
+            this.executeSyncActions(conn.peer, filesReceiverWillSend, filesInitiatorMustDelete);
+        } catch(e) {
+            console.error("Error during full sync request handling:", e);
+            new Notice("Error processing sync request. See console for details.");
+            this.sendData(conn.peer, {type: 'full-sync-complete'}); // Tell peer to abort
+            this.resetFullSyncState();
+        }
     }
 
-    async handleFullSyncResponse(data: FullSyncResponsePayload, peerId: string) {
-        if (!this.isSyncing) return;
-        new Notice("Received sync plan. Exchanging files..."); this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, I will receive ${data.filesReceiverWillSend.length}`);
-        for (const path of data.filesInitiatorMustSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { this.sendFileUpdate(item, peerId); } else if (item instanceof TFolder) { this.sendData(peerId, { type: 'folder-create', path }); } }
-        const dynamicTimeout = 20000 + (data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length) * 500; setTimeout(() => { if (this.isSyncing) { this.handleFullSyncComplete(); } }, dynamicTimeout);
+    async handleFullSyncResponse(data: FullSyncResponsePayload, conn: DataConnection) {
+        if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
+        new Notice("Received sync plan. Exchanging files and deletions..."); 
+        this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, will receive ${data.filesReceiverWillSend.length}. I must delete ${data.filesInitiatorMustDelete.length}, will receive deletions for ${data.filesReceiverMustDelete.length}`);
+        
+        // This device (the initiator) starts its work
+        this.executeSyncActions(conn.peer, data.filesInitiatorMustSend, data.filesReceiverMustDelete);
+    }
+    
+    async executeSyncActions(peerId: string, filesToSend: string[], filesToDelete: string[]) {
+        if (!this.syncState.isSyncing) return;
+        try {
+            // Process sends
+            for (const path of filesToSend) {
+                const item = this.app.vault.getAbstractFileByPath(path);
+                if (item instanceof TFile) {
+                    await this.sendFileUpdate(item, peerId);
+                } else if (item instanceof TFolder) {
+                    this.sendData(peerId, { type: 'folder-create', path });
+                }
+            }
+            // Process own deletions
+            for (const path of filesToDelete) {
+                const item = this.app.vault.getAbstractFileByPath(path);
+                if (item) {
+                    this.log(`Full Sync: Deleting ${path}`);
+                    await this.applyFileDelete({type: 'file-delete', path}); // use apply to handle ignore logic
+                }
+            }
+            // After finishing my batch, I notify the peer.
+            this.log("Finished sending my batch of sync actions.");
+            this.sendData(peerId, { type: 'full-sync-batch-complete' });
+            this.syncState.sentMyBatchComplete = true;
+            this.checkFullSyncCompletion();
+        } catch(e) {
+            console.error("Error executing sync actions:", e);
+            new Notice("Error during file exchange. Aborting sync.");
+            this.sendData(peerId, {type: 'full-sync-complete'}); // Tell peer to abort
+            this.resetFullSyncState();
+        }
     }
 
-    handleFullSyncComplete() { if (!this.isSyncing) return; this.isSyncing = false; this.syncQueue = []; this.isQueueProcessing = false; this.currentTransferId = null; this.updateStatus(); new Notice("✅ Full sync complete."); }
+    handleFullSyncBatchComplete(conn: DataConnection) {
+        if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
+        this.log("Received peer's batch completion signal.");
+        this.syncState.receivedPeerBatchComplete = true;
+        this.checkFullSyncCompletion();
+    }
+
+    checkFullSyncCompletion() {
+        if (this.syncState.isSyncing && this.syncState.sentMyBatchComplete && this.syncState.receivedPeerBatchComplete) {
+            this.log("Both peers have completed their sync batches. Sync is complete.");
+            this.handleFullSyncComplete();
+        }
+    }
+    
+    resetFullSyncState() {
+        this.syncState = { isSyncing: false, peerId: null, sentMyBatchComplete: false, receivedPeerBatchComplete: false };
+        this.syncQueue = []; 
+        this.isQueueProcessing = false; 
+        this.currentTransferId = null;
+        this.updateStatus();
+    }
+
+    handleFullSyncComplete() { 
+        if (!this.syncState.isSyncing) return; 
+        this.resetFullSyncState();
+        new Notice("✅ Full sync complete."); 
+    }
 
     private isPathSyncable(path: string): boolean {
-        if (path.startsWith('.obsidian/') && !this.settings.syncObsidianConfig) { this.log(`Ignoring path in .obsidian: ${path}`); return false; }
+        if (path.startsWith('.obsidian/') && !this.settings.syncObsidianConfig) { return false; }
         const excluded = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
         const included = this.settings.includedFolders.split('\n').map(p => p.trim()).filter(Boolean);
-        if (excluded.length > 0 && excluded.some(p => path.startsWith(p))) { this.log(`Ignoring excluded path: ${path}`); return false; }
-        if (included.length > 0 && !included.some(p => path.startsWith(p))) { this.log(`Ignoring path not in 'included' list: ${path}`); return false; }
+        if (excluded.length > 0 && excluded.some(p => path.startsWith(p))) { return false; }
+        if (included.length > 0 && !included.some(p => path.startsWith(p))) { return false; }
         return true;
     }
 
@@ -841,12 +1044,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     getMyPeerInfo(): PeerInfo { return { deviceId: this.peer?.id || this.settings.deviceId, friendlyName: this.settings.friendlyName, ip: this.getLocalIp() }; }
 
     public startDirectIpHost() { if (Platform.isMobile) return; this.reinitializeConnectionManager(); const pin = Math.floor(100000 + Math.random() * 900000).toString(); this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin); this.updateStatus(); return pin; }
-    public async connectToDirectIpHost(config: DirectIpConfig) { this.reinitializeConnectionManager(); this.directIpClient = new DirectIpClient(this, config); this.clusterPeers.set(config.host, { deviceId: config.host, friendlyName: `Host (${config.host})`, ip: config.host }); this.updateStatus(); }
+    public async connectToDirectIpHost(config: DirectIpConfig) { this.reinitializeConnectionManager(); this.directIpClient = new DirectIpClient(this, config); const hostId = `${config.host}:${config.port}`; this.clusterPeers.set(hostId, { deviceId: hostId, friendlyName: `Host (${config.host})`, ip: config.host }); this.updateStatus(); }
 
     updateStatus(statusText?: string) {
         if (statusText) { this.statusBar.setText(statusText); return; }
         let currentStatus = "🔄 Sync Idle";
-        if (this.isSyncing) { currentStatus = "⚙️ Full Syncing..."; }
+        if (this.syncState.isSyncing) { currentStatus = "⚙️ Full Syncing..."; }
         else if (this.isQueueProcessing) { currentStatus = `⏳ Syncing (${this.syncQueue.length + 1} item${this.syncQueue.length > 0 ? 's' : ''})`; }
         else if (this.settings.connectionMode === 'direct-ip') { if (this.directIpServer) currentStatus = `Host Mode`; else if (this.directIpClient) currentStatus = `Client Mode`; else currentStatus = `❌ Sync Offline (Direct IP)`; }
         else {
@@ -1067,7 +1270,7 @@ class ConnectionModal extends Modal {
             if (!remoteId.trim()) { new Notice("Please enter a Peer ID."); return; }
             if (!this.plugin.peer || this.plugin.peer.disconnected) { new Notice("Peer connection is not active. Please initialize PeerJS first."); this.plugin.initializePeer(); return; }
 
-            const conn = this.plugin.peer.connect(remoteId.trim());
+            const conn = this.plugin.peer.connect(remoteId.trim(), { reliable: true });
             this.plugin.setupConnection(conn);
             this.close();
         }));
@@ -1110,7 +1313,7 @@ class ConnectionModal extends Modal {
                 if (pin.length !== 4) { new Notice("PIN must be 4 digits."); return; }
                 if (!this.plugin.peer || this.plugin.peer.disconnected) { new Notice("Peer connection is not active."); this.plugin.initializePeer(); return; }
 
-                const conn = this.plugin.peer.connect(peer.deviceId);
+                const conn = this.plugin.peer.connect(peer.deviceId, { reliable: true });
                 this.plugin.setupConnection(conn, pin);
                 this.close();
             }));
@@ -1147,7 +1350,7 @@ class ConnectionModal extends Modal {
             new Notice(`Set ${remoteId.trim()} as companion. Sending pair request...`);
 
             if (this.plugin.peer && !this.plugin.peer.disconnected) {
-                const conn = this.plugin.peer.connect(remoteId.trim());
+                const conn = this.plugin.peer.connect(remoteId.trim(), { reliable: true });
                 this.plugin.setupConnection(conn);
                 conn.on('open', () => {
                     conn.send({ type: 'companion-pair', peerInfo: this.plugin.getMyPeerInfo() });
@@ -1197,7 +1400,7 @@ class SelectPeerModal extends Modal {
     onOpen() {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Force Full Sync with Peer' });
-        contentEl.createEl('p', { text: 'This will perform a two-way sync. Files will be exchanged based on which is newer. This is the safest way to reconcile two vaults.' }).addClass('mod-warning');
+        contentEl.createEl('p', { text: 'This will perform a two-way sync. Files and deletions will be exchanged based on which is newer. This is the safest way to reconcile two vaults.' }).addClass('mod-warning');
         let selectedPeer = '';
         const peerList = Array.from(this.connections.keys());
         if (peerList.length === 0) {
