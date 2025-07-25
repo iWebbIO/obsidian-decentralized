@@ -192,3 +192,5 @@ Contributions, bug reports, and feature requests are welcome! Please feel free t
 ## 📜 License
 
 This plugin is licensed under the **GNU General Public License v3.0**. For the full license text, please see the `LICENSE` file included in the repository.
+
+Special thanks to [Ray Vermey](https://github.com/rayvermey) for their guidance, encouragement and feedback.
