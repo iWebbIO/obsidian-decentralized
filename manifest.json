@@ -1,10 +1,10 @@
 {
 	"id": "obsidian-decentralized",
 	"name": "Obsidian Decentralized",
-	"version": "1.0.2",
+	"version": "1.1.0",
 	"minAppVersion": "0.12.0",
-	"description": "Synchronize your vault across devices on your local network. This plugin uses a peer-to-peer mesh system to send data directly between your devices with no central server.",
-	"author": "Moreweb Software Group",
+	"description": "A free, private, and local-first sync solution for Obsidian.md. Your notes travel directly between your devices, with no central server involved.",
+	"author": "iWebb",
 	"authorUrl": "https://github.com/iwebbio",
 	"isDesktopOnly": false
 }
