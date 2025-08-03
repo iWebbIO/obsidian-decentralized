@@ -1,10 +1,10 @@
 {
 	"id": "obsidian-decentralized",
 	"name": "Obsidian Decentralized",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"minAppVersion": "0.12.0",
 	"description": "A free, private, and local-first sync solution for Obsidian.md. Your notes travel directly between your devices, with no central server involved.",
-	"author": "iWebb",
+	"author": "Moreweb Software Group",
 	"authorUrl": "https://github.com/iwebbio",
 	"isDesktopOnly": false
 }
