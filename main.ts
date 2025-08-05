@@ -341,7 +341,7 @@ class DirectIpClient {
             'X-Pin': config.pin,
         };
         this.startPolling();
-        new Notice(`Connected to Direct IP Host at ${config.host}`);
+        new Notice(`Connected to Direct IP Host at ${config.host}`, 3000);
     }
 
     private arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -407,7 +407,7 @@ class DirectIpClient {
     stop() {
         if (this.pollInterval) clearInterval(this.pollInterval);
         this.pollInterval = null;
-        new Notice("Disconnected from Direct IP Host.");
+        new Notice("Disconnected from Direct IP Host.", 3000);
     }
 }
 
@@ -613,7 +613,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             clearTimeout(connectionTimeout);
             this.peerInitAttempts = 0;
             this.log(`PeerJS connection open. ID: ${id}`);
-            new Notice(`Decentralized Sync network is online.`);
+            new Notice(`Decentralized Sync network is online.`, 3000);
             this.updateStatus();
             this.tryToConnectToCompanion();
             if (!Platform.isMobile) {
@@ -682,7 +682,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log(`Connection to peer ${peerId} lost during transfer. Aborting.`);
                 this.abortCurrentChunkTransfer();
             }
-            if (peerInfo) new Notice(`👋 Peer disconnected: ${peerInfo.friendlyName}`);
+            if (peerInfo) this.log(`Peer disconnected: ${peerInfo.friendlyName} (${peerId})`);
             if (peerId === this.settings.companionPeerId) {
                 new Notice(`Companion disconnected. Will try to reconnect automatically.`);
                 this.log("Companion connection closed, restarting connection attempts.");
@@ -736,7 +736,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     handleHandshake(data: HandshakePayload, conn: DataConnection) {
         if (this.joinPin && data.pin !== this.joinPin) { new Notice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 10000); conn.close(); return; }
-        if (this.joinPin) this.joinPin = null; new Notice(`🤝 Connected to ${data.peerInfo.friendlyName}`);
+        if (this.joinPin) this.joinPin = null; new Notice(`🤝 Connected to ${data.peerInfo.friendlyName}`, 4000);
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
         const existingPeers = Array.from(this.clusterPeers.values());
         conn.send({ type: 'cluster-gossip', peers: existingPeers });
@@ -753,7 +753,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleCompanionPair(data: CompanionPairPayload) {
         this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
-        new Notice(`✅ Paired with ${data.peerInfo.friendlyName} as a companion device.`);
+        new Notice(`✅ Paired with ${data.peerInfo.friendlyName} as a companion device.`, 4000);
         this.tryToConnectToCompanion();
     }
 
@@ -774,7 +774,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.companionConnectionInterval) { clearInterval(this.companionConnectionInterval); this.companionConnectionInterval = null; }
         const companionId = this.settings.companionPeerId;
         if (companionId) { const conn = this.connections.get(companionId); conn?.close(); }
-        this.settings.companionPeerId = undefined; await this.saveSettings(); new Notice('Companion link forgotten.');
+        this.settings.companionPeerId = undefined; await this.saveSettings(); new Notice('Companion link forgotten.', 3000);
     }
 
     // --- Sync Logic (Apply Changes) ---
@@ -853,7 +853,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             new Notice(`Conflict detected for: ${data.path}`, 10000); this.log(`Conflict detected for: ${data.path}. Strategy: ${this.settings.conflictResolutionStrategy}`);
             switch (this.settings.conflictResolutionStrategy) {
                 case 'last-write-wins': this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`); this.ignoreNextEventForPath(data.path); if (data.encoding === 'binary') { await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer); } else { await this.app.vault.modify(existingFile, data.content as string); } break;
-                case 'attempt-auto-merge': if (data.encoding === 'binary' || !data.path.endsWith('.md')) { this.log(`Cannot auto-merge binary or non-md file, creating conflict file: ${data.path}`); await this.createConflictFile(data); break; } const dmp = new DiffMatchPatch(); const patches = dmp.patch_make(localContent as string, data.content as string); const [mergedContent, results] = dmp.patch_apply(patches, localContent as string); if (results.every(r => r)) { this.log(`Conflict successfully auto-merged: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.modify(existingFile, mergedContent); new Notice(`Successfully auto-merged ${data.path}`); } else { this.log(`Auto-merge failed, creating conflict file: ${data.path}`); await this.createConflictFile(data); } break;
+                case 'attempt-auto-merge': if (data.encoding === 'binary' || !data.path.endsWith('.md')) { this.log(`Cannot auto-merge binary or non-md file, creating conflict file: ${data.path}`); await this.createConflictFile(data); break; } const dmp = new DiffMatchPatch(); const patches = dmp.patch_make(localContent as string, data.content as string); const [mergedContent, results] = dmp.patch_apply(patches, localContent as string); if (results.every(r => r)) { this.log(`Conflict successfully auto-merged: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.modify(existingFile, mergedContent); new Notice(`Successfully auto-merged ${data.path}`, 3000); } else { this.log(`Auto-merge failed, creating conflict file: ${data.path}`); await this.createConflictFile(data); } break;
                 case 'create-conflict-file': default: this.log(`Creating conflict file for: ${data.path}`); await this.createConflictFile(data); break;
             }
         }
@@ -1287,7 +1287,7 @@ class ConnectionModal extends Modal {
                 idEl.setText(id);
                 buttonContainer.empty();
                 new Setting(buttonContainer)
-                    .addButton(btn => btn.setButtonText("Copy ID").onClick(() => { navigator.clipboard.writeText(id); new Notice("ID Copied!"); }))
+                    .addButton(btn => btn.setButtonText("Copy ID").onClick(() => { navigator.clipboard.writeText(id); new Notice("ID Copied!", 2000); }))
                     .addButton(btn => btn.setButtonText("Back").onClick(backCallback));
             } catch (e) {
                 console.error("QR Code generation failed", e);
