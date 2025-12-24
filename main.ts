@@ -951,7 +951,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public calculateStatusText(): string {
         if (this.isSyncing) { return "⚙️ Full Syncing..."; }
         if (this.transferProgress.size > 0) {
-            const [id, transfer] = this.transferProgress.entries().next().value;
+            const [transfer] = this.transferProgress.entries().next().value;
             return `⏫ Syncing ${transfer.path} (${transfer.progress}%)`;
         }
         if (this.isQueueProcessing) {
