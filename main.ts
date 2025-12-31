@@ -95,6 +95,27 @@ interface ILANDiscovery {
     stop(): void;
 }
 
+// --- Helper Functions ---
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+    const binary_string = window.atob(base64);
+    const len = binary_string.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+        bytes[i] = binary_string.charCodeAt(i);
+    }
+    return bytes.buffer;
+}
+
 class DummyLANDiscovery implements ILANDiscovery {
     on(event: string, listener: (...args: any[]) => void): this { return this; }
     startBroadcasting(peerInfo: PeerInfo): void { }
@@ -251,26 +272,6 @@ class DirectIpServer {
         });
     }
 
-    private base64ToArrayBuffer(base64: string): ArrayBuffer {
-        const binary_string = window.atob(base64);
-        const len = binary_string.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binary_string.charCodeAt(i);
-        }
-        return bytes.buffer;
-    }
-
-    private arrayBufferToBase64(buffer: ArrayBuffer): string {
-        let binary = '';
-        const bytes = new Uint8Array(buffer);
-        const len = bytes.byteLength;
-        for (let i = 0; i < len; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        return window.btoa(binary);
-    }
-
     private handleRequest(req: any, res: any) {
         const CORS_HEADERS = {
             'Access-Control-Allow-Origin': '*',
@@ -297,7 +298,7 @@ class DirectIpServer {
                 if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
                     return {
                         ...msg,
-                        content: this.arrayBufferToBase64(msg.content),
+                        content: arrayBufferToBase64(msg.content),
                         encoding: 'base64'
                     };
                 }
@@ -314,7 +315,7 @@ class DirectIpServer {
                     if (data.type === 'file-update' && data.encoding === 'base64' && typeof data.content === 'string') {
                          data = {
                             ...data,
-                            content: this.base64ToArrayBuffer(data.content),
+                            content: base64ToArrayBuffer(data.content),
                             encoding: 'binary'
                         };
                     }
@@ -360,26 +361,6 @@ class DirectIpClient {
         this.plugin.showNotice(`Connected to Direct IP Host at ${config.host}`, 'info', 3000);
     }
 
-    private arrayBufferToBase64(buffer: ArrayBuffer): string {
-        let binary = '';
-        const bytes = new Uint8Array(buffer);
-        const len = bytes.byteLength;
-        for (let i = 0; i < len; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        return window.btoa(binary);
-    }
-
-    private base64ToArrayBuffer(base64: string): ArrayBuffer {
-        const binary_string = window.atob(base64);
-        const len = binary_string.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            bytes[i] = binary_string.charCodeAt(i);
-        }
-        return bytes.buffer;
-    }
-
     private async poll() {
         try {
             const response = await requestUrl({
@@ -393,7 +374,7 @@ class DirectIpClient {
                     if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
                         msg = {
                             ...msg,
-                            content: this.base64ToArrayBuffer(msg.content),
+                            content: base64ToArrayBuffer(msg.content),
                             encoding: 'binary'
                         } as FileUpdatePayload;
                     }
@@ -412,7 +393,7 @@ class DirectIpClient {
         if (data.type === 'file-update' && data.encoding === 'binary' && data.content instanceof ArrayBuffer) {
             payloadToSend = {
                 ...data,
-                content: this.arrayBufferToBase64(data.content),
+                content: arrayBufferToBase64(data.content),
                 encoding: 'base64'
             };
         }
