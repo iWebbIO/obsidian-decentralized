@@ -13,7 +13,7 @@ export default {
     format: 'cjs',
     exports: 'default',
   },
-  external: ['obsidian'],
+  external: ['obsidian', 'os', 'http', 'dgram', 'events'],
   plugins: [
     typescript(),
     nodeResolve({

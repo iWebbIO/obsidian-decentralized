@@ -19,8 +19,7 @@
   "license": "GPL-3.0",
   "dependencies": {
     "diff-match-patch": "^1.0.5",
-    "peerjs": "^1.4.7",
-    "qrcode": "^1.5.1"
+    "peerjs": "^1.4.7"
   },
   "devDependencies": {
     "@rollup/plugin-commonjs": "^24.0.1",

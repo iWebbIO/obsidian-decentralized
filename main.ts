@@ -1382,9 +1382,9 @@ class ConnectionModal extends Modal {
                         info.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
                         info.createDiv({ text: `${peer.ip || 'Unknown IP'}:${peer.port || '???'}`, cls: 'sub-text' });
                         const btn = item.createEl('button', { text: 'Select' });
-                        btn.onclick = () => {
+                        btn.onclick = async () => {
                             if (peer.ip) ipInput.value = peer.ip;
-                            if (peer.port) this.plugin.settings.directIpHostPort = peer.port;
+                            if (peer.port) { this.plugin.settings.directIpHostPort = peer.port; await this.plugin.saveSettings(); }
                             new Notice(`Selected ${peer.friendlyName}`);
                         };
                     });
@@ -1406,9 +1406,10 @@ class ConnectionModal extends Modal {
         if (Platform.isMobile) { pinInput.style.width = '100%'; pinInput.style.marginBottom = '10px'; }
 
         const connectBtn = container.createEl('button', { text: 'Connect', cls: 'mod-cta od-full-width' });
-        connectBtn.onclick = () => {
+        connectBtn.onclick = async () => {
             if (ipInput.value && pinInput.value) {
                 this.plugin.settings.directIpHostAddress = ipInput.value;
+                await this.plugin.saveSettings();
                 this.plugin.connectToDirectIpHost({ host: ipInput.value, port: this.plugin.settings.directIpHostPort, pin: pinInput.value });
                 this.close();
             }
