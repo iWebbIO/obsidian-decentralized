@@ -1,6 +1,8 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile, Modal, Platform, requestUrl, debounce, setIcon } from 'obsidian';
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
+import * as QRCode from 'qrcode';
+import { Html5Qrcode } from 'html5-qrcode';
 
 // --- Constants ---
 const DISCOVERY_PORT = 41234;
@@ -1229,6 +1231,14 @@ class ConnectionModal extends Modal {
             .od-mobile .od-full-width { width: 100%; }
             .od-mobile .od-input-row { flex-direction: column; }
             .od-mobile .od-input-row button { width: 100%; margin-top: 5px; }
+
+            .od-id-icons { display: flex; gap: 8px; }
+            .od-icon-button { padding: 4px; border-radius: 4px; color: var(--text-muted); display: flex; align-items: center; transition: color 0.2s; }
+            .od-icon-button:hover { color: var(--text-normal); background-color: var(--background-modifier-hover); }
+            
+            .od-qr-container { text-align: center; padding: 20px; background: white; border-radius: 8px; margin: 0 auto; max-width: 320px; }
+            .od-qr-text { word-break: break-all; font-family: var(--font-monospace); margin-top: 10px; color: black; }
+            #od-qr-reader { width: 100%; border-radius: 8px; overflow: hidden; }
         `;
         document.head.appendChild(style);
     }
@@ -1250,7 +1260,17 @@ class ConnectionModal extends Modal {
         const idText = idContainer.createDiv();
         idText.createDiv({ text: myInfo.friendlyName, cls: 'od-id-name' });
         idText.createDiv({ text: myInfo.deviceId, cls: 'od-id-value' });
-        const copyIcon = idContainer.createDiv();
+        
+        const iconsDiv = idContainer.createDiv({ cls: 'od-id-icons' });
+        
+        const qrIcon = iconsDiv.createDiv({ cls: 'od-icon-button', attr: { 'aria-label': 'Show QR Code' } });
+        setIcon(qrIcon, 'qr-code');
+        qrIcon.onclick = (e) => {
+            e.stopPropagation();
+            new QRCodeModal(this.app, myInfo.deviceId).open();
+        };
+
+        const copyIcon = iconsDiv.createDiv({ cls: 'od-icon-button', attr: { 'aria-label': 'Copy ID' } });
         setIcon(copyIcon, 'copy');
         idContainer.onclick = () => {
             navigator.clipboard.writeText(myInfo.deviceId);
@@ -1294,6 +1314,15 @@ class ConnectionModal extends Modal {
         contentEl.createDiv({ cls: 'od-section-title', text: 'Manual Connection' });
         const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
         const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter Peer ID' });
+        
+        const scanBtn = inputRow.createEl('button', { cls: 'clickable-icon', attr: { 'aria-label': 'Scan QR Code' } });
+        setIcon(scanBtn, 'qr-code');
+        scanBtn.onclick = () => {
+            new QRScannerModal(this.app, (scannedId) => {
+                input.value = scannedId;
+            }).open();
+        };
+
         const connectBtn = inputRow.createEl('button', { text: 'Connect', cls: 'mod-cta' });
         connectBtn.onclick = () => {
             if (input.value.trim()) {
@@ -1423,6 +1452,47 @@ class ConnectionModal extends Modal {
             this.plugin.reinitializeConnectionManager();
             this.renderDashboard();
         };
+    }
+}
+
+class QRCodeModal extends Modal {
+    constructor(app: App, private text: string) { super(app); }
+    async onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h2', { text: 'Device QR Code' });
+        const container = contentEl.createDiv({ cls: 'od-qr-container' });
+        try {
+            const url = await QRCode.toDataURL(this.text, { width: 300, margin: 2 });
+            container.createEl('img', { attr: { src: url } });
+            container.createEl('p', { text: this.text, cls: 'od-qr-text' });
+        } catch (e) {
+            container.createEl('p', { text: 'Error generating QR code.' });
+        }
+    }
+}
+
+class QRScannerModal extends Modal {
+    private html5QrCode: Html5Qrcode | null = null;
+    constructor(app: App, private onScan: (text: string) => void) { super(app); }
+    
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h2', { text: 'Scan QR Code' });
+        const readerId = 'od-qr-reader';
+        contentEl.createDiv({ attr: { id: readerId } });
+        
+        this.html5QrCode = new Html5Qrcode(readerId);
+        this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
+            this.onScan(decodedText);
+            this.close();
+        }, () => {}).catch(err => {
+            contentEl.createEl('p', { text: 'Error starting camera: ' + err, cls: 'mod-warning' });
+        });
+    }
+    
+    onClose() {
+        if (this.html5QrCode && this.html5QrCode.isScanning) { this.html5QrCode.stop().then(() => this.html5QrCode?.clear()).catch(console.error); }
+        this.contentEl.empty();
     }
 }
 
