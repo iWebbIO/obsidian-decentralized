@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile, Modal, Platform, requestUrl, debounce } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile, Modal, Platform, requestUrl, debounce, setIcon } from 'obsidian';
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
 import * as QRCode from 'qrcode';
@@ -34,13 +34,15 @@ type FullSyncResponsePayload = { type: 'response-full-sync'; filesReceiverWillSe
 type FullSyncCompletePayload = { type: 'full-sync-complete' };
 type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: number, totalChunks: number, transferId: string };
 type FileChunkDataPayload = { type: 'file-chunk-data', transferId: string, index: number, data: ArrayBuffer };
+type PingPayload = { type: 'ping' };
+type PongPayload = { type: 'pong' };
 
 type SyncData =
     | HandshakePayload | ClusterGossipPayload | CompanionPairPayload | AckPayload
     | FileUpdatePayload | FileDeletePayload | FileRenamePayload
     | FolderCreatePayload | FolderDeletePayload | FolderRenamePayload
     | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload
-    | FileChunkStartPayload | FileChunkDataPayload;
+    | FileChunkStartPayload | FileChunkDataPayload | PingPayload | PongPayload;
 
 // Interfaces
 interface PeerServerConfig { host: string; port: number; path: string; secure: boolean; }
@@ -62,6 +64,7 @@ interface ObsidianDecentralizedSettings {
     conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins' | 'attempt-auto-merge';
     includedFolders: string;
     excludedFolders: string;
+    hideNativeSyncStatus: boolean;
 }
 const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     syncMode: 'auto',
@@ -80,6 +83,7 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     conflictResolutionStrategy: 'create-conflict-file',
     includedFolders: '',
     excludedFolders: '',
+    hideNativeSyncStatus: true,
 };
 
 interface ILANDiscovery {
@@ -417,7 +421,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number }> = new Map();
     private fullSyncTimeout: number | null = null;
 
-    private syncQueue: { peerId: string | null, data: SyncData }[] = [];
+    private syncQueue: { peerId: string | null, data: SyncData, retries: number }[] = [];
     private isQueueProcessing: boolean = false;
     private pendingAcks: Map<string, () => void> = new Map();
     private peerInitRetryTimeout: number | null = null;
@@ -434,6 +438,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         await this.loadSettings();
+        this.applyHideNativeSync();
+        this.injectStatusBarStyles();
         this.statusBar = this.addStatusBarItem();
         this.addSettingTab(new ObsidianDecentralizedSettingTab(this.app, this));
         this.conflictCenter = new ConflictCenter(this.app, this);
@@ -448,13 +454,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
         });
 
-        this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), DEBOUNCE_DELAY_MS, true);
+        this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), DEBOUNCE_DELAY_MS);
         this.registerEvent(this.app.vault.on('create', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('modify', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('delete', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => this.handleRenameEvent(file, oldPath)));
 
         this.initializeConnectionManager();
+        this.startHeartbeat();
     }
 
     onunload() {
@@ -465,8 +472,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout);
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
     }
-    async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); }
+    async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); this.applyHideNativeSync(); }
     async saveSettings() { await this.saveData(this.settings); }
+
+    applyHideNativeSync() {
+        if (this.settings.hideNativeSyncStatus) {
+            document.body.classList.add('od-hide-native-sync');
+        } else {
+            document.body.classList.remove('od-hide-native-sync');
+        }
+    }
 
     public log(...args: any[]) { if (this.settings.verboseLogging) { console.log("Obsidian Decentralized:", ...args); } }
 
@@ -497,14 +512,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
     broadcastData(data: SyncData) { this.addToQueue(null, data); }
     sendData(peerId: string, data: SyncData) { this.addToQueue(peerId, data); }
-    private addToQueue(peerId: string | null, data: SyncData) { this.syncQueue.push({ peerId, data }); this.processQueue(); }
+    private addToQueue(peerId: string | null, data: SyncData) { this.syncQueue.push({ peerId, data, retries: 0 }); this.processQueue(); }
 
     private async processQueue() {
         if (this.isQueueProcessing || this.syncQueue.length === 0) return;
         this.isQueueProcessing = true;
         this.updateStatus();
 
-        const { peerId, data } = this.syncQueue.shift()!;
+        const item = this.syncQueue.shift()!;
+        const { peerId, data, retries } = item;
         const transferId = (data as BasePayload).transferId;
 
         try {
@@ -542,7 +558,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         } catch (e) {
             console.error(`Error processing queue item ${transferId}:`, e);
-            this.showNotice(`File transfer failed for ${(data as any).path || 'an item'}.`, 'error', 8000);
+            if (retries < 3) {
+                this.log(`Retrying transfer ${transferId} (Attempt ${retries + 1}/3)`);
+                this.syncQueue.push({ peerId, data, retries: retries + 1 });
+                // Add a small delay before processing the retry to let network stabilize
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            } else {
+                this.showNotice(`File transfer failed permanently for ${(data as any).path || 'an item'}.`, 'error', 8000);
+            }
         } finally {
             this.pendingAcks.delete(transferId);
             this.transferProgress.delete(transferId);
@@ -672,6 +695,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         conn.on('error', (err) => { console.error(`Connection error with ${conn.peer}:`, err); this.showNotice(`Connection error with a peer.`, 'error'); });
     }
     
+    startHeartbeat() {
+        this.registerInterval(window.setInterval(() => {
+            this.connections.forEach(conn => {
+                if (conn.open) conn.send({ type: 'ping' });
+            });
+        }, 20000));
+    }
+
     processIncomingData(data: any, conn: DataConnection | null) {
         if (!data || !data.type) return; this.log("Received data:", data.type, "from", conn?.peer);
         switch (data.type) {
@@ -696,6 +727,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'full-sync-complete': this.handleFullSyncComplete(); break;
             case 'file-chunk-start': this.handleFileChunkStart(data); break;
             case 'file-chunk-data': this.handleFileChunkData(data, conn!); break;
+            case 'ping': conn?.send({ type: 'pong' }); break;
+            case 'pong': /* Heartbeat ack */ break;
         }
     }
 
@@ -751,8 +784,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!isBinaryFile && !this.shouldSyncAllFileTypes()) { const textWhitelist = ['md', 'css', 'js', 'json']; if (!textWhitelist.includes(file.extension)) { this.log(`Skipping non-whitelisted text file: ${file.path}`); return; } }
         this.log(`Queueing file update for ${peerId || 'broadcast'}: ${file.path}`);
         try {
-            const content = await this.app.vault[isBinaryFile ? 'readBinary' : 'cachedRead'](file);
-            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding: isBinaryFile ? 'binary' : 'utf8', transferId: this.generateTransferId(file.path) };
+            let content: string | ArrayBuffer = isBinaryFile ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
+            let encoding: 'utf8' | 'binary' | 'base64' = isBinaryFile ? 'binary' : 'utf8';
+
+            // Convert large strings to ArrayBuffer to ensure they get chunked
+            if (typeof content === 'string' && content.length > CHUNK_SIZE) {
+                content = new TextEncoder().encode(content).buffer;
+                encoding = 'binary';
+            }
+
+            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding, transferId: this.generateTransferId(file.path) };
             if (peerId) { this.sendData(peerId, payload); } else { this.broadcastData(payload); }
         } catch (e) { console.error(`Error reading file ${file.path} for sync:`, e); }
     }
@@ -823,8 +864,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.ignoreNextEventForPath(data.path);
         try {
             const folderPath = data.path.substring(0, data.path.lastIndexOf('/'));
-            if (folderPath && !this.app.vault.getAbstractFileByPath(folderPath)) {
-                await this.app.vault.createFolder(folderPath);
+            if (folderPath) {
+                await this.ensureFolderExists(folderPath);
             }
             if (data.encoding === 'binary' || data.encoding === 'base64') {
                 await this.app.vault.createBinary(data.path, data.content as ArrayBuffer);
@@ -832,42 +873,70 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await this.app.vault.create(data.path, data.content as string);
             }
         } catch (e) {
-            console.error("File creation error:", e);
-            this.showNotice(`Failed to create file: ${data.path}`, 'error');
+            if (e instanceof Error && e.message.includes("File already exists")) {
+                this.log(`File ${data.path} already exists, falling back to modification.`);
+                const file = this.app.vault.getAbstractFileByPath(data.path);
+                if (file instanceof TFile) await this.handleFileModification(data, file);
+            } else {
+                console.error("File creation error:", e);
+                this.showNotice(`Failed to create file: ${data.path}`, 'error');
+            }
+        }
+    }
+
+    private async ensureFolderExists(path: string) {
+        const folders = path.split('/');
+        let currentPath = '';
+        for (const folder of folders) {
+            currentPath = currentPath === '' ? folder : `${currentPath}/${folder}`;
+            if (!this.app.vault.getAbstractFileByPath(currentPath)) {
+                try {
+                    await this.app.vault.createFolder(currentPath);
+                } catch (e) { /* Ignore if created concurrently */ }
+            }
         }
     }
 
     private async handleFileModification(data: FileUpdatePayload, existingFile: TFile) {
-        if (data.mtime > existingFile.stat.mtime + MTIME_TOLERANCE_MS) {
-            this.log(`Applying update (remote is newer): ${data.path}`);
-            this.ignoreNextEventForPath(data.path);
-            if (data.encoding === 'binary' || data.encoding === 'base64') {
-                await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer);
-            } else {
-                await this.app.vault.modify(existingFile, data.content as string);
+        try {
+            if (data.mtime > existingFile.stat.mtime + MTIME_TOLERANCE_MS) {
+                this.log(`Applying update (remote is newer): ${data.path}`);
+                this.ignoreNextEventForPath(data.path);
+                if (data.encoding === 'binary' || data.encoding === 'base64') {
+                    await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer);
+                } else {
+                    await this.app.vault.modify(existingFile, data.content as string);
+                }
+                return;
             }
-            return;
+
+            if (data.mtime < existingFile.stat.mtime - MTIME_TOLERANCE_MS) {
+                this.log(`Ignoring update (local is newer): ${data.path}`);
+                return;
+            }
+
+            const localContent = (data.encoding === 'binary' || data.encoding === 'base64')
+                ? await this.app.vault.readBinary(existingFile)
+                : await this.app.vault.cachedRead(existingFile);
+
+            const contentIsSame = (data.encoding === 'binary' || data.encoding === 'base64')
+                ? this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
+                : localContent === data.content;
+
+            if (contentIsSame) {
+                this.log(`Ignoring update (content is identical): ${data.path}`);
+                return;
+            }
+
+            await this.resolveConflict(data, existingFile, localContent);
+        } catch (e) {
+            if (e instanceof Error && (e.message.includes("File not found") || e.message.includes("no such file"))) {
+                this.log(`File ${data.path} not found during modification, falling back to creation.`);
+                await this.handleNewFileCreation(data);
+            } else {
+                console.error(`Error modifying file ${data.path}:`, e);
+            }
         }
-
-        if (data.mtime < existingFile.stat.mtime - MTIME_TOLERANCE_MS) {
-            this.log(`Ignoring update (local is newer): ${data.path}`);
-            return;
-        }
-
-        const localContent = (data.encoding === 'binary' || data.encoding === 'base64')
-            ? await this.app.vault.readBinary(existingFile)
-            : await this.app.vault.cachedRead(existingFile);
-
-        const contentIsSame = (data.encoding === 'binary' || data.encoding === 'base64')
-            ? this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
-            : localContent === data.content;
-
-        if (contentIsSame) {
-            this.log(`Ignoring update (content is identical): ${data.path}`);
-            return;
-        }
-
-        await this.resolveConflict(data, existingFile, localContent);
     }
 
     private async resolveConflict(data: FileUpdatePayload, existingFile: TFile, localContent: string | ArrayBuffer) {
@@ -887,24 +956,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 break;
 
             case 'attempt-auto-merge':
-                if (data.encoding !== 'utf8' || !data.path.endsWith('.md')) {
-                    this.log(`Cannot auto-merge non-markdown file, creating conflict file: ${data.path}`);
-                    await this.createConflictFile(data);
-                    break;
-                }
-                const dmp = new DiffMatchPatch();
-                const patches = dmp.patch_make(localContent as string, data.content as string);
-                const [mergedContent, results] = dmp.patch_apply(patches, localContent as string);
-
-                if (results.every(r => r)) {
-                    this.log(`Conflict successfully auto-merged: ${data.path}`);
-                    this.ignoreNextEventForPath(data.path);
-                    await this.app.vault.modify(existingFile, mergedContent);
-                    this.showNotice(`Successfully auto-merged ${data.path}`, 'verbose', 3000);
-                } else {
-                    this.log(`Auto-merge failed, creating conflict file: ${data.path}`);
-                    await this.createConflictFile(data);
-                }
+                this.log(`Auto-merge not supported without base revision, creating conflict file: ${data.path}`);
+                await this.createConflictFile(data);
                 break;
 
             case 'create-conflict-file':
@@ -948,6 +1001,44 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public startDirectIpHost() { if (Platform.isMobile) return; this.reinitializeConnectionManager(); const pin = Math.floor(1000 + Math.random() * 9000).toString().padStart(4, '0'); this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin); this.updateStatus(); return pin; }
     public async connectToDirectIpHost(config: DirectIpConfig) { this.reinitializeConnectionManager(); this.directIpClient = new DirectIpClient(this, config); this.clusterPeers.set(config.host, { deviceId: config.host, friendlyName: `Host (${config.host})`, ip: config.host }); this.updateStatus(); }
     
+    injectStatusBarStyles() {
+        const styleId = 'obsidian-decentralized-status-styles';
+        if (document.getElementById(styleId)) return;
+        const style = document.createElement('style');
+        style.id = styleId;
+        style.innerHTML = `
+            .od-loading-spinner {
+                border: 2px solid var(--background-modifier-border);
+                border-top: 2px solid var(--interactive-accent);
+                border-radius: 50%;
+                width: 14px;
+                height: 14px;
+                animation: od-spin 1s linear infinite;
+                display: inline-block;
+                vertical-align: middle;
+                margin-right: 6px;
+            }
+            @keyframes od-spin {
+                from { transform: rotate(0deg); }
+                to { transform: rotate(360deg); }
+            }
+            .od-status-icon {
+                display: inline-block;
+                vertical-align: middle;
+                margin-right: 6px;
+            }
+            .od-status-container {
+                display: flex;
+                align-items: center;
+                line-height: 1;
+            }
+            body.od-hide-native-sync .status-bar-item.plugin-sync {
+                display: none !important;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
     public calculateStatusText(): string {
         if (this.isSyncing) { return "⚙️ Full Syncing..."; }
         if (this.transferProgress.size > 0) {
@@ -974,7 +1065,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     updateStatus(statusText?: string) {
         const currentStatus = statusText || this.calculateStatusText();
-        this.statusBar.setText(currentStatus);
+        this.statusBar.empty();
+        const container = this.statusBar.createDiv({ cls: 'od-status-container' });
+
+        let state: 'loading' | 'success' | 'error' | 'neutral' = 'neutral';
+        
+        if (this.isSyncing || this.transferProgress.size > 0 || this.isQueueProcessing || currentStatus.includes('Connecting') || currentStatus.includes('Syncing')) {
+            state = 'loading';
+        } else if (currentStatus.includes('Offline') || currentStatus.includes('Error') || currentStatus.includes('Unreachable')) {
+            state = 'error';
+        } else if (currentStatus.includes('Online') || currentStatus.includes('Cluster') || currentStatus.includes('Host') || currentStatus.includes('Client')) {
+            state = 'success';
+        }
+
+        if (state === 'loading') {
+            container.createDiv({ cls: 'od-loading-spinner' });
+        } else if (state === 'success') {
+            const icon = container.createDiv({ cls: 'od-status-icon' });
+            setIcon(icon, 'check');
+        } else if (state === 'error') {
+            const icon = container.createDiv({ cls: 'od-status-icon' });
+            setIcon(icon, 'alert-circle');
+        }
+
+        const cleanText = currentStatus.replace(/^[\p{Emoji}\uFE0F\u200D]+\s*/u, '');
+        container.createSpan({ text: cleanText });
     }
 }
 
@@ -1062,6 +1177,17 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.showToasts)
                 .onChange(async (value) => {
                     this.plugin.settings.showToasts = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Hide Obsidian Sync status')
+            .setDesc('Hide the native Obsidian Sync button in the status bar.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.hideNativeSyncStatus)
+                .onChange(async (value) => {
+                    this.plugin.settings.hideNativeSyncStatus = value;
+                    this.plugin.applyHideNativeSync();
                     await this.plugin.saveSettings();
                 }));
 
