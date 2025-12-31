@@ -257,6 +257,16 @@ class DirectIpServer {
         return bytes.buffer;
     }
 
+    private arrayBufferToBase64(buffer: ArrayBuffer): string {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return window.btoa(binary);
+    }
+
     private handleRequest(req: any, res: any) {
         const CORS_HEADERS = {
             'Access-Control-Allow-Origin': '*',
@@ -279,7 +289,17 @@ class DirectIpServer {
 
         if (req.url === '/poll' && req.method === 'GET') {
             res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(this.messageQueue));
+            const messages = this.messageQueue.map(msg => {
+                if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
+                    return {
+                        ...msg,
+                        content: this.arrayBufferToBase64(msg.content),
+                        encoding: 'base64'
+                    };
+                }
+                return msg;
+            });
+            res.end(JSON.stringify(messages));
             this.messageQueue = [];
         } else if (req.url === '/push' && req.method === 'POST') {
             let body = '';
@@ -346,6 +366,16 @@ class DirectIpClient {
         return window.btoa(binary);
     }
 
+    private base64ToArrayBuffer(base64: string): ArrayBuffer {
+        const binary_string = window.atob(base64);
+        const len = binary_string.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binary_string.charCodeAt(i);
+        }
+        return bytes.buffer;
+    }
+
     private async poll() {
         try {
             const response = await requestUrl({
@@ -355,7 +385,14 @@ class DirectIpClient {
             });
             if (response.status === 200) {
                 const messages: SyncData[] = response.json;
-                for (const msg of messages) {
+                for (let msg of messages) {
+                    if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
+                        msg = {
+                            ...msg,
+                            content: this.base64ToArrayBuffer(msg.content),
+                            encoding: 'binary'
+                        } as FileUpdatePayload;
+                    }
                     this.plugin.processIncomingData(msg, null);
                 }
             }
@@ -501,7 +538,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     public getConflictStrategy() { return this.settings.syncMode === 'auto' ? 'create-conflict-file' : this.settings.conflictResolutionStrategy; }
     public shouldSyncAllFileTypes() { return this.settings.syncMode === 'auto' ? true : this.settings.syncAllFileTypes; }
-    public shouldSyncObsidianConfig() { return this.settings.syncMode === 'auto' ? false : this.settings.syncObsidianConfig; }
+    public shouldSyncObsidianConfig() { return this.settings.syncMode === 'auto' ? true : this.settings.syncObsidianConfig; }
     public getConnectionMode() { return this.settings.syncMode === 'auto' ? 'peerjs' : this.settings.connectionMode; }
 
     private generateTransferId(path: string): string { return `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
@@ -978,15 +1015,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async requestFullSyncFromPeer(peerId: string) { if (this.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } const conn = this.connections.get(peerId); if (!conn) { this.showNotice("Peer not found.", 'error'); return; } this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); this.isSyncing = true; this.updateStatus(); const localManifest = await this.buildVaultManifest(); this.log(`Sending sync request with ${localManifest.length} items.`); this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest }); }
     async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { if (this.isSyncing) { this.showNotice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`, 'verbose'); return; } this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); this.isSyncing = true; this.updateStatus(); const remoteManifest = data.manifest; const localManifest = await this.buildVaultManifest(); const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); const localIndex = new Map(localManifest.map(item => [item.path, item])); const filesInitiatorMustSend: string[] = []; const filesReceiverWillSend: string[] = []; localIndex.forEach((localItem, path) => { const remoteItem = remoteIndex.get(path); if (!remoteItem) { filesReceiverWillSend.push(path); } else if (localItem.type === 'file' && remoteItem.type === 'file') { if (localItem.mtime > remoteItem.mtime + MTIME_TOLERANCE_MS) { filesReceiverWillSend.push(path); } } }); remoteIndex.forEach((remoteItem, path) => { const localItem = localIndex.get(path); if (!localItem) { filesInitiatorMustSend.push(path); } else if (remoteItem.type === 'file' && localItem.type === 'file') { if (remoteItem.mtime > localItem.mtime + MTIME_TOLERANCE_MS) { filesInitiatorMustSend.push(path); } } }); this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`); this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend }); for (const path of filesReceiverWillSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } this.log("Full sync: receiver has sent all its files. Sending complete message."); this.sendData(conn.peer, { type: 'full-sync-complete'}); this.isSyncing = false; this.updateStatus(); }
     async handleFullSyncResponse(data: FullSyncResponsePayload, conn: DataConnection) { if (!this.isSyncing) return; this.showNotice("Received sync plan. Exchanging files...", 'verbose'); this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, I will receive ${data.filesReceiverWillSend.length}`); for (const path of data.filesInitiatorMustSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } const dynamicTimeout = 30000 + (data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length) * 1000; if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = window.setTimeout(() => { if (this.isSyncing) { this.showNotice("Sync timed out. Some files may not have transferred.", 'error', 10000); this.handleFullSyncComplete(); } }, dynamicTimeout); }
-    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.isQueueProcessing = false; this.processQueue(); this.updateStatus(); this.showNotice("✅ Full sync complete.", 'info'); }
+    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.updateStatus(); this.showNotice("✅ Full sync complete.", 'info'); }
     
     private async buildVaultManifest(): Promise<VaultManifest> { const manifest: VaultManifest = []; const allFiles = this.app.vault.getAllLoadedFiles(); for (const file of allFiles) { if (this.isPathSyncable(file.path)) { if (file instanceof TFolder) { if (file.path !== '/') manifest.push({ type: 'folder', path: file.path }); } else if (file instanceof TFile) { manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size }); } } } return manifest; }
     private isPathSyncable(path: string): boolean {
-        if (path.startsWith('.obsidian/') && !this.shouldSyncObsidianConfig()) { return false; }
+        // 1. Check Exclusions (Global)
+        const excluded = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
+        if (excluded.length > 0 && excluded.some(p => path.startsWith(p))) { return false; }
+
+        // 2. Handle .obsidian folder
+        if (path.startsWith('.obsidian/')) {
+            if (this.settings.syncMode === 'auto') {
+                const safePaths = ['.obsidian/snippets/', '.obsidian/themes/', '.obsidian/appearance.json'];
+                return safePaths.some(safe => path.startsWith(safe));
+            } else {
+                return this.settings.syncObsidianConfig;
+            }
+        }
+
         if (this.settings.syncMode === 'manual') {
-            const excluded = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
             const included = this.settings.includedFolders.split('\n').map(p => p.trim()).filter(Boolean);
-            if (excluded.length > 0 && excluded.some(p => path.startsWith(p))) { return false; }
             if (included.length > 0 && !included.some(p => path.startsWith(p))) { return false; }
         }
         return true;
@@ -1124,7 +1172,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Mode')
-            .setDesc('Auto mode is recommended for most users. Manual mode provides advanced configuration options.')
+            .setDesc('Auto mode syncs all files, snippets, and themes. Manual mode provides advanced configuration options.')
             .addDropdown(dd => dd
                 .addOption('auto', 'Auto (Recommended)')
                 .addOption('manual', 'Manual')
@@ -1148,10 +1196,16 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         this.clusterStatusEl = containerEl.createDiv();
         this.updateStatus();
 
+        // Shared Settings (Visible in both modes)
+        containerEl.createEl('h3', { text: 'Settings' });
+        new Setting(containerEl)
+            .setName("Excluded folders")
+            .setDesc("Never sync folders in this list. One folder per line. Example: 'Attachments/Large Files'.")
+            .addTextArea(text => text.setPlaceholder("Path/To/Exclude\nAnother/Path").setValue(this.plugin.settings.excludedFolders).onChange(async (value) => { this.plugin.settings.excludedFolders = value; await this.plugin.saveSettings(); }));
+
         if (this.plugin.settings.syncMode === 'manual') {
             this.displayManualSettings(containerEl);
         } else {
-            containerEl.createEl('h2', { text: 'Notifications' });
              new Setting(containerEl)
                 .setName('Show Sync Notifications')
                 .setDesc('Enable to see pop-up notifications for sync events like connections and conflicts.')
@@ -1168,7 +1222,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     }
 
     displayManualSettings(containerEl: HTMLElement): void {
-        containerEl.createEl('h2', { text: 'Notifications & Sync Behavior' });
+        containerEl.createEl('h4', { text: 'Manual Configuration' });
 
         new Setting(containerEl)
             .setName('Show Sync Notifications')
@@ -1229,10 +1283,6 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             .setName("Included folders")
             .setDesc("Only sync folders in this list. One folder per line. If empty, all folders are included (unless excluded). Example: 'Journal/Daily'.")
             .addTextArea(text => text.setPlaceholder("Path/To/Include\nAnother/Path").setValue(this.plugin.settings.includedFolders).onChange(async (value) => { this.plugin.settings.includedFolders = value; await this.plugin.saveSettings(); }));
-        new Setting(containerEl)
-            .setName("Excluded folders")
-            .setDesc("Never sync folders in this list. One folder per line. Takes priority over included folders. Example: 'Attachments/Large Files'.")
-            .addTextArea(text => text.setPlaceholder("Path/To/Exclude\nAnother/Path").setValue(this.plugin.settings.excludedFolders).onChange(async (value) => { this.plugin.settings.excludedFolders = value; await this.plugin.saveSettings(); }));
         
         const advancedSettings = containerEl.createEl('details');
         advancedSettings.createEl('summary', { text: 'Advanced Settings' });
