@@ -1,7 +1,6 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile, Modal, Platform, requestUrl, debounce, setIcon } from 'obsidian';
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
-import * as QRCode from 'qrcode';
 
 // --- Constants ---
 const DISCOVERY_PORT = 41234;
@@ -12,7 +11,7 @@ const CHUNK_SIZE = 16 * 1024 * 0.9;
 const COMPANION_RECONNECT_INTERVAL_MS = 10000;
 
 // --- Type Definitions ---
-type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; };
+type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; port?: number; mode?: 'peerjs' | 'direct-ip'; };
 type DiscoveryBeacon = { type: 'obsidian-decentralized-beacon'; peerInfo: PeerInfo; };
 type FileManifestEntry = { path: string; mtime: number; size: number; type: 'file' };
 type FolderManifestEntry = { path: string; type: 'folder' };
@@ -109,6 +108,7 @@ class DesktopLANDiscovery implements ILANDiscovery {
     private peerTimeouts: Map<string, number> = new Map();
     private discoveryTimeoutMs: number = 5000;
     private _emitter: any;
+    private myDeviceId: string | null = null;
 
     constructor() {
         const { EventEmitter } = require('events');
@@ -152,6 +152,7 @@ class DesktopLANDiscovery implements ILANDiscovery {
                 const data: DiscoveryBeacon = JSON.parse(msg.toString());
                 if (data.type === 'obsidian-decentralized-beacon' && data.peerInfo?.deviceId) {
                     const peerId = data.peerInfo.deviceId;
+                    if (this.myDeviceId && peerId === this.myDeviceId) return;
 
                     if (this.peerTimeouts.has(peerId)) {
                         clearTimeout(this.peerTimeouts.get(peerId)!);
@@ -178,6 +179,7 @@ class DesktopLANDiscovery implements ILANDiscovery {
     }
 
     public startBroadcasting(peerInfo: PeerInfo) {
+        this.myDeviceId = peerInfo.deviceId;
         this.stopBroadcasting();
         this.createSocket();
 
@@ -625,6 +627,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     initializeConnectionManager(onOpen?: (id: string) => void) {
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
+        
+        if (!Platform.isMobile) {
+            this.lanDiscovery.startBroadcasting(this.getMyPeerInfo());
+            this.lanDiscovery.startListening();
+        }
+
         if (this.getConnectionMode() === 'peerjs') {
             this.initializePeer(onOpen);
         } else {
@@ -660,7 +668,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.tryToConnectToCompanion();
             if (!Platform.isMobile) {
                 this.lanDiscovery.startBroadcasting(this.getMyPeerInfo());
-                this.lanDiscovery.startListening();
             }
             onOpen?.(id);
         });
@@ -1045,13 +1052,27 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public ignoreNextEventForPath(path: string, durationMs = 2000) { this.ignoreEvents.set(path, Date.now() + durationMs); }
     getConflictPath(originalPath: string): string { const extension = originalPath.split('.').pop() || ''; const base = originalPath.substring(0, originalPath.lastIndexOf('.')); const date = new Date().toISOString().split('T')[0]; return `${base} (conflict on ${date}).${extension}`; }
     getLocalIp(): string | null { if (Platform.isMobile) return null; try { const os = require('os'); const interfaces = os.networkInterfaces(); for (const name in interfaces) { for (const net of interfaces[name]!) { if (net.family === 'IPv4' && !net.internal) return net.address; } } } catch (e) { console.warn("Could not get local IP address.", e); } return null; }
-    getMyPeerInfo(): PeerInfo { return { deviceId: this.peer?.id || this.settings.deviceId, friendlyName: this.settings.friendlyName, ip: this.getLocalIp() }; }
+    getMyPeerInfo(): PeerInfo {
+        const mode = this.getConnectionMode();
+        let port: number | undefined;
+        if (mode === 'direct-ip' && this.directIpServer) {
+            port = this.settings.directIpHostPort;
+        }
+        return { 
+            deviceId: this.peer?.id || this.settings.deviceId, 
+            friendlyName: this.settings.friendlyName, 
+            ip: this.getLocalIp(),
+            mode: mode,
+            port: port
+        }; 
+    }
     public startDirectIpHost() { if (Platform.isMobile) return; this.reinitializeConnectionManager(); const pin = Math.floor(1000 + Math.random() * 9000).toString().padStart(4, '0'); this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin); this.updateStatus(); return pin; }
     public async connectToDirectIpHost(config: DirectIpConfig) { this.reinitializeConnectionManager(); this.directIpClient = new DirectIpClient(this, config); this.clusterPeers.set(config.host, { deviceId: config.host, friendlyName: `Host (${config.host})`, ip: config.host }); this.updateStatus(); }
     
     injectStatusBarStyles() {
         const styleId = 'obsidian-decentralized-status-styles';
-        if (document.getElementById(styleId)) return;
+        const existing = document.getElementById(styleId);
+        if (existing) existing.remove();
         const style = document.createElement('style');
         style.id = styleId;
         style.innerHTML = `
@@ -1141,7 +1162,268 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 }
 
-class ConnectionModal extends Modal { private discoveredPeers: Map<string, PeerInfo> = new Map(); constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); } onOpen() { this.injectStyles(); this.showInitialOptions(); } onClose() { this.plugin.lanDiscovery.stop(); this.contentEl.empty(); } injectStyles() { const styleId = 'obsidian-decentralized-styles'; if (document.getElementById(styleId)) return; const style = document.createElement('style'); style.id = styleId; style.innerHTML = ` .obsidian-decentralized-connect-modal .qr-code-container { text-align: center; margin-bottom: 1em; } .obsidian-decentralized-connect-modal .qr-code-container img { max-width: 200px; margin: auto; background: white; padding: 10px; border-radius: 8px; } .obsidian-decentralized-connect-modal .obsidian-decentralized-id-block { font-family: monospace; font-size: 1.1em; padding: 0.8em; background-color: var(--background-secondary); border-radius: 6px; word-break: break-all; user-select: all; margin: 1em 0; text-align: left; } .obsidian-decentralized-connect-modal .obsidian-decentralized-info-display { font-family: monospace; font-size: 1.2em; text-align: center; margin: 0.5em 0; } .obsidian-decentralized-connect-modal .pin-display { font-size: 3em; font-weight: bold; text-align: center; letter-spacing: 0.5em; margin: 0.5em 0; } .obsidian-decentralized-connect-modal .obsidian-decentralized-cluster-list { display: flex; flex-direction: column; gap: 8px; margin-top: 1em; max-height: 200px; overflow-y: auto; } .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry { display: flex; align-items: center; padding: 10px; background-color: var(--background-secondary); border-radius: 6px; border-left: 4px solid var(--background-modifier-border); cursor: pointer; } .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry:hover { background-color: var(--background-modifier-hover); } .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry .peer-info { flex-grow: 1; pointer-events: none; } .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry .peer-name { font-weight: bold; display: block; } .obsidian-decentralized-connect-modal .obsidian-decentralized-peer-entry .peer-details { font-size: var(--font-ui-small); color: var(--text-muted); } `; document.head.appendChild(style); } showInitialOptions() { this.plugin.lanDiscovery.stop(); const { contentEl } = this; this.modalEl.addClass('obsidian-decentralized-connect-modal'); contentEl.empty(); contentEl.createEl('h2', { text: 'Connect Devices' }); new Setting(contentEl).setName("PeerJS (Internet/LAN)").setDesc("Connect using the standard PeerJS cloud or your own server. Recommended for most users.").addButton(btn => btn.setButtonText("Setup").setCta().onClick(() => this.showPeerJsMenu())); if (this.plugin.settings.syncMode === 'manual') { new Setting(contentEl).setName("Direct IP (Offline LAN Only)").setDesc("Advanced: Connect directly to another device on your LAN using its IP address. No internet needed.").addButton(btn => btn.setButtonText("Setup").onClick(() => this.showDirectIpMenu())); } } showPeerJsMenu() { const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'PeerJS Connection' }); new Setting(contentEl).setName("Companion Mode").setDesc("Set a permanent companion device for automatic connections.").addButton(btn => btn.setButtonText("Setup").setCta().onClick(() => this.showCompanionSetup())); new Setting(contentEl).setName("One-Time Connection").setDesc("Temporarily connect to any device.").addButton(btn => btn.setButtonText("Connect").onClick(() => this.showOneTimeConnection())); new Setting(contentEl).addButton(btn => btn.setButtonText('Back').onClick(() => this.showInitialOptions())); } showOneTimeConnection() { this.plugin.lanDiscovery.stop(); const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'One-Time Connection' }); if (!Platform.isMobile) { new Setting(contentEl).setName("Invite via LAN (No Internet Needed)").setDesc("Broadcast an invitation on your local network. The other device must be on the same Wi-Fi.").addButton(btn => btn.setButtonText("Invite with PIN").onClick(() => this.showInviteLAN())); } new Setting(contentEl).setName("Invite via ID / QR Code").setDesc("The most secure method. Requires an internet or self-hosted server for the initial handshake.").addButton(btn => btn.setButtonText("Show ID").setCta().onClick(() => this.showMyId(() => this.showOneTimeConnection(), 'Invite with ID', 'On your other device, select "Join a Network" and paste the ID below.'))); new Setting(contentEl).setName("Join a Network").setDesc("Enter an ID from another device, or discover devices on your LAN.").addButton(btn => btn.setButtonText("Join").onClick(() => this.showJoin())); new Setting(contentEl).addButton(btn => btn.setButtonText('Back').onClick(() => this.showPeerJsMenu())); } showDirectIpMenu() { const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'Direct IP Connection' }); contentEl.createEl('p', { text: "One device must act as the 'Host' (usually a Desktop). Other devices then connect as 'Clients'." }).addClass('mod-warning'); if (!Platform.isMobile) { new Setting(contentEl).setName("Become a Host").setDesc("Allow other devices on your LAN to connect to you.").addButton(btn => btn.setButtonText("Start Hosting").setCta().onClick(() => this.showDirectIpHost())); } new Setting(contentEl).setName("Connect to a Host").setDesc("Enter the IP Address and PIN from your Host device.").addButton(btn => btn.setButtonText("Connect").onClick(() => this.showDirectIpClient())); new Setting(contentEl).addButton(btn => btn.setButtonText('Back').onClick(() => this.showInitialOptions())); } showDirectIpHost() { const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'Direct IP Host Mode' }); const pin = this.plugin.startDirectIpHost(); if (!pin) { contentEl.createEl('p', { text: 'Could not start host server. Check console for errors.' }); new Setting(contentEl).addButton(btn => btn.setButtonText("Back").onClick(() => this.showDirectIpMenu())); return; } contentEl.createEl('p', { text: 'This device is now hosting. On your client device, enter the following information:' }); const ip = this.plugin.getLocalIp(); if (ip) { contentEl.createEl('div', { text: `Your IP: ${ip}`, cls: 'obsidian-decentralized-info-display' }); } else { contentEl.createEl('div', { text: `Could not determine IP. Check your system's network settings.`, cls: 'obsidian-decentralized-info-display mod-warning' }); } contentEl.createEl('div', { text: `Port: ${this.plugin.settings.directIpHostPort}`, cls: 'obsidian-decentralized-info-display' }); contentEl.createEl('div', { text: `Your PIN is:`, cls: 'obsidian-decentralized-info-display' }); contentEl.createEl('div', { text: pin, cls: 'pin-display' }); contentEl.createEl('p', { text: 'This window can be closed. The host will remain active.', cls: 'setting-item-description' }); new Setting(contentEl).addButton(btn => btn.setButtonText("Done").onClick(() => this.close())); } showDirectIpClient() { const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'Connect to Direct IP Host' }); contentEl.createEl('p', { text: "Enter the details shown on the host device." }); const config: DirectIpConfig = { host: this.plugin.settings.directIpHostAddress, port: this.plugin.settings.directIpHostPort, pin: '' }; new Setting(contentEl).setName("Host IP Address").addText(text => text.setValue(config.host).onChange(val => config.host = val)); new Setting(contentEl).setName("Host Port").addText(text => text.setValue(config.port.toString()).onChange(val => config.port = parseInt(val) || 31235)); new Setting(contentEl).setName("PIN").addText(text => { text.inputEl.type = 'number'; text.inputEl.maxLength = 4; text.setPlaceholder("Enter PIN...").onChange(value => config.pin = value); }); new Setting(contentEl) .addButton(btn => btn.setButtonText("Back").onClick(() => this.showDirectIpMenu())) .addButton(btn => btn.setButtonText("Connect").setCta().onClick(() => { if (!config.host || config.pin.length !== 4) { new Notice("Please enter a valid Host IP and 4-digit PIN."); return; } this.plugin.connectToDirectIpHost(config); this.close(); })); } showInviteLAN() { const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'Invite with PIN (LAN)' }); contentEl.createEl('p', { text: 'Your device is now discoverable on your local network. On the other device, choose "Join a Network" to find this one.' }); const pin = Math.floor(1000 + Math.random() * 9000).toString().padStart(4, '0'); this.plugin.joinPin = pin; this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo()); const ip = this.plugin.getLocalIp(); if (ip) { contentEl.createEl('div', { text: `Your IP: ${ip}`, cls: 'obsidian-decentralized-info-display' }); } contentEl.createEl('div', { text: `Your PIN is:`, cls: 'obsidian-decentralized-info-display' }); contentEl.createEl('div', { text: pin, cls: 'pin-display' }); contentEl.createEl('p', { text: 'This PIN will be required to connect.', cls: 'setting-item-description' }); new Setting(contentEl).addButton(btn => btn.setButtonText("Back").onClick(() => this.showOneTimeConnection())); } showJoin() { const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'Join Network' }); if (!Platform.isMobile) { contentEl.createEl('h3', { text: 'Discovered on LAN' }); const discoveryListEl = contentEl.createDiv({ cls: 'obsidian-decentralized-cluster-list' }); const noPeersEl = discoveryListEl.createEl('p', { text: 'Searching for devices...' }); this.plugin.lanDiscovery.on('discover', (peerInfo: PeerInfo) => { noPeersEl.hide(); if (peerInfo.deviceId === this.plugin.settings.deviceId) return; this.discoveredPeers.set(peerInfo.deviceId, peerInfo); this.renderDiscoveredPeers(discoveryListEl); }); this.plugin.lanDiscovery.on('lose', (peerInfo: PeerInfo) => { this.discoveredPeers.delete(peerInfo.deviceId); this.renderDiscoveredPeers(discoveryListEl); if (this.discoveredPeers.size === 0) { noPeersEl.show(); } }); this.plugin.lanDiscovery.startListening(); } contentEl.createEl('h3', { text: 'Manual Connection' }); let remoteId = ''; new Setting(contentEl).setName("Peer ID").addText(text => text.setPlaceholder("Paste ID here...").onChange(value => remoteId = value)); const buttonRow = new Setting(contentEl); buttonRow.addButton(btn => btn.setButtonText("Back").onClick(() => this.showOneTimeConnection())); buttonRow.addButton(btn => btn.setButtonText("Connect with ID").setCta().onClick(() => { if (!remoteId.trim()) { new Notice("Please enter a Peer ID."); return; } if (!this.plugin.peer || this.plugin.peer.disconnected) { new Notice("Peer connection is not active. Please initialize PeerJS first."); this.plugin.initializePeer(); return; } const conn = this.plugin.peer.connect(remoteId.trim()); this.plugin.setupConnection(conn); this.close(); })); } renderDiscoveredPeers(container: HTMLElement) { container.empty(); if (this.discoveredPeers.size === 0) { container.createEl('p', { text: 'Searching for devices...' }); return; } this.discoveredPeers.forEach(peer => { const entry = container.createEl('div', { cls: 'obsidian-decentralized-peer-entry' }); entry.onclick = () => { this.showPinPrompt(peer); }; const infoDiv = entry.createDiv({ cls: 'peer-info' }); infoDiv.createEl('div', { text: peer.friendlyName, cls: 'peer-name' }); infoDiv.createEl('div', { text: `IP: ${peer.ip} | ID: ${peer.deviceId.substring(0, 12)}...`, cls: 'peer-details' }); }); } showPinPrompt(peer: PeerInfo) { this.plugin.lanDiscovery.stop(); const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: `Connect to ${peer.friendlyName}` }); contentEl.createEl('p', { text: `Enter the PIN displayed on the other device.` }); let pin = ''; new Setting(contentEl).setName("PIN").addText(text => { text.inputEl.type = 'number'; text.setPlaceholder("Enter PIN...").onChange(value => pin = value); }); new Setting(contentEl) .addButton(btn => btn.setButtonText("Back").onClick(() => this.showJoin())) .addButton(btn => btn.setButtonText("Connect").setCta().onClick(() => { if (pin.length !== 4) { new Notice("PIN must be 4 digits."); return; } if (!this.plugin.peer || this.plugin.peer.disconnected) { new Notice("Peer connection is not active."); this.plugin.initializePeer(); return; } const conn = this.plugin.peer.connect(peer.deviceId); this.plugin.setupConnection(conn, pin); this.close(); })); } showCompanionSetup() { const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: 'Companion Mode' }); const companionId = this.plugin.settings.companionPeerId; if (companionId) { const peerInfo = this.plugin.clusterPeers.get(companionId); contentEl.createEl('p', { text: `Currently paired with: ${peerInfo?.friendlyName || 'Unknown Device'}` }); contentEl.createEl('p', { text: `ID: ${companionId}` }).style.fontSize = 'var(--font-ui-small)'; } else { contentEl.createEl('p', { text: 'Not currently paired with a companion device.' }); } contentEl.createEl('h3', { text: 'Pair a New Companion' }); contentEl.createEl('p', { text: 'Enter the ID from your other device to create a permanent, automatic link. This will replace any existing companion.' }); let remoteId = ''; new Setting(contentEl).setName("Companion's ID").addText(text => text.setPlaceholder("Paste companion's ID...").onChange(value => remoteId = value)); const buttonRow = new Setting(contentEl); buttonRow.addButton(btn => btn.setButtonText('Back').onClick(() => this.showPeerJsMenu())); buttonRow.addButton(btn => btn.setButtonText("Show My ID").onClick(() => this.showMyId(() => this.showCompanionSetup(), 'This Device\'s ID', 'On your other device, select "Companion Mode", and paste this ID.'))); buttonRow.addButton(btn => btn.setButtonText("Pair").setCta().onClick(async () => { if (!remoteId.trim()) { new Notice("Please enter a Peer ID."); return; } await this.plugin.forgetCompanion(); this.plugin.settings.companionPeerId = remoteId.trim(); await this.plugin.saveSettings(); this.plugin.showNotice(`Set ${remoteId.trim()} as companion. Sending pair request...`, 'info'); if (this.plugin.peer && !this.plugin.peer.disconnected) { const conn = this.plugin.peer.connect(remoteId.trim()); this.plugin.setupConnection(conn); conn.on('open', () => { conn.send({ type: 'companion-pair', peerInfo: this.plugin.getMyPeerInfo() }); }); } else { this.plugin.showNotice("Peer connection is not active. Please wait for it to initialize.", 'info'); this.plugin.initializePeer(); } this.plugin.tryToConnectToCompanion(); this.close(); })); } showMyId(backCallback: () => void, title: string, text: string) { this.plugin.lanDiscovery.stop(); const { contentEl } = this; contentEl.empty(); contentEl.createEl('h2', { text: title }); contentEl.createEl('p', { text }); const qrEl = contentEl.createDiv({ cls: 'qr-code-container' }); const idEl = contentEl.createDiv({ cls: 'obsidian-decentralized-id-block', text: 'Loading ID...' }); const buttonContainer = contentEl.createDiv(); this.plugin.initializePeer(async (id) => { try { const dataUrl = await QRCode.toDataURL(id, { width: 200, margin: 2 }); qrEl.empty(); qrEl.createEl('img', { attr: { src: dataUrl } }); idEl.setText(id); buttonContainer.empty(); new Setting(buttonContainer) .addButton(btn => btn.setButtonText("Copy ID").onClick(() => { navigator.clipboard.writeText(id); new Notice("ID Copied!", 2000); })) .addButton(btn => btn.setButtonText("Back").onClick(backCallback)); } catch (e) { console.error("QR Code generation failed", e); idEl.setText("Error generating QR code."); } }); if (!this.plugin.peer || this.plugin.peer.disconnected) { idEl.setText("Connecting to sync network to get ID..."); } } }
+class ConnectionModal extends Modal {
+    private discoveredPeers: Map<string, PeerInfo> = new Map();
+
+    constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
+
+    onOpen() {
+        this.injectStyles();
+        this.contentEl.addClass(Platform.isMobile ? 'od-mobile' : 'od-desktop');
+        this.renderDashboard();
+    }
+
+    onClose() {
+        this.plugin.lanDiscovery.stop();
+        this.contentEl.empty();
+    }
+
+    injectStyles() {
+        const styleId = 'obsidian-decentralized-styles';
+        const existing = document.getElementById(styleId);
+        if (existing) existing.remove();
+        const style = document.createElement('style');
+        style.id = styleId;
+        style.innerHTML = `
+            .od-dashboard-header { text-align: center; margin-bottom: 20px; font-weight: 600; color: var(--text-normal); }
+            .od-id-container { background: var(--background-primary-alt); padding: 15px; border-radius: 8px; user-select: all; font-family: var(--font-monospace); cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--background-modifier-border); transition: all 0.2s ease; }
+            .od-id-container:hover { border-color: var(--interactive-accent); box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+            .od-section-title { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; color: var(--text-muted); margin-top: 25px; margin-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 5px; }
+            .od-peer-list { display: flex; flex-direction: column; gap: 8px; }
+            .od-peer-item { padding: 12px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: 6px; display: flex; align-items: center; justify-content: space-between; transition: background 0.1s; }
+            .od-peer-item:hover { background: var(--background-primary-alt); }
+            .od-peer-item .info { display: flex; flex-direction: column; }
+            .od-peer-item .sub-text { font-size: 0.8em; color: var(--text-muted); margin-top: 2px; }
+            .od-mode-switch { margin-top: 40px; text-align: center; font-size: 0.85em; color: var(--text-muted); cursor: pointer; text-decoration: none; opacity: 0.7; transition: opacity 0.2s; }
+            .od-mode-switch:hover { opacity: 1; text-decoration: underline; }
+            .od-input-row { display: flex; gap: 10px; margin-bottom: 5px; }
+            .od-input-row input { flex-grow: 1; }
+
+            .od-companion-btn { background-color: #f1c40f !important; color: #000 !important; font-size: 12px !important; padding: 4px 12px !important; height: auto !important; box-shadow: none !important; border: none !important; margin-top: 5px; }
+            .od-companion-btn:hover { background-color: #f39c12 !important; }
+            .od-right-align { display: flex; justify-content: flex-end; }
+
+            .od-id-name { font-weight: bold; margin-bottom: 4px; }
+            .od-id-value { font-size: 0.9em; color: var(--text-muted); }
+            .od-scanning { color: var(--text-muted); font-style: italic; }
+            .od-peer-name { font-weight: bold; }
+            .od-full-width { width: 100%; }
+            .od-top-margin { margin-top: 10px; }
+            .od-ip-display { font-size: 1.2em; text-align: center; margin: 10px; }
+            .od-pin-display { font-size: 2em; font-weight: bold; text-align: center; margin: 20px; }
+            .od-text-muted { color: var(--text-muted); }
+
+            /* Responsive & Platform Specifics */
+            .od-full-width { width: 100%; }
+
+            /* Desktop */
+            .od-desktop .od-full-width { width: auto; min-width: 200px; display: block; margin: 10px auto; }
+            .od-desktop .od-direct-ip-wrapper { max-width: 400px; margin: 0 auto; }
+            .od-desktop .od-direct-ip-wrapper input { margin-bottom: 10px; width: 100%; }
+            .od-desktop .od-id-container { max-width: 500px; margin: 0 auto; }
+            .od-desktop .od-peer-list { max-width: 600px; margin: 0 auto; }
+            .od-desktop .od-section-title { text-align: center; max-width: 600px; margin-left: auto; margin-right: auto; }
+            .od-desktop .od-input-row { max-width: 500px; margin: 0 auto 10px auto; }
+            
+            /* Mobile */
+            .od-mobile .od-full-width { width: 100%; }
+            .od-mobile .od-input-row { flex-direction: column; }
+            .od-mobile .od-input-row button { width: 100%; margin-top: 5px; }
+        `;
+        document.head.appendChild(style);
+    }
+
+    renderDashboard() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        if (this.plugin.settings.connectionMode === 'direct-ip') {
+            this.renderDirectIpDashboard();
+            return;
+        }
+
+        contentEl.createEl('h2', { text: 'Connection Manager', cls: 'od-dashboard-header' });
+
+        // 1. My Identity
+        const myInfo = this.plugin.getMyPeerInfo();
+        const idContainer = contentEl.createDiv({ cls: 'od-id-container', attr: { 'aria-label': 'Click to copy ID' } });
+        const idText = idContainer.createDiv();
+        idText.createDiv({ text: myInfo.friendlyName, cls: 'od-id-name' });
+        idText.createDiv({ text: myInfo.deviceId, cls: 'od-id-value' });
+        const copyIcon = idContainer.createDiv();
+        setIcon(copyIcon, 'copy');
+        idContainer.onclick = () => {
+            navigator.clipboard.writeText(myInfo.deviceId);
+            setIcon(copyIcon, 'check');
+            new Notice("ID Copied!");
+            setTimeout(() => setIcon(copyIcon, 'copy'), 2000);
+        };
+
+        // 2. LAN Discovery
+        if (!Platform.isMobile) {
+            contentEl.createDiv({ cls: 'od-section-title', text: 'Nearby Devices (LAN)' });
+            const lanList = contentEl.createDiv({ cls: 'od-peer-list' });
+            const renderLanList = () => {
+                lanList.empty();
+                if (this.discoveredPeers.size === 0) {
+                    lanList.createDiv({ text: 'Scanning for devices...', cls: 'od-scanning' });
+                } else {
+                    this.discoveredPeers.forEach((peer) => {
+                        const item = lanList.createDiv({ cls: 'od-peer-item' });
+                        const info = item.createDiv({ cls: 'info' });
+                        info.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
+                        info.createDiv({ text: peer.ip || 'Unknown IP', cls: 'sub-text' });
+                        info.createDiv({ text: `ID: ${peer.deviceId}`, cls: 'sub-text' });
+                        const btn = item.createEl('button', { text: 'Connect' });
+                        btn.onclick = () => {
+                            const conn = this.plugin.peer?.connect(peer.deviceId);
+                            if (conn) this.plugin.setupConnection(conn);
+                            this.close();
+                        };
+                    });
+                }
+            };
+            this.plugin.lanDiscovery.on('discover', (p) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); });
+            this.plugin.lanDiscovery.on('lose', (p) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); });
+            this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
+            this.plugin.lanDiscovery.startListening();
+            renderLanList();
+        }
+
+        // 3. Manual Connection
+        contentEl.createDiv({ cls: 'od-section-title', text: 'Manual Connection' });
+        const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
+        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter Peer ID' });
+        const connectBtn = inputRow.createEl('button', { text: 'Connect', cls: 'mod-cta' });
+        connectBtn.onclick = () => {
+            if (input.value.trim()) {
+                const conn = this.plugin.peer?.connect(input.value.trim());
+                if (conn) this.plugin.setupConnection(conn);
+                this.close();
+            }
+        };
+
+        // 4. Companion
+        const companionId = this.plugin.settings.companionPeerId;
+        if (companionId) {
+            contentEl.createDiv({ cls: 'od-section-title', text: 'Saved Companion' });
+            const item = contentEl.createDiv({ cls: 'od-peer-item' });
+            const info = item.createDiv({ cls: 'info' });
+            const peerInfo = this.plugin.clusterPeers.get(companionId);
+            info.createDiv({ text: peerInfo?.friendlyName || 'Companion Device', cls: 'od-peer-name' });
+            info.createDiv({ text: companionId, cls: 'sub-text' });
+            
+            if (this.plugin.connections.has(companionId)) {
+                item.createDiv({ text: 'Connected', cls: 'mod-success' });
+            } else {
+                const btn = item.createEl('button', { text: 'Connect' });
+                btn.onclick = () => { this.plugin.tryToConnectToCompanion(); this.close(); };
+            }
+        } else {
+            const btnContainer = contentEl.createDiv({ cls: 'od-right-align' });
+            const pairBtn = btnContainer.createEl('button', { text: 'Set ID as Companion', cls: 'od-companion-btn' });
+            pairBtn.onclick = async () => {
+                if (input.value.trim()) {
+                    this.plugin.settings.companionPeerId = input.value.trim();
+                    await this.plugin.saveSettings();
+                    this.plugin.tryToConnectToCompanion();
+                    this.renderDashboard();
+                } else {
+                    new Notice("Enter an ID first.");
+                }
+            };
+        }
+
+        // Footer
+        const footer = contentEl.createDiv({ cls: 'od-mode-switch' });
+        footer.setText("Switch to Direct IP Mode (Offline)");
+        footer.onclick = async () => {
+            this.plugin.settings.connectionMode = 'direct-ip';
+            await this.plugin.saveSettings();
+            this.plugin.reinitializeConnectionManager();
+            this.renderDashboard();
+        };
+    }
+
+    renderDirectIpDashboard() {
+        const { contentEl } = this;
+        contentEl.createEl('h2', { text: 'Direct IP (Offline)', cls: 'od-dashboard-header' });
+        
+        const container = contentEl.createDiv({ cls: 'od-direct-ip-wrapper' });
+
+        container.createDiv({ cls: 'od-section-title', text: 'Host Mode' });
+        if (!Platform.isMobile) {
+            const hostBtn = container.createEl('button', { text: 'Start Hosting', cls: 'mod-cta od-full-width' });
+            hostBtn.onclick = () => {
+                const pin = this.plugin.startDirectIpHost();
+                if (pin) {
+                    contentEl.empty();
+                    contentEl.createEl('h2', { text: 'Hosting Active', cls: 'od-dashboard-header' });
+                    contentEl.createDiv({ text: `IP: ${this.plugin.getLocalIp()}`, cls: 'od-ip-display' });
+                    contentEl.createDiv({ text: `PIN: ${pin}`, cls: 'od-pin-display' });
+                    contentEl.createEl('button', { text: 'Done', cls: 'od-full-width', attr: { style: 'margin-top: 20px;' } }).onclick = () => this.close();
+                }
+            };
+        } else {
+            container.createDiv({ text: 'Hosting is not available on mobile.', cls: 'od-text-muted' });
+        }
+
+        if (!Platform.isMobile) {
+            container.createDiv({ cls: 'od-section-title', text: 'Discovered Hosts' });
+            const lanList = container.createDiv({ cls: 'od-peer-list' });
+            const renderLanList = () => {
+                lanList.empty();
+                if (this.discoveredPeers.size === 0) {
+                    lanList.createDiv({ text: 'Scanning for hosts...', cls: 'od-scanning' });
+                } else {
+                    this.discoveredPeers.forEach((peer) => {
+                        const item = lanList.createDiv({ cls: 'od-peer-item' });
+                        const info = item.createDiv({ cls: 'info' });
+                        info.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
+                        info.createDiv({ text: `${peer.ip || 'Unknown IP'}:${peer.port || '???'}`, cls: 'sub-text' });
+                        const btn = item.createEl('button', { text: 'Select' });
+                        btn.onclick = () => {
+                            if (peer.ip) ipInput.value = peer.ip;
+                            if (peer.port) this.plugin.settings.directIpHostPort = peer.port;
+                            new Notice(`Selected ${peer.friendlyName}`);
+                        };
+                    });
+                }
+            };
+            this.plugin.lanDiscovery.on('discover', (p) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); });
+            this.plugin.lanDiscovery.on('lose', (p) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); });
+            this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
+            this.plugin.lanDiscovery.startListening();
+            renderLanList();
+        }
+
+        container.createDiv({ cls: 'od-section-title', text: 'Client Mode' });
+        const ipInput = container.createEl('input', { type: 'text', placeholder: 'Host IP' });
+        ipInput.value = this.plugin.settings.directIpHostAddress;
+        if (Platform.isMobile) { ipInput.style.width = '100%'; ipInput.style.marginBottom = '10px'; }
+        
+        const pinInput = container.createEl('input', { type: 'number', placeholder: 'PIN' });
+        if (Platform.isMobile) { pinInput.style.width = '100%'; pinInput.style.marginBottom = '10px'; }
+
+        const connectBtn = container.createEl('button', { text: 'Connect', cls: 'mod-cta od-full-width' });
+        connectBtn.onclick = () => {
+            if (ipInput.value && pinInput.value) {
+                this.plugin.settings.directIpHostAddress = ipInput.value;
+                this.plugin.connectToDirectIpHost({ host: ipInput.value, port: this.plugin.settings.directIpHostPort, pin: pinInput.value });
+                this.close();
+            }
+        };
+
+        const footer = contentEl.createDiv({ cls: 'od-mode-switch' });
+        footer.setText("Switch to Standard Mode (PeerJS)");
+        footer.onclick = async () => {
+            this.plugin.settings.connectionMode = 'peerjs';
+            await this.plugin.saveSettings();
+            this.plugin.reinitializeConnectionManager();
+            this.renderDashboard();
+        };
+    }
+}
 
 class SelectPeerModal extends Modal { constructor(app: App, private connections: Map<string, DataConnection>, private clusterPeers: Map<string, PeerInfo>, private onSubmit: (peerId: string) => void) { super(app); } onOpen() { const { contentEl } = this; contentEl.createEl('h2', { text: 'Force Full Sync with Peer' }); contentEl.createEl('p', { text: 'This will perform a two-way sync. Files will be exchanged based on which is newer. This is the safest way to reconcile two vaults.' }).addClass('mod-warning'); let selectedPeer = ''; const peerList = Array.from(this.connections.keys()); if (peerList.length === 0) { contentEl.createEl('p', { text: 'No peers are currently connected.' }); new Setting(contentEl).addButton(btn => btn.setButtonText("OK").onClick(() => this.close())); return; } new Setting(contentEl).setName('Sync with Device').addDropdown(dropdown => { peerList.forEach(peerId => { const peerInfo = this.clusterPeers.get(peerId); dropdown.addOption(peerId, peerInfo?.friendlyName || peerId); }); selectedPeer = dropdown.getValue(); dropdown.onChange(value => selectedPeer = value); }); new Setting(contentEl) .addButton(btn => btn.setButtonText('Cancel').onClick(() => this.close())) .addButton(btn => btn.setButtonText('Start Full Sync').setWarning().onClick(() => { if (selectedPeer) this.onSubmit(selectedPeer); this.close(); })); } onClose() { this.contentEl.empty(); } }
 class ConflictCenter { private conflicts: Map<string, string> = new Map(); private ribbonEl: HTMLElement | null = null; constructor(private app: App, private plugin: ObsidianDecentralizedPlugin) { } registerRibbon() { this.ribbonEl = this.plugin.addRibbonIcon('swords', 'Resolve Sync Conflicts', () => this.showConflictList()); this.ribbonEl.style.display = 'none'; } addConflict(originalPath: string, conflictPath: string) { this.conflicts.set(originalPath, conflictPath); this.updateRibbon(); } resolveConflict(originalPath: string) { this.conflicts.delete(originalPath); this.updateRibbon(); } updateRibbon() { if (!this.ribbonEl) return; if (this.conflicts.size > 0) { this.ribbonEl.show(); this.ribbonEl.setAttribute('aria-label', `Resolve ${this.conflicts.size} sync conflicts`); this.ribbonEl.setText(this.conflicts.size.toString()); } else { this.ribbonEl.hide(); } } showConflictList() { new ConflictListModal(this.app, this, this.plugin).open(); } }
