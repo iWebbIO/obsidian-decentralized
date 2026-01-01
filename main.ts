@@ -258,7 +258,6 @@ class DesktopLANDiscovery implements ILANDiscovery {
             });
         };
 
-        sendBeacon();
         this.broadcastInterval = window.setInterval(sendBeacon, 2000);
     }
 
