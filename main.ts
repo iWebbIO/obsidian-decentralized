@@ -95,7 +95,7 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     conflictResolutionStrategy: 'create-conflict-file',
     includedFolders: '',
     excludedFolders: '',
-    hideNativeSyncStatus: true,
+    hideNativeSyncStatus: false,
 };
 
 interface ILANDiscovery {
@@ -560,6 +560,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.directIpClient?.stop();
         if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout);
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
+        this.activeTransfers.clear();
     }
     async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); this.applyHideNativeSync(); }
     async saveSettings() { await this.saveData(this.settings); }
@@ -592,12 +593,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public shouldSyncAllFileTypes() { return this.settings.syncMode === 'auto' ? true : this.settings.syncAllFileTypes; }
     public shouldSyncObsidianConfig() { return this.settings.syncMode === 'auto' ? true : this.settings.syncObsidianConfig; }
     public getConnectionMode() { return this.settings.syncMode === 'auto' ? 'peerjs' : this.settings.connectionMode; }
+    private hasPeers(): boolean {
+        if (this.getConnectionMode() === 'direct-ip') {
+            return !!this.directIpClient || !!this.directIpServer;
+        }
+        return this.connections.size > 0;
+    }
 
     private generateTransferId(path: string): string { return `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
-    private handleEvent(file: TAbstractFile) { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; if (!this.app.vault.getAbstractFileByPath(file.path)) { this.handleFileDelete(file); return; } this.debouncedHandleFileChange(file); }
+    private handleEvent(file: TAbstractFile) { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; if (!this.hasPeers()) return; if (!this.app.vault.getAbstractFileByPath(file.path)) { this.handleFileDelete(file); return; } this.debouncedHandleFileChange(file); }
     private async handleFileChange(file: TAbstractFile) { this.log(`Processing debounced change for: ${file.path}`); if (file instanceof TFile) { this.sendFileUpdate(file); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-create', path: file.path, transferId: this.generateTransferId(file.path) }); } }
     private handleFileDelete(file: TAbstractFile) { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; this.log(`Processing delete: ${file.path}`); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-delete', path: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-delete', path: file.path, transferId }); } }
-    private handleRenameEvent(file: TAbstractFile, oldPath: string) { if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; this.log(`Processing rename: ${oldPath} -> ${file.path}`); this.ignoreNextEventForPath(file.path); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId }); } }
+    private handleRenameEvent(file: TAbstractFile, oldPath: string) { if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; if (!this.hasPeers()) return; this.log(`Processing rename: ${oldPath} -> ${file.path}`); this.ignoreNextEventForPath(file.path); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId }); } }
     
     broadcastData(data: SyncData) { this.addToQueue(null, data); }
     sendData(peerId: string, data: SyncData) { this.addToQueue(peerId, data); }
@@ -606,38 +613,44 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private async processQueue() {
         if (this.isQueueProcessing || this.syncQueue.length === 0) return;
         this.isQueueProcessing = true;
-        this.updateStatus();
-
-        const item = this.syncQueue.shift()!;
-        const { peerId, data, retries } = item;
-        const transferId = (data as BasePayload).transferId;
+        
+        let transferId: string | undefined;
+        let item: { peerId: string | null, data: SyncData, retries: number } | undefined;
 
         try {
+            this.updateStatus();
+            item = this.syncQueue.shift();
+            if (!item) return;
+
+            const { peerId, data } = item;
+            transferId = (data as any).transferId;
+
             const isChunkedTransfer = data.type === 'file-update' && data.content instanceof ArrayBuffer && data.content.byteLength > CHUNK_SIZE;
 
             if (isChunkedTransfer) {
+                if (!transferId) throw new Error("Transfer ID missing for chunked transfer");
                 if (this.getConnectionMode() === 'direct-ip') {
                     if (this.directIpClient) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
                             const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
-                            this.pendingAcks.set(transferId, () => {
+                            this.pendingAcks.set(transferId!, () => {
                                 clearTimeout(timeout);
                                 resolve();
                             });
                         });
-                        await this.sendFileInChunks('direct-ip-host', data.path, data.mtime, data.content as ArrayBuffer, transferId);
+                        await this.sendFileInChunks('direct-ip-host', data.path, data.mtime, data.content as ArrayBuffer, transferId!);
                         await ackPromise;
                         this.log(`Chunked transfer ${transferId} (DirectIP) completed.`);
                     } else if (this.directIpServer) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
                             const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
-                            this.pendingAcks.set(transferId, () => {
+                            this.pendingAcks.set(transferId!, () => {
                                 clearTimeout(timeout);
                                 resolve();
                             });
                         });
                         // PeerId is just a placeholder here as the server broadcasts to the queue
-                        await this.sendFileInChunks('direct-ip-client', data.path, data.mtime, data.content as ArrayBuffer, transferId);
+                        await this.sendFileInChunks('direct-ip-client', data.path, data.mtime, data.content as ArrayBuffer, transferId!);
                         await ackPromise;
                         this.log(`Chunked transfer ${transferId} (DirectIP Host) completed.`);
                     }
@@ -649,13 +662,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         
                         const ackPromise = new Promise<void>((resolve, reject) => {
                             const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 30000);
-                            this.pendingAcks.set(transferId, () => {
+                            this.pendingAcks.set(transferId!, () => {
                                 clearTimeout(timeout);
                                 resolve();
                             });
                         });
 
-                        this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content as ArrayBuffer, transferId);
+                        this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content as ArrayBuffer, transferId!);
                         await ackPromise;
                         this.log(`Chunked transfer ${transferId} for ${data.path} completed successfully.`);
                     }
@@ -674,17 +687,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         } catch (e) {
             console.error(`Error processing queue item ${transferId}:`, e);
-            if (retries < 3) {
-                this.log(`Retrying transfer ${transferId} (Attempt ${retries + 1}/3)`);
-                this.syncQueue.push({ peerId, data, retries: retries + 1 });
+            if (item && item.retries < 3) {
+                this.log(`Retrying transfer ${transferId} (Attempt ${item.retries + 1}/3)`);
+                this.syncQueue.push({ peerId: item.peerId, data: item.data, retries: item.retries + 1 });
                 // Add a small delay before processing the retry to let network stabilize
                 await new Promise(resolve => setTimeout(resolve, 1000));
-            } else {
-                this.showNotice(`File transfer failed permanently for ${(data as any).path || 'an item'}.`, 'error', 8000);
+            } else if (item) {
+                this.showNotice(`File transfer failed permanently for ${(item.data as any).path || 'an item'}.`, 'error', 8000);
             }
         } finally {
-            this.pendingAcks.delete(transferId);
-            this.activeTransfers.delete(transferId);
+            if (transferId) {
+                this.pendingAcks.delete(transferId);
+                this.activeTransfers.delete(transferId);
+            }
             this.isQueueProcessing = false;
             this.processQueue();
         }
@@ -699,6 +714,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.directIpServer = null;
         this.connections.clear();
         this.clusterPeers.clear();
+        this.activeTransfers.clear();
         this.initializeConnectionManager();
     }
 
@@ -762,6 +778,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.connections.forEach(conn => conn.close());
         this.connections.clear();
         this.clusterPeers.clear();
+        this.activeTransfers.clear();
     
         let userMessage = 'Connection Failed';
         switch(err.type) {
@@ -800,6 +817,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.connections.delete(peerId);
             const peerInfo = this.clusterPeers.get(peerId);
             this.clusterPeers.delete(peerId);
+
+            for (const [id, transfer] of this.activeTransfers.entries()) {
+                if (transfer.peerId === peerId) {
+                    this.activeTransfers.delete(id);
+                }
+            }
             this.updateStatus();
 
             if (this.pendingAcks.size > 0) {
@@ -1017,12 +1040,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     cleanupPendingChunks() {
         const now = Date.now();
+        let statusChanged = false;
+
         for (const [id, transfer] of this.pendingFileChunks.entries()) {
             if (now - transfer.lastUpdated > 60000 * 5) { // 5 minutes TTL
                 this.log(`Cleaning up stale chunk transfer: ${id}`);
                 this.pendingFileChunks.delete(id);
             }
         }
+        for (const [id, transfer] of this.activeTransfers.entries()) {
+            if (now - transfer.lastUpdate > 60000) { // 1 minute TTL for stalled UI
+                this.log(`Cleaning up stale active transfer: ${id}`);
+                this.activeTransfers.delete(id);
+                statusChanged = true;
+            }
+        }
+        if (statusChanged) this.updateStatus();
     }
 
     async applyFileUpdate(data: FileUpdatePayload) {
@@ -1758,6 +1791,8 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     }));
         }
+        
+        this.displayAdvancedSettings(containerEl);
 
         if (this.statusInterval) clearInterval(this.statusInterval);
         this.statusInterval = window.setInterval(() => this.updateStatus(), 3000);
@@ -1773,17 +1808,6 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.showToasts)
                 .onChange(async (value) => {
                     this.plugin.settings.showToasts = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Hide Obsidian Sync status')
-            .setDesc('Hide the native Obsidian Sync button in the status bar.')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.hideNativeSyncStatus)
-                .onChange(async (value) => {
-                    this.plugin.settings.hideNativeSyncStatus = value;
-                    this.plugin.applyHideNativeSync();
                     await this.plugin.saveSettings();
                 }));
 
@@ -1825,27 +1849,22 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             .setName("Included folders")
             .setDesc("Only sync folders in this list. One folder per line. If empty, all folders are included (unless excluded). Example: 'Journal/Daily'.")
             .addTextArea(text => text.setPlaceholder("Path/To/Include\nAnother/Path").setValue(this.plugin.settings.includedFolders).onChange(async (value) => { this.plugin.settings.includedFolders = value; await this.plugin.saveSettings(); }));
-        
+    }
+
+    displayAdvancedSettings(containerEl: HTMLElement): void {
         const advancedSettings = containerEl.createEl('details');
         advancedSettings.createEl('summary', { text: 'Advanced Settings' });
 
         new Setting(advancedSettings)
-            .setName("Connection Mode")
-            .setDesc("Choose how devices connect. 'PeerJS' is standard. 'Direct IP' is for offline LAN-only sync. Changing this requires a plugin reload or Obsidian restart.")
-            .addDropdown(dd => dd
-                .addOption('peerjs', 'PeerJS (Cloud/Self-Hosted)')
-                .addOption('direct-ip', 'Direct IP (Offline LAN)')
-                .setValue(this.plugin.settings.connectionMode)
-                .onChange(async (value: 'peerjs' | 'direct-ip') => {
-                    this.plugin.settings.connectionMode = value; 
-                    await this.plugin.saveSettings(); 
-                    this.plugin.reinitializeConnectionManager(); 
-                    this.display(); 
-                })); 
-        
-        if (this.plugin.settings.connectionMode === 'direct-ip') { 
-            advancedSettings.createEl('p', { text: "Direct IP mode must be configured from the 'Connect' modal.", cls: "setting-item-description" }); 
-        } 
+            .setName('Hide Obsidian Sync status')
+            .setDesc('Hide the native Obsidian Sync button in the status bar.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.hideNativeSyncStatus)
+                .onChange(async (value) => {
+                    this.plugin.settings.hideNativeSyncStatus = value;
+                    this.plugin.applyHideNativeSync();
+                    await this.plugin.saveSettings();
+                }));
 
         new Setting(advancedSettings)
             .setName("Enable Verbose Logging")
