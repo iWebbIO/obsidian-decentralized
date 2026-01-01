@@ -38,6 +38,17 @@ type FileChunkDataPayload = { type: 'file-chunk-data', transferId: string, index
 type PingPayload = { type: 'ping' };
 type PongPayload = { type: 'pong' };
 
+interface TransferStatus {
+    id: string;
+    path: string;
+    direction: 'upload' | 'download';
+    peerId: string;
+    totalChunks: number;
+    processedChunks: number;
+    startTime: number;
+    lastUpdate: number;
+}
+
 type SyncData =
     | HandshakePayload | ClusterGossipPayload | CompanionPairPayload | AckPayload
     | FileUpdatePayload | FileDeletePayload | FileRenamePayload
@@ -114,6 +125,15 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
         bytes[i] = binary_string.charCodeAt(i);
     }
     return bytes.buffer;
+}
+
+function formatBytes(bytes: number, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
 class DummyLANDiscovery implements ILANDiscovery {
@@ -302,13 +322,32 @@ class DirectIpServer {
                         encoding: 'base64'
                     };
                 }
+                if (msg.type === 'file-chunk-data' && msg.data instanceof ArrayBuffer) {
+                    return {
+                        ...msg,
+                        data: arrayBufferToBase64(msg.data)
+                    };
+                }
                 return msg;
             });
             res.end(JSON.stringify(messages));
             this.messageQueue = [];
         } else if (req.url === '/push' && req.method === 'POST') {
             let body = '';
+            let totalSize = 0;
+            const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB Limit
+
             req.on('data', (chunk: any) => body += chunk.toString());
+            req.on('data', (chunk: any) => {
+                totalSize += chunk.length;
+                if (totalSize > MAX_BODY_SIZE) {
+                    res.writeHead(413, CORS_HEADERS);
+                    res.end(JSON.stringify({ error: 'Payload too large' }));
+                    req.destroy();
+                    return;
+                }
+                body += chunk.toString();
+            });
             req.on('end', () => {
                 try {
                     let data: SyncData = JSON.parse(body);
@@ -319,8 +358,18 @@ class DirectIpServer {
                             encoding: 'binary'
                         };
                     }
+                    if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
+                        (data as any).data = base64ToArrayBuffer((data as any).data);
+                    }
 
-                    this.plugin.processIncomingData(data, null);
+                    // Create a mock connection for Direct IP to handle ACKs
+                    const mockConn = {
+                        send: (msg: SyncData) => this.send(msg),
+                        peer: 'direct-ip-client',
+                        open: true,
+                    } as any;
+
+                    this.plugin.processIncomingData(data, mockConn);
                     res.writeHead(200, CORS_HEADERS);
                     res.end(JSON.stringify({ status: 'ok' }));
                 } catch (e) {
@@ -378,7 +427,17 @@ class DirectIpClient {
                             encoding: 'binary'
                         } as FileUpdatePayload;
                     }
-                    this.plugin.processIncomingData(msg, null);
+                    if (msg.type === 'file-chunk-data' && typeof (msg as any).data === 'string') {
+                        (msg as any).data = base64ToArrayBuffer((msg as any).data);
+                    }
+
+                    const mockConn = {
+                        send: (data: SyncData) => this.send(data),
+                        peer: 'direct-ip-host',
+                        open: true
+                    } as any;
+
+                    this.plugin.processIncomingData(msg, mockConn);
                 }
             }
         } catch (e) {
@@ -396,6 +455,13 @@ class DirectIpClient {
                 content: arrayBufferToBase64(data.content),
                 encoding: 'base64'
             };
+        }
+        
+        if (data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer) {
+            payloadToSend = {
+                ...data,
+                data: arrayBufferToBase64(data.data)
+            } as any;
         }
 
         try {
@@ -437,10 +503,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private ignoreEvents: Map<string, number> = new Map();
     private statusBar: HTMLElement;
     private conflictCenter: ConflictCenter;
-    private transferProgress: Map<string, { path: string, progress: number }> = new Map();
+    public activeTransfers: Map<string, TransferStatus> = new Map();
     public joinPin: string | null = null;
     private companionConnectionInterval: number | null = null;
-    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number }> = new Map();
+    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, lastUpdated: number }> = new Map();
     private fullSyncTimeout: number | null = null;
 
     private syncQueue: { peerId: string | null, data: SyncData, retries: number }[] = [];
@@ -484,6 +550,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         this.initializeConnectionManager();
         this.startHeartbeat();
+        this.registerInterval(window.setInterval(() => this.cleanupPendingChunks(), 60000));
     }
 
     onunload() {
@@ -549,22 +616,49 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const isChunkedTransfer = data.type === 'file-update' && data.content instanceof ArrayBuffer && data.content.byteLength > CHUNK_SIZE;
 
             if (isChunkedTransfer) {
-                const targetPeers = peerId ? [peerId] : Array.from(this.connections.keys());
-                if (targetPeers.length > 0) {
-                    const firstPeer = targetPeers[0];
-                    for (let i = 1; i < targetPeers.length; i++) { this.addToQueue(targetPeers[i], data); }
-                    
-                    const ackPromise = new Promise<void>((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 30000);
-                        this.pendingAcks.set(transferId, () => {
-                            clearTimeout(timeout);
-                            resolve();
+                if (this.getConnectionMode() === 'direct-ip') {
+                    if (this.directIpClient) {
+                        const ackPromise = new Promise<void>((resolve, reject) => {
+                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
+                            this.pendingAcks.set(transferId, () => {
+                                clearTimeout(timeout);
+                                resolve();
+                            });
                         });
-                    });
+                        await this.sendFileInChunks('direct-ip-host', data.path, data.mtime, data.content as ArrayBuffer, transferId);
+                        await ackPromise;
+                        this.log(`Chunked transfer ${transferId} (DirectIP) completed.`);
+                    } else if (this.directIpServer) {
+                        const ackPromise = new Promise<void>((resolve, reject) => {
+                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
+                            this.pendingAcks.set(transferId, () => {
+                                clearTimeout(timeout);
+                                resolve();
+                            });
+                        });
+                        // PeerId is just a placeholder here as the server broadcasts to the queue
+                        await this.sendFileInChunks('direct-ip-client', data.path, data.mtime, data.content as ArrayBuffer, transferId);
+                        await ackPromise;
+                        this.log(`Chunked transfer ${transferId} (DirectIP Host) completed.`);
+                    }
+                } else {
+                    const targetPeers = peerId ? [peerId] : Array.from(this.connections.keys());
+                    if (targetPeers.length > 0) {
+                        const firstPeer = targetPeers[0];
+                        for (let i = 1; i < targetPeers.length; i++) { this.addToQueue(targetPeers[i], data); }
+                        
+                        const ackPromise = new Promise<void>((resolve, reject) => {
+                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 30000);
+                            this.pendingAcks.set(transferId, () => {
+                                clearTimeout(timeout);
+                                resolve();
+                            });
+                        });
 
-                    this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content as ArrayBuffer, transferId);
-                    await ackPromise;
-                    this.log(`Chunked transfer ${transferId} for ${data.path} completed successfully.`);
+                        this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content as ArrayBuffer, transferId);
+                        await ackPromise;
+                        this.log(`Chunked transfer ${transferId} for ${data.path} completed successfully.`);
+                    }
                 }
             } else {
                 if (this.getConnectionMode() === 'direct-ip') {
@@ -590,7 +684,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         } finally {
             this.pendingAcks.delete(transferId);
-            this.transferProgress.delete(transferId);
+            this.activeTransfers.delete(transferId);
             this.isQueueProcessing = false;
             this.processQueue();
         }
@@ -752,7 +846,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'request-full-sync': this.handleFullSyncRequest(data, conn!); break;
             case 'response-full-sync': this.handleFullSyncResponse(data, conn!); break;
             case 'full-sync-complete': this.handleFullSyncComplete(); break;
-            case 'file-chunk-start': this.handleFileChunkStart(data); break;
+            case 'file-chunk-start': this.handleFileChunkStart(data, conn); break;
             case 'file-chunk-data': this.handleFileChunkData(data, conn!); break;
             case 'ping': conn?.send({ type: 'pong' }); break;
             case 'pong': /* Heartbeat ack */ break;
@@ -826,30 +920,60 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string) {
-        const conn = this.connections.get(peerId);
-        if (!conn?.open) {
-            this.log(`No open connection to ${peerId} to send chunks. Aborting transfer.`);
-            this.pendingAcks.get(transferId)?.();
-            return;
+        const isDirectIp = this.getConnectionMode() === 'direct-ip';
+        let conn: DataConnection | undefined;
+
+        if (!isDirectIp) {
+            conn = this.connections.get(peerId);
+            if (!conn?.open) {
+                this.log(`No open connection to ${peerId} to send chunks. Aborting transfer.`);
+                this.pendingAcks.get(transferId)?.();
+                return;
+            }
         }
-        this.transferProgress.set(transferId, { path, progress: 0 });
+        this.activeTransfers.set(transferId, {
+            id: transferId,
+            path,
+            direction: 'upload',
+            peerId,
+            totalChunks: Math.ceil(fileContent.byteLength / CHUNK_SIZE),
+            processedChunks: 0,
+            startTime: Date.now(),
+            lastUpdate: Date.now()
+        });
         this.updateStatus();
 
         const totalChunks = Math.ceil(fileContent.byteLength / CHUNK_SIZE);
         this.log(`Sending file in ${totalChunks} chunks to ${peerId}: ${path} (ID: ${transferId})`);
-        conn.send({ type: 'file-chunk-start', path, mtime, totalChunks, transferId });
+        
+        const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId };
+        if (isDirectIp) {
+            if (this.directIpClient) await this.directIpClient.send(startPayload);
+            else if (this.directIpServer) this.directIpServer.send(startPayload);
+        }
+        else conn!.send(startPayload);
         
         for (let i = 0; i < totalChunks; i++) {
-            if (!conn.open) {
+            if (!isDirectIp && !conn!.open) {
                 this.log(`Connection to ${peerId} closed mid-transfer. Aborting.`);
                 this.pendingAcks.get(transferId)?.();
                 return;
             }
             try {
                 const start = i * CHUNK_SIZE; const end = start + CHUNK_SIZE; const chunk = fileContent.slice(start, end);
-                conn.send({ type: 'file-chunk-data', transferId, index: i, data: chunk });
-                const progress = Math.round(((i + 1) / totalChunks) * 100);
-                this.transferProgress.set(transferId, { path, progress });
+                const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk };
+                
+                if (isDirectIp) {
+                    if (this.directIpClient) await this.directIpClient.send(chunkPayload);
+                    else if (this.directIpServer) this.directIpServer.send(chunkPayload);
+                }
+                else conn!.send(chunkPayload);
+
+                const transfer = this.activeTransfers.get(transferId);
+                if (transfer) {
+                    transfer.processedChunks = i + 1;
+                    transfer.lastUpdate = Date.now();
+                }
                 this.updateStatus();
                 await new Promise(resolve => setTimeout(resolve, 5));
             } catch (e) {
@@ -860,17 +984,44 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         this.log(`Finished sending all chunks for ${path} to ${peerId}. Waiting for ack.`);
     }
-    handleFileChunkStart(payload: FileChunkStartPayload) { this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, }); this.log(`Receiving chunked file: ${payload.path}, ID: ${payload.transferId}`); }
+    handleFileChunkStart(payload: FileChunkStartPayload, conn: DataConnection | null) { 
+        this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, lastUpdated: Date.now() }); 
+        this.activeTransfers.set(payload.transferId, {
+            id: payload.transferId,
+            path: payload.path,
+            direction: 'download',
+            peerId: conn?.peer || 'Direct-IP',
+            totalChunks: payload.totalChunks,
+            processedChunks: 0,
+            startTime: Date.now(),
+            lastUpdate: Date.now()
+        });
+        this.log(`Receiving chunked file: ${payload.path}, ID: ${payload.transferId}`); 
+    }
     async handleFileChunkData(payload: FileChunkDataPayload, conn: DataConnection) {
         const transfer = this.pendingFileChunks.get(payload.transferId); if (!transfer) { this.log("Received chunk for unknown transfer:", payload.transferId); return; }
         transfer.chunks[payload.index] = payload.data;
+        transfer.lastUpdated = Date.now();
+        const active = this.activeTransfers.get(payload.transferId);
+        if (active) { active.processedChunks = transfer.chunks.filter(c => c !== undefined).length; active.lastUpdate = Date.now(); }
         if (transfer.chunks.every(chunk => chunk !== undefined)) {
             this.log(`All chunks received for ${transfer.path}. Reassembling...`);
             this.pendingFileChunks.delete(payload.transferId);
+            this.activeTransfers.delete(payload.transferId);
             const totalSize = transfer.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0); const reassembled = new Uint8Array(totalSize); let offset = 0;
             for (const chunk of transfer.chunks) { reassembled.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
             await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId });
             conn.send({ type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
+        }
+    }
+
+    cleanupPendingChunks() {
+        const now = Date.now();
+        for (const [id, transfer] of this.pendingFileChunks.entries()) {
+            if (now - transfer.lastUpdated > 60000 * 5) { // 5 minutes TTL
+                this.log(`Cleaning up stale chunk transfer: ${id}`);
+                this.pendingFileChunks.delete(id);
+            }
         }
     }
 
@@ -1087,15 +1238,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             body.od-hide-native-sync .status-bar-item.plugin-sync {
                 display: none !important;
             }
+            .od-status-container.mod-clickable { cursor: pointer; }
+            .od-status-container.mod-clickable:hover { color: var(--text-accent); }
+            .od-progress-modal .od-transfer-item { margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); }
+            .od-progress-modal .od-transfer-meta { display: flex; justify-content: space-between; font-size: 0.85em; color: var(--text-muted); margin-top: 4px; }
         `;
         document.head.appendChild(style);
     }
 
     public calculateStatusText(): string {
         if (this.isSyncing) { return "⚙️ Full Syncing..."; }
-        if (this.transferProgress.size > 0) {
-            const [transfer] = this.transferProgress.entries().next().value;
-            return `⏫ Syncing ${transfer.path} (${transfer.progress}%)`;
+        if (this.activeTransfers.size > 0) {
+            const count = this.activeTransfers.size;
+            return `⏫ Syncing ${count} file${count > 1 ? 's' : ''}...`;
         }
         if (this.isQueueProcessing) {
             const queueSize = this.syncQueue.length + 1;
@@ -1110,9 +1265,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.peer.id) { return "🔌 Connecting..."; }
         if (this.connections.size > 0) {
             const totalDevices = this.connections.size + 1;
-            return `✅ Sync Cluster (${totalDevices} device${totalDevices > 1 ? 's' : ''})`;
+            return `✅ Connected (${totalDevices} device${totalDevices > 1 ? 's' : ''})`;
         }
-        return "🟢 Sync Online";
+        return "🟢 Online";
     }
 
     updateStatus(statusText?: string) {
@@ -1122,15 +1277,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         let state: 'loading' | 'success' | 'error' | 'neutral' = 'neutral';
         
-        if (this.isSyncing || this.transferProgress.size > 0 || this.isQueueProcessing || currentStatus.includes('Connecting') || currentStatus.includes('Syncing')) {
+        if (this.isSyncing || this.activeTransfers.size > 0 || this.isQueueProcessing || currentStatus.includes('Connecting') || currentStatus.includes('Syncing')) {
             state = 'loading';
         } else if (currentStatus.includes('Offline') || currentStatus.includes('Error') || currentStatus.includes('Unreachable')) {
             state = 'error';
-        } else if (currentStatus.includes('Online') || currentStatus.includes('Cluster') || currentStatus.includes('Host') || currentStatus.includes('Client')) {
+        } else if (currentStatus.includes('Online') || currentStatus.includes('Connected') || currentStatus.includes('Host') || currentStatus.includes('Client')) {
             state = 'success';
         }
 
         if (state === 'loading') {
+            container.addClass('mod-clickable');
+            container.onclick = () => new SyncProgressModal(this.app, this).open();
             container.createDiv({ cls: 'od-loading-spinner' });
         } else if (state === 'success') {
             const icon = container.createDiv({ cls: 'od-status-icon' });
@@ -1481,6 +1638,57 @@ class SelectPeerModal extends Modal { constructor(app: App, private connections:
 class ConflictCenter { private conflicts: Map<string, string> = new Map(); private ribbonEl: HTMLElement | null = null; constructor(private app: App, private plugin: ObsidianDecentralizedPlugin) { } registerRibbon() { this.ribbonEl = this.plugin.addRibbonIcon('swords', 'Resolve Sync Conflicts', () => this.showConflictList()); this.ribbonEl.style.display = 'none'; } addConflict(originalPath: string, conflictPath: string) { this.conflicts.set(originalPath, conflictPath); this.updateRibbon(); } resolveConflict(originalPath: string) { this.conflicts.delete(originalPath); this.updateRibbon(); } updateRibbon() { if (!this.ribbonEl) return; if (this.conflicts.size > 0) { this.ribbonEl.show(); this.ribbonEl.setAttribute('aria-label', `Resolve ${this.conflicts.size} sync conflicts`); this.ribbonEl.setText(this.conflicts.size.toString()); } else { this.ribbonEl.hide(); } } showConflictList() { new ConflictListModal(this.app, this, this.plugin).open(); } }
 class ConflictListModal extends Modal { constructor(app: App, private conflictCenter: ConflictCenter, private plugin: ObsidianDecentralizedPlugin) { super(app); } onOpen() { const { contentEl } = this; contentEl.createEl('h2', { text: 'Sync Conflicts' }); const conflicts: Map<string, string> = (this.conflictCenter as any).conflicts; if (conflicts.size === 0) { contentEl.createEl('p', { text: 'No conflicts to resolve.' }); return; } conflicts.forEach((conflictPath, originalPath) => { new Setting(contentEl).setName(originalPath).setDesc(`Conflict file: ${conflictPath}`) .addButton(btn => btn.setButtonText('Resolve').setCta().onClick(async () => { this.close(); await this.showResolutionModal(originalPath, conflictPath); })); }); } async showResolutionModal(originalPath: string, conflictPath: string) { const originalFile = this.app.vault.getAbstractFileByPath(originalPath) as TFile; const conflictFile = this.app.vault.getAbstractFileByPath(conflictPath) as TFile; if (!originalFile || !conflictFile) { this.plugin.showNotice("One of the conflict files is missing.", 'error'); this.conflictCenter.resolveConflict(originalPath); return; } const localContent = await this.app.vault.read(originalFile); const remoteContent = await this.app.vault.read(conflictFile); new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => { this.plugin.ignoreNextEventForPath(originalPath); await this.app.vault.modify(originalFile, chosenContent); this.plugin.ignoreNextEventForPath(conflictPath); await this.app.vault.delete(conflictFile); this.conflictCenter.resolveConflict(originalPath); this.plugin.showNotice(`${originalPath} has been resolved.`, 'info'); }).open(); } onClose() { this.contentEl.empty(); } }
 class ConflictResolutionModal extends Modal { constructor(app: App, private localContent: string, private remoteContent: string, private onResolve: (chosenContent: string) => void) { super(app); } onOpen() { const { contentEl } = this; contentEl.addClass('obsidian-decentralized-diff-modal'); contentEl.createEl('h2', { text: 'Resolve Conflict' }); const dmp = new DiffMatchPatch(); const diff = dmp.diff_main(this.localContent, this.remoteContent); dmp.diff_cleanupSemantic(diff); const diffEl = contentEl.createDiv({ cls: 'obsidian-decentralized-diff-view' }); diffEl.innerHTML = dmp.diff_prettyHtml(diff); new Setting(contentEl) .addButton(btn => btn.setButtonText('Keep My Version').onClick(() => { this.onResolve(this.localContent); this.close(); })) .addButton(btn => btn.setButtonText('Use Their Version').setWarning().onClick(() => { this.onResolve(this.remoteContent); this.close(); })); } onClose() { this.contentEl.empty(); } }
+
+class SyncProgressModal extends Modal {
+    private container: HTMLElement;
+    private refreshInterval: number | null = null;
+
+    constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.addClass('od-progress-modal');
+        contentEl.createEl('h2', { text: 'Sync Progress' });
+        this.container = contentEl.createDiv();
+        this.refresh();
+        this.refreshInterval = window.setInterval(() => this.refresh(), 500);
+    }
+
+    onClose() {
+        if (this.refreshInterval) clearInterval(this.refreshInterval);
+        this.contentEl.empty();
+    }
+
+    refresh() {
+        this.container.empty();
+        if (this.plugin.activeTransfers.size === 0) {
+            this.container.createEl('p', { text: 'No active file transfers.' });
+            return;
+        }
+
+        this.plugin.activeTransfers.forEach(transfer => {
+            const item = this.container.createDiv({ cls: 'od-transfer-item' });
+            const title = item.createDiv({ cls: 'od-transfer-title' });
+            title.createSpan({ text: (transfer.direction === 'upload' ? '⬆️ ' : '⬇️ ') + transfer.path, attr: { style: 'font-weight: bold;' } });
+            
+            const progress = item.createEl('progress', { attr: { value: transfer.processedChunks, max: transfer.totalChunks } });
+            progress.style.width = '100%';
+
+            const now = Date.now();
+            const elapsedSeconds = (now - transfer.startTime) / 1000;
+            const processedBytes = transfer.processedChunks * CHUNK_SIZE;
+            const totalBytes = transfer.totalChunks * CHUNK_SIZE;
+            const speedBytesPerSec = elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0;
+            const remainingBytes = totalBytes - processedBytes;
+            const remainingSeconds = speedBytesPerSec > 0 ? remainingBytes / speedBytesPerSec : 0;
+
+            const meta = item.createDiv({ cls: 'od-transfer-meta' });
+            meta.createSpan({ text: `${formatBytes(speedBytesPerSec)}/s` });
+            meta.createSpan({ text: `${Math.round(remainingSeconds)}s remaining` });
+            meta.createSpan({ text: `${Math.round((transfer.processedChunks / transfer.totalChunks) * 100)}%` });
+        });
+    }
+}
 
 class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     plugin: ObsidianDecentralizedPlugin;
