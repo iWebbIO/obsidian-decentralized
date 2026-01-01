@@ -47,6 +47,7 @@ interface TransferStatus {
     processedChunks: number;
     startTime: number;
     lastUpdate: number;
+    status: 'active' | 'paused';
 }
 
 type SyncData =
@@ -538,6 +539,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public directIpServer: DirectIpServer | null = null;
     public directIpClient: DirectIpClient | null = null;
     private lastHeard: Map<string, number> = new Map();
+    private statePath: string;
+    private debouncedSaveState: () => void;
 
     async onload() {
         if (Platform.isMobile) {
@@ -545,6 +548,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         } else {
             this.lanDiscovery = new DesktopLANDiscovery();
         }
+
+        this.statePath = `${this.manifest.dir}/state.json`;
+        this.debouncedSaveState = debounce(this.saveState.bind(this), 1000);
 
         await this.loadSettings();
         this.applyHideNativeSync();
@@ -572,6 +578,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.initializeConnectionManager();
         this.startHeartbeat();
         this.registerInterval(window.setInterval(() => this.cleanupPendingChunks(), 60000));
+        await this.loadState();
     }
 
     onunload() {
@@ -582,6 +589,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout);
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.activeTransfers.clear();
+    }
+
+    async loadState() {
+        if (await this.app.vault.adapter.exists(this.statePath)) {
+            try {
+                const stateStr = await this.app.vault.adapter.read(this.statePath);
+                const state = JSON.parse(stateStr);
+                if (state.activeTransfers) {
+                    for (const t of state.activeTransfers) {
+                        // Restore as paused
+                        this.activeTransfers.set(t.id, { ...t, status: 'paused' });
+                    }
+                    this.updateStatus();
+                }
+            } catch (e) {
+                console.error("Failed to load state", e);
+            }
+        }
+    }
+
+    async saveState() {
+        const state = {
+            activeTransfers: Array.from(this.activeTransfers.values())
+        };
+        await this.app.vault.adapter.write(this.statePath, JSON.stringify(state, null, 2));
     }
     async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); this.applyHideNativeSync(); }
     async saveSettings() { await this.saveData(this.settings); }
@@ -648,6 +680,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         
         let transferId: string | undefined;
         let item: { peerId: string | null, data: SyncData, retries: number } | undefined;
+        let isPaused = false;
 
         try {
             this.updateStatus();
@@ -700,7 +733,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             });
                         });
 
-                        this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content as ArrayBuffer, transferId!);
+                        await this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content as ArrayBuffer, transferId!);
                         await ackPromise;
                         this.log(`Chunked transfer ${transferId} for ${data.path} completed successfully.`);
                     }
@@ -734,6 +767,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             }
         } catch (e) {
+            if (e.message === 'Paused') {
+                this.log(`Transfer ${transferId} paused due to connection loss.`);
+                isPaused = true;
+                return;
+            }
             console.error(`Error processing queue item ${transferId}:`, e);
             if (item && item.retries < 3) {
                 this.log(`Retrying transfer ${transferId} (Attempt ${item.retries + 1}/3)`);
@@ -745,9 +783,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (this.isSyncing) this.abortSync("Transfer failed permanently.");
             }
         } finally {
-            if (transferId) {
+            if (transferId && !isPaused) {
                 this.pendingAcks.delete(transferId);
                 this.activeTransfers.delete(transferId);
+                this.debouncedSaveState();
             }
             this.isQueueProcessing = false;
             this.processQueue();
@@ -858,6 +897,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log("Companion connected, stopping reconnect attempts.");
             }
             conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin });
+            this.resumeTransfers(conn.peer);
         });
         conn.on('data', (data: any) => this.processIncomingData(data, conn));
         conn.on('close', () => {
@@ -869,7 +909,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.clusterPeers.delete(peerId);
 
             for (const [id, transfer] of this.activeTransfers.entries()) {
-                if (transfer.peerId === peerId) {
+                if (transfer.peerId === peerId && transfer.direction === 'download') {
                     this.activeTransfers.delete(id);
                 }
             }
@@ -889,6 +929,40 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         conn.on('error', (err) => { console.error(`Connection error with ${conn.peer}:`, err); this.showNotice(`Connection error with a peer.`, 'error'); });
     }
     
+    async resumeTransfers(peerId: string) {
+        const transfersToResume = Array.from(this.activeTransfers.values())
+            .filter(t => t.peerId === peerId && t.status === 'paused' && t.direction === 'upload');
+
+        for (const t of transfersToResume) {
+            this.log(`Resuming transfer ${t.id} to ${peerId}`);
+            t.status = 'active';
+            this.updateStatus();
+            
+            const file = this.app.vault.getAbstractFileByPath(t.path);
+            if (file instanceof TFile) {
+                const content = await this.app.vault.readBinary(file);
+                const ackPromise = new Promise<void>((resolve, reject) => {
+                    const timeout = setTimeout(() => reject(new Error(`Transfer ${t.id} timed out`)), 60000);
+                    this.pendingAcks.set(t.id, () => { clearTimeout(timeout); resolve(); });
+                });
+
+                try {
+                    await this.sendFileInChunks(t.peerId, t.path, file.stat.mtime, content, t.id, t.processedChunks);
+                    await ackPromise;
+                    this.log(`Resumed transfer ${t.id} completed.`);
+                    this.activeTransfers.delete(t.id);
+                    this.debouncedSaveState();
+                } catch (e) {
+                    if (e.message === 'Paused') this.log(`Transfer ${t.id} paused again.`);
+                    else this.log(`Resumed transfer ${t.id} failed:`, e);
+                }
+            } else {
+                this.activeTransfers.delete(t.id);
+                this.debouncedSaveState();
+            }
+        }
+    }
+
     startHeartbeat() {
         this.registerInterval(window.setInterval(() => {
             const now = Date.now();
@@ -1006,7 +1080,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         } catch (e) { console.error(`Error reading file ${file.path} for sync:`, e); }
     }
 
-    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string) {
+    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string, startIndex = 0) {
         const isDirectIp = this.getConnectionMode() === 'direct-ip';
         let conn: DataConnection | undefined;
 
@@ -1018,33 +1092,42 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 return;
             }
         }
-        this.activeTransfers.set(transferId, {
+        
+        const existingTransfer = this.activeTransfers.get(transferId);
+        this.activeTransfers.set(transferId, existingTransfer || {
             id: transferId,
             path,
             direction: 'upload',
             peerId,
             totalChunks: Math.ceil(fileContent.byteLength / CHUNK_SIZE),
-            processedChunks: 0,
+            processedChunks: startIndex,
             startTime: Date.now(),
-            lastUpdate: Date.now()
+            lastUpdate: Date.now(),
+            status: 'active'
         });
         this.updateStatus();
+        this.debouncedSaveState();
 
         const totalChunks = Math.ceil(fileContent.byteLength / CHUNK_SIZE);
         this.log(`Sending file in ${totalChunks} chunks to ${peerId}: ${path} (ID: ${transferId})`);
         
-        const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId };
-        if (isDirectIp) {
-            if (this.directIpClient) await this.directIpClient.send(startPayload);
-            else if (this.directIpServer) this.directIpServer.send(startPayload);
+        if (startIndex === 0) {
+            const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId };
+            if (isDirectIp) {
+                if (this.directIpClient) await this.directIpClient.send(startPayload);
+                else if (this.directIpServer) this.directIpServer.send(startPayload);
+            }
+            else conn!.send(startPayload);
         }
-        else conn!.send(startPayload);
         
-        for (let i = 0; i < totalChunks; i++) {
+        for (let i = startIndex; i < totalChunks; i++) {
             if (!isDirectIp && !conn!.open) {
-                this.log(`Connection to ${peerId} closed mid-transfer. Aborting.`);
-                this.pendingAcks.get(transferId)?.();
-                return;
+                this.log(`Connection to ${peerId} closed mid-transfer. Pausing.`);
+                const t = this.activeTransfers.get(transferId);
+                if (t) { t.status = 'paused'; t.lastUpdate = Date.now(); }
+                this.updateStatus();
+                this.debouncedSaveState();
+                throw new Error("Paused");
             }
             try {
                 const start = i * CHUNK_SIZE; const end = start + CHUNK_SIZE; const chunk = fileContent.slice(start, end);
@@ -1063,6 +1146,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
                 this.updateStatus();
                 await new Promise(resolve => setTimeout(resolve, 5));
+                if (i % 10 === 0) this.debouncedSaveState();
             } catch (e) {
                 this.log(`Error sending chunk ${i} for ${path}. Aborting.`, e);
                 this.pendingAcks.get(transferId)?.();
@@ -1081,7 +1165,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             totalChunks: payload.totalChunks,
             processedChunks: 0,
             startTime: Date.now(),
-            lastUpdate: Date.now()
+            lastUpdate: Date.now(),
+            status: 'active'
         });
         this.log(`Receiving chunked file: ${payload.path}, ID: ${payload.transferId}`); 
     }
@@ -1113,6 +1198,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
         for (const [id, transfer] of this.activeTransfers.entries()) {
+            if (transfer.status === 'paused') continue;
             if (now - transfer.lastUpdate > 60000) { // 1 minute TTL for stalled UI
                 this.log(`Cleaning up stale active transfer: ${id}`);
                 this.activeTransfers.delete(id);
@@ -1346,7 +1432,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public calculateStatusText(): string {
         if (this.isSyncing) { return "⚙️ Full Syncing..."; }
         if (this.activeTransfers.size > 0) {
-            const count = this.activeTransfers.size;
+            const count = Array.from(this.activeTransfers.values()).filter(t => t.status === 'active').length;
+            if (count === 0 && this.activeTransfers.size > 0) return "⏸️ Transfers Paused";
             return `⏫ Syncing ${count} file${count > 1 ? 's' : ''}...`;
         }
         if (this.isQueueProcessing) {
@@ -1769,7 +1856,8 @@ class SyncProgressModal extends Modal {
             const item = this.container.createDiv({ cls: 'od-transfer-item' });
             const title = item.createDiv({ cls: 'od-transfer-title' });
             title.createSpan({ text: (transfer.direction === 'upload' ? '⬆️ ' : '⬇️ ') + transfer.path, attr: { style: 'font-weight: bold;' } });
-            
+            if (transfer.status === 'paused') title.createSpan({ text: ' (Paused)', attr: { style: 'color: var(--text-muted); font-size: 0.8em;' } });
+
             const progress = item.createEl('progress', { attr: { value: transfer.processedChunks, max: transfer.totalChunks } });
             progress.style.width = '100%';
 
