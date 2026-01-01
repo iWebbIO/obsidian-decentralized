@@ -188,7 +188,7 @@ If a conflict occurs and a `(conflict)` file is created, a new icon (`swords`) w
 
 ## 🤝 Contributing
 
-Contributions, bug reports, and feature requests are welcome! Please feel free to open an issue or submit a pull request on the [GitHub repository](https://github.com/iWebbIO/obsidian-decentralized).
+Contributions, bug reports, and feature requests are welcome! Please feel free to open an issue or submit a pull request.
 
 ## 📜 License
 
