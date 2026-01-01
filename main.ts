@@ -537,6 +537,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private debouncedHandleFileChange: (file: TAbstractFile) => void;
     public directIpServer: DirectIpServer | null = null;
     public directIpClient: DirectIpClient | null = null;
+    private lastHeard: Map<string, number> = new Map();
 
     async onload() {
         if (Platform.isMobile) {
@@ -630,6 +631,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     sendData(peerId: string, data: SyncData) { this.addToQueue(peerId, data); }
     private addToQueue(peerId: string | null, data: SyncData) { this.syncQueue.push({ peerId, data, retries: 0 }); this.processQueue(); }
 
+    private abortSync(reason: string) {
+        if (!this.isSyncing) return;
+        this.isSyncing = false;
+        this.syncQueue = [];
+        this.activeTransfers.clear();
+        this.pendingAcks.clear();
+        if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout);
+        this.showNotice(`Sync aborted: ${reason}`, 'error');
+        this.updateStatus();
+    }
+
     private async processQueue() {
         if (this.isQueueProcessing || this.syncQueue.length === 0) return;
         this.isQueueProcessing = true;
@@ -694,6 +706,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                 }
             } else {
+                if (data.type === 'file-update' && peerId) {
+                    const ackPromise = new Promise<void>((resolve, reject) => {
+                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 15000);
+                        this.pendingAcks.set(transferId!, () => { clearTimeout(timeout); resolve(); });
+                    });
+
+                    if (this.getConnectionMode() === 'direct-ip') {
+                        if (this.directIpClient) await this.directIpClient.send(data);
+                        else if (this.directIpServer) this.directIpServer.send(data);
+                    } else {
+                        const conn = this.connections.get(peerId);
+                        if (conn?.open) conn.send(data);
+                        else throw new Error("Connection closed");
+                    }
+                    await ackPromise;
+                } else 
                 if (this.getConnectionMode() === 'direct-ip') {
                     if (this.directIpClient) this.directIpClient.send(data);
                     else if (this.directIpServer) this.directIpServer.send(data);
@@ -714,6 +742,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await new Promise(resolve => setTimeout(resolve, 1000));
             } else if (item) {
                 this.showNotice(`File transfer failed permanently for ${(item.data as any).path || 'an item'}.`, 'error', 8000);
+                if (this.isSyncing) this.abortSync("Transfer failed permanently.");
             }
         } finally {
             if (transferId) {
@@ -835,6 +864,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const peerId = conn.peer;
             this.log("DataConnection closed with:", peerId);
             this.connections.delete(peerId);
+            this.lastHeard.delete(peerId);
             const peerInfo = this.clusterPeers.get(peerId);
             this.clusterPeers.delete(peerId);
 
@@ -861,14 +891,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
     startHeartbeat() {
         this.registerInterval(window.setInterval(() => {
-            this.connections.forEach(conn => {
-                if (conn.open) conn.send({ type: 'ping' });
+            const now = Date.now();
+            this.connections.forEach((conn, peerId) => {
+                if (conn.open) {
+                    conn.send({ type: 'ping' });
+                    const last = this.lastHeard.get(peerId);
+                    if (last && now - last > 6000) {
+                        this.log(`Peer ${peerId} timed out (Heartbeat).`);
+                        conn.close();
+                    }
+                }
             });
-        }, 20000));
+        }, 2000));
     }
 
     processIncomingData(data: any, conn: DataConnection | null) {
         if (!data || !data.type) return; this.log("Received data:", data.type, "from", conn?.peer);
+        if (conn?.peer) this.lastHeard.set(conn.peer, Date.now());
         switch (data.type) {
             case 'handshake': this.handleHandshake(data, conn!); break;
             case 'cluster-gossip': this.handleClusterGossip(data); break;
@@ -880,7 +919,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.pendingAcks.delete(data.transferId);
                 }
                 break;
-            case 'file-update': this.applyFileUpdate(data); break;
+            case 'file-update': 
+                this.applyFileUpdate(data).then(() => {
+                    if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
+                });
+                break;
             case 'file-delete': this.applyFileDelete(data); break;
             case 'file-rename': this.applyFileRename(data); break;
             case 'folder-create': this.applyFolderCreate(data); break;
@@ -900,6 +943,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.joinPin && data.pin !== this.joinPin) { this.showNotice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 'error', 10000); conn.close(); return; }
         if (this.joinPin) this.joinPin = null; 
         this.showNotice(`🤝 Connected to ${data.peerInfo.friendlyName}`, 'info', 4000);
+        this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
         const existingPeers = Array.from(this.clusterPeers.values());
         conn.send({ type: 'cluster-gossip', peers: existingPeers });
