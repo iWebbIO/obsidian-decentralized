@@ -181,8 +181,29 @@ class DesktopLANDiscovery implements ILANDiscovery {
 
         this.socket.on('listening', () => {
             try {
-                this.socket?.addMembership(DISCOVERY_MULTICAST_ADDRESS);
                 this.socket?.setMulticastTTL(128);
+
+                // Attempt to add membership on all IPv4 interfaces.
+                // This fixes discovery issues on devices with multiple interfaces (VPNs, VMs, etc).
+                const os = require('os');
+                const interfaces = os.networkInterfaces();
+                let membershipAdded = false;
+
+                for (const name in interfaces) {
+                    const ifaceList = interfaces[name];
+                    if (!ifaceList) continue;
+                    for (const net of ifaceList) {
+                        if (net.family === 'IPv4' && !net.internal) {
+                            try {
+                                this.socket?.addMembership(DISCOVERY_MULTICAST_ADDRESS, net.address);
+                                membershipAdded = true;
+                            } catch (e) { /* Ignore specific interface errors */ }
+                        }
+                    }
+                }
+
+                if (!membershipAdded) this.socket?.addMembership(DISCOVERY_MULTICAST_ADDRESS);
+
                 console.log(`LAN Discovery listening on ${DISCOVERY_MULTICAST_ADDRESS}:${DISCOVERY_PORT}`);
             } catch (e) {
                 console.error("Error setting up multicast:", e);
@@ -218,7 +239,7 @@ class DesktopLANDiscovery implements ILANDiscovery {
             } catch (e) { /* ignore parse errors */ }
         });
 
-        this.socket.bind(DISCOVERY_PORT);
+        this.socket.bind(DISCOVERY_PORT, '0.0.0.0');
     }
 
     public startBroadcasting(peerInfo: PeerInfo) {
