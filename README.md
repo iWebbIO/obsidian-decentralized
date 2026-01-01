@@ -1,6 +1,7 @@
 # Obsidian Decentralized
 
 ![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
+![Obsidian Decentralized Banner](https://mwassets.github.io/files/obsidian-decentralized/banner.png)
 
 Sync your Obsidian notes across devices **without a central server**. This plugin uses peer-to-peer technologies (WebRTC via PeerJS) to transfer your files directly between your devices, offering a free, private, and local-first alternative to cloud-based sync services.
 
