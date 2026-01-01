@@ -1297,8 +1297,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.peer || this.peer.disconnected) { return "🔴 Sync Offline"; }
         if (!this.peer.id) { return "🔌 Connecting..."; }
         if (this.connections.size > 0) {
-            const totalDevices = this.connections.size + 1;
-            return `✅ Connected (${totalDevices} device${totalDevices > 1 ? 's' : ''})`;
+            if (this.connections.size === 1) {
+                return "✅ Connected";
+            }
+            return `✅ Connected (${this.connections.size})`;
         }
         return "🟢 Online";
     }
