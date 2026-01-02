@@ -1085,7 +1085,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'file-update': 
                 this.applyFileUpdate(data).then(() => {
                     if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
-                });
+                }).catch(e => {
+                    this.log(`Failed to apply file update: ${data.path}`, e);
+                }); 
                 break;
             case 'file-delete': this.applyFileDelete(data); break;
             case 'file-rename': this.applyFileRename(data); break;
@@ -1345,8 +1347,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (chunk) { reassembled.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
             }
             
-            await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId });
-            conn.send({ type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
+            try {
+                await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId });
+                conn.send({ type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
+            } catch (e) {
+                this.log(`Failed to apply chunked file update: ${transfer.path}`, e);
+            }
         }
     }
 
@@ -1404,6 +1410,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             } else {
                 console.error("File creation error:", e);
                 this.showNotice(`Failed to create file: ${data.path}`, 'error');
+                throw e;
             }
         }
     }
@@ -1459,6 +1466,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await this.handleNewFileCreation(data);
             } else {
                 console.error(`Error modifying file ${data.path}:`, e);
+                throw e;
             }
         }
     }
@@ -1592,6 +1600,27 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             .od-status-container.mod-clickable:hover { color: var(--text-accent); }
             .od-progress-modal .od-transfer-item { margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); }
             .od-progress-modal .od-transfer-meta { display: flex; justify-content: space-between; font-size: 0.85em; color: var(--text-muted); margin-top: 4px; }
+            
+            .od-editable-name-container {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                padding: 4px 8px;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+            }
+            .od-editable-name-container:hover {
+                border-color: var(--background-modifier-border);
+                background-color: var(--background-primary-alt);
+            }
+            .od-editable-name-icon { color: var(--text-muted); opacity: 0.5; display: flex; }
+            .od-editable-name-container:hover .od-editable-name-icon { opacity: 1; }
+            .od-editable-name-input { margin: 0; height: 28px; }
+            .od-editable-name-submit { color: var(--interactive-success); cursor: pointer; display: flex; padding: 4px; }
+            .od-editable-name-submit:hover { background-color: var(--background-modifier-hover); border-radius: 4px; }
+            .od-setting-item-name-wrapper { display: flex; align-items: center; }
         `;
         document.head.appendChild(style);
     }
@@ -1997,18 +2026,6 @@ class ConflictCenter { private conflicts: Map<string, string> = new Map(); priva
 class ConflictListModal extends Modal { constructor(app: App, private conflictCenter: ConflictCenter, private plugin: ObsidianDecentralizedPlugin) { super(app); } onOpen() { const { contentEl } = this; contentEl.createEl('h2', { text: 'Sync Conflicts' }); const conflicts: Map<string, string> = (this.conflictCenter as any).conflicts; if (conflicts.size === 0) { contentEl.createEl('p', { text: 'No conflicts to resolve.' }); return; } conflicts.forEach((conflictPath, originalPath) => { new Setting(contentEl).setName(originalPath).setDesc(`Conflict file: ${conflictPath}`) .addButton(btn => btn.setButtonText('Resolve').setCta().onClick(async () => { this.close(); await this.showResolutionModal(originalPath, conflictPath); })); }); } async showResolutionModal(originalPath: string, conflictPath: string) { const originalFile = this.app.vault.getAbstractFileByPath(originalPath) as TFile; const conflictFile = this.app.vault.getAbstractFileByPath(conflictPath) as TFile; if (!originalFile || !conflictFile) { this.plugin.showNotice("One of the conflict files is missing.", 'error'); this.conflictCenter.resolveConflict(originalPath); return; } const localContent = await this.app.vault.read(originalFile); const remoteContent = await this.app.vault.read(conflictFile); new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => { this.plugin.ignoreNextEventForPath(originalPath); await this.app.vault.modify(originalFile, chosenContent); this.plugin.ignoreNextEventForPath(conflictPath); await this.app.vault.delete(conflictFile); this.conflictCenter.resolveConflict(originalPath); this.plugin.showNotice(`${originalPath} has been resolved.`, 'info'); }).open(); } onClose() { this.contentEl.empty(); } }
 class ConflictResolutionModal extends Modal { constructor(app: App, private localContent: string, private remoteContent: string, private onResolve: (chosenContent: string) => void) { super(app); } onOpen() { const { contentEl } = this; contentEl.addClass('obsidian-decentralized-diff-modal'); contentEl.createEl('h2', { text: 'Resolve Conflict' }); const dmp = new DiffMatchPatch(); const diff = dmp.diff_main(this.localContent, this.remoteContent); dmp.diff_cleanupSemantic(diff); const diffEl = contentEl.createDiv({ cls: 'obsidian-decentralized-diff-view' }); diffEl.innerHTML = dmp.diff_prettyHtml(diff); new Setting(contentEl) .addButton(btn => btn.setButtonText('Keep My Version').onClick(() => { this.onResolve(this.localContent); this.close(); })) .addButton(btn => btn.setButtonText('Use Their Version').setWarning().onClick(() => { this.onResolve(this.remoteContent); this.close(); })); } onClose() { this.contentEl.empty(); } }
 
-class RenameModal extends Modal {
-    constructor(app: App, private currentName: string, private onRename: (newName: string) => void) { super(app); }
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.createEl('h2', { text: 'Rename Device' });
-        let name = this.currentName;
-        new Setting(contentEl).setName("New Name").addText(text => text.setValue(name).onChange(v => name = v));
-        new Setting(contentEl).addButton(btn => btn.setButtonText("Save").setCta().onClick(() => { this.onRename(name); this.close(); }));
-    }
-    onClose() { this.contentEl.empty(); }
-}
-
 class SyncProgressModal extends Modal {
     private container: HTMLElement;
     private refreshInterval: number | null = null;
@@ -2067,6 +2084,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     private clusterStatusEl: HTMLDivElement | null = null;
     private statusInterval: number | null = null;
     private statusTextEl: HTMLDivElement | null = null;
+    private isEditingName = false;
 
     constructor(app: App, plugin: ObsidianDecentralizedPlugin) {
         super(app, plugin);
@@ -2074,6 +2092,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     }
 
     display(): void {
+        this.isEditingName = false;
         const { containerEl } = this;
         containerEl.empty();
         containerEl.createEl('h2', { text: 'Obsidian Decentralized' });
@@ -2097,10 +2116,6 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                     this.display(); 
                 }));
-
-        new Setting(containerEl)
-            .setName('This Device\'s Name').addText(text => text.setPlaceholder('e.g., My Desktop').setValue(this.plugin.settings.friendlyName)
-                .onChange(async (value) => { this.plugin.settings.friendlyName = value; await this.plugin.saveSettings(); }));
 
         new Setting(containerEl)
             .setName('Connect Devices')
@@ -2298,6 +2313,45 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         }
     }
 
+    private createEditableName(container: HTMLElement, displayName: string, editValue: string, onSave: (newName: string) => void) {
+        container.empty();
+        const wrapper = container.createDiv({ cls: 'od-editable-name-container' });
+        
+        wrapper.createSpan({ text: displayName, cls: 'od-editable-name-text' });
+        const iconEl = wrapper.createSpan({ cls: 'od-editable-name-icon' });
+        setIcon(iconEl, 'pencil');
+
+        const switchToEdit = () => {
+            this.isEditingName = true;
+            wrapper.empty();
+            wrapper.removeClass('od-editable-name-container'); // Remove hover styles during edit
+            wrapper.addClass('od-setting-item-name-wrapper');
+
+            const inputEl = wrapper.createEl('input', { type: 'text', value: editValue });
+            inputEl.addClass('od-editable-name-input');
+            
+            const save = () => {
+                this.isEditingName = false;
+                const newName = inputEl.value.trim();
+                if (newName && newName !== editValue) onSave(newName);
+                else this.createEditableName(container, displayName, editValue, onSave); // Revert
+            };
+
+            const submitBtn = wrapper.createSpan({ cls: 'od-editable-name-submit' });
+            setIcon(submitBtn, 'check');
+            submitBtn.onclick = (e) => { e.stopPropagation(); save(); };
+
+            inputEl.onkeydown = (e) => { 
+                if (e.key === 'Enter') save(); 
+                if (e.key === 'Escape') { this.isEditingName = false; this.createEditableName(container, displayName, editValue, onSave); }
+            };
+            inputEl.onclick = (e) => e.stopPropagation();
+            
+            setTimeout(() => inputEl.focus(), 0);
+        };
+        wrapper.onclick = (e) => { e.preventDefault(); switchToEdit(); };
+    }
+
     updateStatus() {
         if (this.statusTextEl) {
             this.statusTextEl.setText(this.plugin.calculateStatusText());
@@ -2306,12 +2360,31 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         if (!this.clusterStatusEl || !this.clusterStatusEl.isConnected) {
             return;
         }
+        if (this.isEditingName) return;
         this.clusterStatusEl.empty();
 
         const createEntry = (peer: PeerInfo, type: 'self' | 'companion' | 'peer' | 'host' | 'disconnected') => {
             const settingItem = new Setting(this.clusterStatusEl!)
-                .setName(peer.friendlyName + (type === 'self' ? ' (This Device)' : ''))
                 .setDesc(`ID: ${peer.deviceId}`);
+
+            // Use custom editable name for Self and Peers
+            if (type === 'self') {
+                this.createEditableName(settingItem.nameEl, peer.friendlyName + ' (This Device)', peer.friendlyName, async (newName) => {
+                    this.plugin.settings.friendlyName = newName;
+                    await this.plugin.saveSettings();
+                    this.plugin.broadcastData({ type: 'cluster-rename', targetDeviceId: this.plugin.settings.deviceId, newName });
+                    this.updateStatus();
+                });
+            } else if (type === 'peer' || type === 'disconnected') {
+                this.createEditableName(settingItem.nameEl, peer.friendlyName, peer.friendlyName, (newName) => {
+                    this.plugin.broadcastData({ type: 'cluster-rename', targetDeviceId: peer.deviceId, newName });
+                    peer.friendlyName = newName;
+                    this.plugin.saveKnownPeers();
+                    this.updateStatus();
+                });
+            } else {
+                settingItem.setName(peer.friendlyName);
+            }
 
             if (type === 'companion') {
                 settingItem.addButton(btn => btn.setButtonText('Unpair').setWarning().onClick(async () => {
@@ -2331,14 +2404,6 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Kick Device').onClick(() => {
                         this.plugin.broadcastData({ type: 'cluster-kick', targetDeviceId: peer.deviceId });
                         if (this.plugin.connections.has(peer.deviceId)) this.plugin.connections.get(peer.deviceId)?.close();
-                    }));
-                    settingItem.addExtraButton(btn => btn.setIcon('pencil').setTooltip('Rename Device').onClick(() => {
-                        new RenameModal(this.app, peer.friendlyName, (newName) => {
-                            this.plugin.broadcastData({ type: 'cluster-rename', targetDeviceId: peer.deviceId, newName });
-                            peer.friendlyName = newName;
-                            this.plugin.saveKnownPeers();
-                            this.updateStatus();
-                        }).open();
                     }));
                     settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
                         this.plugin.manualPingStart.set(peer.deviceId, Date.now());
