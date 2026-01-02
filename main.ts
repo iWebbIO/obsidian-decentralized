@@ -9,8 +9,9 @@ const DISCOVERY_PORT = 41234;
 const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
 const MTIME_TOLERANCE_MS = 2500;
 const DEBOUNCE_DELAY_MS = 1500;
-const CHUNK_SIZE = 16 * 1024 * 0.9;
+// const CHUNK_SIZE = 64 * 1024; // Uncomment to hardcode
 const COMPANION_RECONNECT_INTERVAL_MS = 10000;
+// const MAX_CONCURRENT_TRANSFERS = 10; // Uncomment to hardcode
 
 // --- Type Definitions ---
 type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; port?: number; mode?: 'peerjs' | 'direct-ip'; };
@@ -48,6 +49,7 @@ interface TransferStatus {
     startTime: number;
     lastUpdate: number;
     status: 'active' | 'paused';
+    chunkSize?: number;
 }
 
 type SyncData =
@@ -290,6 +292,7 @@ class DirectIpServer {
     private server: any | null = null;
     private messageQueue: SyncData[] = [];
     private pin: string;
+    private readonly MAX_QUEUE_SIZE = 2000;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
         if (Platform.isMobile) {
@@ -335,7 +338,8 @@ class DirectIpServer {
 
         if (req.url === '/poll' && req.method === 'GET') {
             res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            const messages = this.messageQueue.map(msg => {
+            const messagesToSend = this.messageQueue.splice(0, 200);
+            const messages = messagesToSend.map(msg => {
                 if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
                     return {
                         ...msg,
@@ -352,7 +356,6 @@ class DirectIpServer {
                 return msg;
             });
             res.end(JSON.stringify(messages));
-            this.messageQueue = [];
         } else if (req.url === '/push' && req.method === 'POST') {
             let body = '';
             let totalSize = 0;
@@ -405,6 +408,10 @@ class DirectIpServer {
     }
 
     send(data: SyncData) {
+        if (this.messageQueue.length >= this.MAX_QUEUE_SIZE) {
+            // Drop oldest messages if queue is full to prevent memory issues
+            this.messageQueue.splice(0, this.messageQueue.length - this.MAX_QUEUE_SIZE + 1);
+        }
         this.messageQueue.push(data);
     }
 
@@ -416,7 +423,7 @@ class DirectIpServer {
 }
 
 class DirectIpClient {
-    private pollInterval: number | null = null;
+    private pollTimeout: number | null = null;
     private baseUrl: string;
     private headers: Record<string, string>;
 
@@ -465,6 +472,8 @@ class DirectIpClient {
             this.plugin.log('Direct IP Poll Error:', e);
             this.plugin.updateStatus('⚠️ Host Unreachable');
         }
+        
+        this.pollTimeout = window.setTimeout(() => this.poll(), 2000);
     }
 
     async send(data: SyncData) {
@@ -500,14 +509,13 @@ class DirectIpClient {
     }
 
     startPolling() {
-        if (this.pollInterval) clearInterval(this.pollInterval);
-        this.pollInterval = window.setInterval(() => this.poll(), 2000);
-        this.plugin.registerInterval(this.pollInterval);
+        if (this.pollTimeout) clearTimeout(this.pollTimeout);
+        this.poll();
     }
 
     stop() {
-        if (this.pollInterval) clearInterval(this.pollInterval);
-        this.pollInterval = null;
+        if (this.pollTimeout) clearTimeout(this.pollTimeout);
+        this.pollTimeout = null;
         this.plugin.showNotice("Disconnected from Direct IP Host.", 'info', 3000);
     }
 }
@@ -527,12 +535,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public activeTransfers: Map<string, TransferStatus> = new Map();
     public joinPin: string | null = null;
     private companionConnectionInterval: number | null = null;
-    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, lastUpdated: number }> = new Map();
+    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, receivedCount: number, lastUpdated: number }> = new Map();
     private fullSyncTimeout: number | null = null;
 
     private syncQueue: { peerId: string | null, data: SyncData, retries: number }[] = [];
-    private isQueueProcessing: boolean = false;
+    private activeQueueTransfers: number = 0;
     private pendingAcks: Map<string, () => void> = new Map();
+    private lastStatusUpdate: number = 0;
+    private currentConcurrency = 4;
+    private currentChunkSize = 64 * 1024;
+    private successfulTransfersSinceLastIncrease = 0;
     private peerInitRetryTimeout: number | null = null;
     private peerInitAttempts = 0;
     private debouncedHandleFileChange: (file: TAbstractFile) => void;
@@ -669,30 +681,86 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.syncQueue = [];
         this.activeTransfers.clear();
         this.pendingAcks.clear();
-        if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout);
         this.showNotice(`Sync aborted: ${reason}`, 'error');
         this.updateStatus();
     }
 
-    private async processQueue() {
-        if (this.isQueueProcessing || this.syncQueue.length === 0) return;
-        this.isQueueProcessing = true;
-        
+    public getConcurrencyLimit() { 
+        // @ts-ignore
+        if (typeof MAX_CONCURRENT_TRANSFERS !== 'undefined') return MAX_CONCURRENT_TRANSFERS;
+        return this.currentConcurrency; 
+    }
+    public getChunkSize() { 
+        // @ts-ignore
+        if (typeof CHUNK_SIZE !== 'undefined') return CHUNK_SIZE;
+        return this.currentChunkSize; 
+    }
+
+    private reportTransferResult(success: boolean) {
+        if (success) {
+            this.successfulTransfersSinceLastIncrease++;
+            if (this.successfulTransfersSinceLastIncrease >= this.currentConcurrency) {
+                if (this.currentConcurrency < 20) {
+                    this.currentConcurrency++;
+                    this.log(`Network stable. Increasing concurrency to ${this.currentConcurrency}`);
+                }
+                this.successfulTransfersSinceLastIncrease = 0;
+            }
+        } else {
+            const newLimit = Math.max(1, Math.floor(this.currentConcurrency * 0.7));
+            if (newLimit < this.currentConcurrency) {
+                this.currentConcurrency = newLimit;
+                this.log(`Network issues detected. Decreasing concurrency to ${this.currentConcurrency}`);
+            }
+            this.successfulTransfersSinceLastIncrease = 0;
+        }
+    }
+
+    private processQueue() {
+        this.updateStatus();
+        while (this.activeQueueTransfers < this.getConcurrencyLimit() && this.syncQueue.length > 0) {
+            const item = this.syncQueue.shift();
+            if (item) {
+                this.activeQueueTransfers++;
+                this.processQueueItem(item).finally(() => {
+                    if (this.activeQueueTransfers > 0) this.activeQueueTransfers--;
+                    this.processQueue();
+                });
+            }
+        }
+    }
+
+    private async processQueueItem(item: { peerId: string | null, data: SyncData, retries: number }) {
         let transferId: string | undefined;
-        let item: { peerId: string | null, data: SyncData, retries: number } | undefined;
         let isPaused = false;
+        let success = false;
 
         try {
-            this.updateStatus();
-            item = this.syncQueue.shift();
-            if (!item) return;
-
-            const { peerId, data } = item;
+            let { peerId, data } = item;
             transferId = (data as any).transferId;
 
-            const isChunkedTransfer = data.type === 'file-update' && data.content instanceof ArrayBuffer && data.content.byteLength > CHUNK_SIZE;
+            // Handle broadcast splitting for file updates to ensure concurrency tracking and ACKs
+            if (!peerId && data.type === 'file-update' && this.getConnectionMode() !== 'direct-ip') {
+                const connectedPeers = Array.from(this.connections.keys());
+                if (connectedPeers.length === 0) {
+                    success = true; // No peers to send to is not a failure
+                    return;
+                }
+                
+                // Assign first peer to this task
+                peerId = connectedPeers[0];
+                
+                // Queue the rest with new transferIds
+                for (let i = 1; i < connectedPeers.length; i++) {
+                    const newData = { ...data, transferId: this.generateTransferId((data as any).path) };
+                    this.addToQueue(connectedPeers[i], newData);
+                }
+            }
+
+            const isChunkedTransfer = data.type === 'file-update' && data.content instanceof ArrayBuffer && data.content.byteLength > this.getChunkSize();
 
             if (isChunkedTransfer) {
+                const fileData = data as FileUpdatePayload;
                 if (!transferId) throw new Error("Transfer ID missing for chunked transfer");
                 if (this.getConnectionMode() === 'direct-ip') {
                     if (this.directIpClient) {
@@ -703,7 +771,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                 resolve();
                             });
                         });
-                        await this.sendFileInChunks('direct-ip-host', data.path, data.mtime, data.content as ArrayBuffer, transferId!);
+                        await this.sendFileInChunks('direct-ip-host', fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!);
                         await ackPromise;
                         this.log(`Chunked transfer ${transferId} (DirectIP) completed.`);
                     } else if (this.directIpServer) {
@@ -715,16 +783,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             });
                         });
                         // PeerId is just a placeholder here as the server broadcasts to the queue
-                        await this.sendFileInChunks('direct-ip-client', data.path, data.mtime, data.content as ArrayBuffer, transferId!);
+                        await this.sendFileInChunks('direct-ip-client', fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!);
                         await ackPromise;
                         this.log(`Chunked transfer ${transferId} (DirectIP Host) completed.`);
                     }
                 } else {
-                    const targetPeers = peerId ? [peerId] : Array.from(this.connections.keys());
-                    if (targetPeers.length > 0) {
-                        const firstPeer = targetPeers[0];
-                        for (let i = 1; i < targetPeers.length; i++) { this.addToQueue(targetPeers[i], data); }
-                        
+                    if (peerId) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
                             const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 30000);
                             this.pendingAcks.set(transferId!, () => {
@@ -733,9 +797,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             });
                         });
 
-                        await this.sendFileInChunks(firstPeer, data.path, data.mtime, data.content as ArrayBuffer, transferId!);
+                        await this.sendFileInChunks(peerId, fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!);
                         await ackPromise;
-                        this.log(`Chunked transfer ${transferId} for ${data.path} completed successfully.`);
+                        this.log(`Chunked transfer ${transferId} for ${fileData.path} completed successfully.`);
                     }
                 }
             } else {
@@ -766,6 +830,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     });
                 }
             }
+            success = true;
         } catch (e) {
             if (e.message === 'Paused') {
                 this.log(`Transfer ${transferId} paused due to connection loss.`);
@@ -784,12 +849,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         } finally {
             if (transferId && !isPaused) {
-                this.pendingAcks.delete(transferId);
+                this.reportTransferResult(success);
+                if (this.pendingAcks.has(transferId)) {
+                    this.pendingAcks.get(transferId)!();
+                    this.pendingAcks.delete(transferId);
+                }
                 this.activeTransfers.delete(transferId);
                 this.debouncedSaveState();
             }
-            this.isQueueProcessing = false;
-            this.processQueue();
+            this.updateStatus();
         }
     }
 
@@ -955,6 +1023,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } catch (e) {
                     if (e.message === 'Paused') this.log(`Transfer ${t.id} paused again.`);
                     else this.log(`Resumed transfer ${t.id} failed:`, e);
+                } finally {
+                    if (this.pendingAcks.has(t.id)) {
+                        this.pendingAcks.get(t.id)!();
+                        this.pendingAcks.delete(t.id);
+                    }
                 }
             } else {
                 this.activeTransfers.delete(t.id);
@@ -1070,7 +1143,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             let encoding: 'utf8' | 'binary' | 'base64' = isBinaryFile ? 'binary' : 'utf8';
 
             // Convert large strings to ArrayBuffer to ensure they get chunked
-            if (typeof content === 'string' && content.length > CHUNK_SIZE) {
+            if (typeof content === 'string' && content.length > this.getChunkSize()) {
                 content = new TextEncoder().encode(content).buffer;
                 encoding = 'binary';
             }
@@ -1093,23 +1166,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
         
+        const chunkSize = this.getChunkSize();
         const existingTransfer = this.activeTransfers.get(transferId);
         this.activeTransfers.set(transferId, existingTransfer || {
             id: transferId,
             path,
             direction: 'upload',
             peerId,
-            totalChunks: Math.ceil(fileContent.byteLength / CHUNK_SIZE),
+            totalChunks: Math.ceil(fileContent.byteLength / chunkSize),
             processedChunks: startIndex,
             startTime: Date.now(),
             lastUpdate: Date.now(),
-            status: 'active'
+            status: 'active',
+            chunkSize: chunkSize
         });
         this.updateStatus();
         this.debouncedSaveState();
 
-        const totalChunks = Math.ceil(fileContent.byteLength / CHUNK_SIZE);
+        const totalChunks = Math.ceil(fileContent.byteLength / chunkSize);
         this.log(`Sending file in ${totalChunks} chunks to ${peerId}: ${path} (ID: ${transferId})`);
+        
+        const YIELD_THRESHOLD_MS = 15;
+        let lastYieldTime = Date.now();
         
         if (startIndex === 0) {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId };
@@ -1130,7 +1208,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 throw new Error("Paused");
             }
             try {
-                const start = i * CHUNK_SIZE; const end = start + CHUNK_SIZE; const chunk = fileContent.slice(start, end);
+                const start = i * chunkSize; const end = start + chunkSize; const chunk = fileContent.slice(start, end);
                 const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk };
                 
                 if (isDirectIp) {
@@ -1144,19 +1222,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     transfer.processedChunks = i + 1;
                     transfer.lastUpdate = Date.now();
                 }
-                this.updateStatus();
-                await new Promise(resolve => setTimeout(resolve, 5));
-                if (i % 10 === 0) this.debouncedSaveState();
+                
+                const now = Date.now();
+                if (now - lastYieldTime > YIELD_THRESHOLD_MS) {
+                    this.updateStatus();
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                    lastYieldTime = Date.now();
+                }
+                
+                if (i % 20 === 0) this.debouncedSaveState();
             } catch (e) {
                 this.log(`Error sending chunk ${i} for ${path}. Aborting.`, e);
-                this.pendingAcks.get(transferId)?.();
-                return;
+                throw e;
             }
         }
         this.log(`Finished sending all chunks for ${path} to ${peerId}. Waiting for ack.`);
     }
     handleFileChunkStart(payload: FileChunkStartPayload, conn: DataConnection | null) { 
-        this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, lastUpdated: Date.now() }); 
+        this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, receivedCount: 0, lastUpdated: Date.now() }); 
         this.activeTransfers.set(payload.transferId, {
             id: payload.transferId,
             path: payload.path,
@@ -1172,16 +1255,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     async handleFileChunkData(payload: FileChunkDataPayload, conn: DataConnection) {
         const transfer = this.pendingFileChunks.get(payload.transferId); if (!transfer) { this.log("Received chunk for unknown transfer:", payload.transferId); return; }
-        transfer.chunks[payload.index] = payload.data;
+        if (payload.index < 0 || payload.index >= transfer.total) {
+            this.log(`Received invalid chunk index ${payload.index} for transfer ${payload.transferId}`);
+            return;
+        }
+        if (!transfer.chunks[payload.index]) {
+            transfer.chunks[payload.index] = payload.data;
+            transfer.receivedCount++;
+        }
         transfer.lastUpdated = Date.now();
         const active = this.activeTransfers.get(payload.transferId);
-        if (active) { active.processedChunks = transfer.chunks.filter(c => c !== undefined).length; active.lastUpdate = Date.now(); }
-        if (transfer.chunks.every(chunk => chunk !== undefined)) {
+        if (active) { active.processedChunks = transfer.receivedCount; active.lastUpdate = Date.now(); }
+        if (transfer.receivedCount === transfer.total) {
             this.log(`All chunks received for ${transfer.path}. Reassembling...`);
             this.pendingFileChunks.delete(payload.transferId);
             this.activeTransfers.delete(payload.transferId);
-            const totalSize = transfer.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0); const reassembled = new Uint8Array(totalSize); let offset = 0;
-            for (const chunk of transfer.chunks) { reassembled.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
+            
+            const totalSize = transfer.chunks.reduce((sum, chunk) => sum + (chunk ? chunk.byteLength : 0), 0); 
+            const reassembled = new Uint8Array(totalSize); 
+            let offset = 0;
+            for (const chunk of transfer.chunks) { 
+                if (chunk) { reassembled.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
+            }
+            
             await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId });
             conn.send({ type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
         }
@@ -1307,12 +1403,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         switch (strategy) {
             case 'last-write-wins':
-                this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`);
-                this.ignoreNextEventForPath(data.path);
-                if (data.encoding === 'binary' || data.encoding === 'base64') {
-                    await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer);
+                if (data.mtime > existingFile.stat.mtime) {
+                    this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`);
+                    this.ignoreNextEventForPath(data.path);
+                    if (data.encoding === 'binary' || data.encoding === 'base64') {
+                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer);
+                    } else {
+                        await this.app.vault.modify(existingFile, data.content as string);
+                    }
                 } else {
-                    await this.app.vault.modify(existingFile, data.content as string);
+                    this.log(`Conflict resolved by 'last-write-wins' (local wins): ${data.path}`);
                 }
                 break;
 
@@ -1436,8 +1536,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (count === 0 && this.activeTransfers.size > 0) return "⏸️ Transfers Paused";
             return `⏫ Syncing ${count} file${count > 1 ? 's' : ''}...`;
         }
-        if (this.isQueueProcessing) {
-            const queueSize = this.syncQueue.length + 1;
+        if (this.activeQueueTransfers > 0 || this.syncQueue.length > 0) {
+            const queueSize = this.syncQueue.length + this.activeQueueTransfers;
             return `⏳ Syncing (${queueSize} item${queueSize > 1 ? 's' : ''})`;
         }
         if (this.getConnectionMode() === 'direct-ip') {
@@ -1457,13 +1557,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     updateStatus(statusText?: string) {
+        const now = Date.now();
+        const isIdle = this.activeTransfers.size === 0 && this.activeQueueTransfers === 0 && this.syncQueue.length === 0;
+        if (!statusText && !isIdle && now - this.lastStatusUpdate < 200) return;
+        this.lastStatusUpdate = now;
+
         const currentStatus = statusText || this.calculateStatusText();
         this.statusBar.empty();
         const container = this.statusBar.createDiv({ cls: 'od-status-container' });
 
         let state: 'loading' | 'success' | 'error' | 'neutral' = 'neutral';
         
-        if (this.isSyncing || this.activeTransfers.size > 0 || this.isQueueProcessing || currentStatus.includes('Connecting') || currentStatus.includes('Syncing')) {
+        if (this.isSyncing || this.activeTransfers.size > 0 || this.activeQueueTransfers > 0 || currentStatus.includes('Connecting') || currentStatus.includes('Syncing')) {
             state = 'loading';
         } else if (currentStatus.includes('Offline') || currentStatus.includes('Error') || currentStatus.includes('Unreachable')) {
             state = 'error';
@@ -1863,8 +1968,9 @@ class SyncProgressModal extends Modal {
 
             const now = Date.now();
             const elapsedSeconds = (now - transfer.startTime) / 1000;
-            const processedBytes = transfer.processedChunks * CHUNK_SIZE;
-            const totalBytes = transfer.totalChunks * CHUNK_SIZE;
+            const chunkSize = transfer.chunkSize || this.plugin.getChunkSize();
+            const processedBytes = transfer.processedChunks * chunkSize;
+            const totalBytes = transfer.totalChunks * chunkSize;
             const speedBytesPerSec = elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0;
             const remainingBytes = totalBytes - processedBytes;
             const remainingSeconds = speedBytesPerSec > 0 ? remainingBytes / speedBytesPerSec : 0;
