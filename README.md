@@ -66,11 +66,11 @@ For LAN connections, the plugin can also use multicast UDP packets to broadcast 
 This plugin must be installed manually.
 
 1.  Go to the [**Releases**](https://github.com/iWebbIO/obsidian-decentralized/releases) page on GitHub.
-2.  Download the `main.js`, `manifest.json`, and `styles.css` files from the latest release.
+2.  Download the `main.js` and `manifest.json` files from the latest release.
 3.  Navigate to your Obsidian vault's plugins folder. This is typically located at `<YourVault>/.obsidian/plugins/`.
     -   If you don't see a `.obsidian` folder, you may need to enable "Show hidden files" in your file explorer.
 4.  Create a new folder inside the `plugins` directory. Name it `obsidian-decentralized`.
-5.  Copy the `main.js`, `manifest.json`, and `styles.css` files you downloaded into this new folder.
+5.  Copy the `main.js`and `manifest.json` files you downloaded into this new folder.
 6.  Restart Obsidian or reload the plugins by going to `Settings` -> `Community Plugins` and toggling a different plugin off and on.
 7.  Go to `Settings` -> `Community Plugins`. You should now see "Obsidian Decentralized" in the list.
 8.  Click the toggle to **enable** the plugin.
