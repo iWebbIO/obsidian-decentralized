@@ -1104,6 +1104,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const rtt = Date.now() - start;
                     this.manualPingStart.delete(conn!.peer);
                     this.showNotice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`);
+                    new Notice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`);
                 }
                 break;
             case 'cluster-forget': this.handleClusterForget(data); break;
@@ -2313,7 +2314,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setDesc(`ID: ${peer.deviceId}`);
 
             if (type === 'companion') {
-                settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(async () => {
+                settingItem.addButton(btn => btn.setButtonText('Unpair').setWarning().onClick(async () => {
                     await this.plugin.forgetCompanion();
                     this.updateStatus();
                 }));
@@ -2357,11 +2358,13 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                             this.plugin.showNotice("Cannot reconnect: Your sync is offline.", 'error');
                         }
                     }));
-                    settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(() => {
-                        this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
-                        this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
-                        this.plugin.saveKnownPeers();
-                    }));
+                    if (type !== 'companion') {
+                        settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(() => {
+                            this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
+                            this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
+                            this.plugin.saveKnownPeers();
+                        }));
+                    }
                 }
             } else if (type === 'host') {
                 settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => {
