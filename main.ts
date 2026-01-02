@@ -7,11 +7,7 @@ import { Html5Qrcode } from 'html5-qrcode';
 // --- Constants ---
 const DISCOVERY_PORT = 41234;
 const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
-const MTIME_TOLERANCE_MS = 2500;
-const DEBOUNCE_DELAY_MS = 1500;
-// const CHUNK_SIZE = 64 * 1024; // Uncomment to hardcode
 const COMPANION_RECONNECT_INTERVAL_MS = 10000;
-// const MAX_CONCURRENT_TRANSFERS = 10; // Uncomment to hardcode
 
 // --- Type Definitions ---
 type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; port?: number; mode?: 'peerjs' | 'direct-ip'; };
@@ -63,7 +59,7 @@ type SyncData =
 interface PeerServerConfig { host: string; port: number; path: string; secure: boolean; }
 interface DirectIpConfig { host: string; port: number; pin: string; }
 interface ObsidianDecentralizedSettings {
-    syncMode: 'auto' | 'manual';
+    syncMode: 'auto' | 'manual' | 'advanced';
     showToasts: boolean;
     deviceId: string;
     friendlyName: string;
@@ -80,6 +76,10 @@ interface ObsidianDecentralizedSettings {
     includedFolders: string;
     excludedFolders: string;
     hideNativeSyncStatus: boolean;
+    maximumConcurrentTransfers: number | null;
+    chunkSize: number | null;
+    debounceDelay: number;
+    mtimeTolerance: number;
 }
 const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     syncMode: 'auto',
@@ -99,6 +99,10 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     includedFolders: '',
     excludedFolders: '',
     hideNativeSyncStatus: false,
+    maximumConcurrentTransfers: null,
+    chunkSize: null,
+    debounceDelay: 1500,
+    mtimeTolerance: 2500,
 };
 
 interface ILANDiscovery {
@@ -581,7 +585,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
         });
 
-        this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), DEBOUNCE_DELAY_MS);
+        this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), this.settings.debounceDelay);
         this.registerEvent(this.app.vault.on('create', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('modify', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('delete', (file) => this.handleEvent(file)));
@@ -629,6 +633,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); this.applyHideNativeSync(); }
     async saveSettings() { await this.saveData(this.settings); }
+
+    public updateDebounceDelay() {
+        this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), this.settings.debounceDelay);
+    }
 
     applyHideNativeSync() {
         if (this.settings.hideNativeSyncStatus) {
@@ -686,13 +694,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public getConcurrencyLimit() { 
-        // @ts-ignore
-        if (typeof MAX_CONCURRENT_TRANSFERS !== 'undefined') return MAX_CONCURRENT_TRANSFERS;
+        if (this.settings.maximumConcurrentTransfers) return this.settings.maximumConcurrentTransfers;
         return this.currentConcurrency; 
     }
     public getChunkSize() { 
-        // @ts-ignore
-        if (typeof CHUNK_SIZE !== 'undefined') return CHUNK_SIZE;
+        if (this.settings.chunkSize) return this.settings.chunkSize;
         return this.currentChunkSize; 
     }
 
@@ -1356,7 +1362,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private async handleFileModification(data: FileUpdatePayload, existingFile: TFile) {
         try {
-            if (data.mtime > existingFile.stat.mtime + MTIME_TOLERANCE_MS) {
+            if (data.mtime > existingFile.stat.mtime + this.settings.mtimeTolerance) {
                 this.log(`Applying update (remote is newer): ${data.path}`);
                 this.ignoreNextEventForPath(data.path);
                 if (data.encoding === 'binary' || data.encoding === 'base64') {
@@ -1367,7 +1373,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 return;
             }
 
-            if (data.mtime < existingFile.stat.mtime - MTIME_TOLERANCE_MS) {
+            if (data.mtime < existingFile.stat.mtime - this.settings.mtimeTolerance) {
                 this.log(`Ignoring update (local is newer): ${data.path}`);
                 return;
             }
@@ -1437,7 +1443,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async applyFolderRename(data: FolderRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const folder = this.app.vault.getAbstractFileByPath(data.oldPath); if (folder instanceof TFolder) { this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.oldPath); this.ignoreNextEventForPath(data.newPath); try { await this.app.vault.rename(folder, data.newPath); } catch (e) { console.error(`Failed to rename folder ${data.oldPath}`, e); } } }
 
     async requestFullSyncFromPeer(peerId: string) { if (this.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } const conn = this.connections.get(peerId); if (!conn) { this.showNotice("Peer not found.", 'error'); return; } this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); this.isSyncing = true; this.updateStatus(); const localManifest = await this.buildVaultManifest(); this.log(`Sending sync request with ${localManifest.length} items.`); this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest }); }
-    async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { if (this.isSyncing) { this.showNotice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`, 'verbose'); return; } this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); this.isSyncing = true; this.updateStatus(); const remoteManifest = data.manifest; const localManifest = await this.buildVaultManifest(); const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); const localIndex = new Map(localManifest.map(item => [item.path, item])); const filesInitiatorMustSend: string[] = []; const filesReceiverWillSend: string[] = []; localIndex.forEach((localItem, path) => { const remoteItem = remoteIndex.get(path); if (!remoteItem) { filesReceiverWillSend.push(path); } else if (localItem.type === 'file' && remoteItem.type === 'file') { if (localItem.mtime > remoteItem.mtime + MTIME_TOLERANCE_MS) { filesReceiverWillSend.push(path); } } }); remoteIndex.forEach((remoteItem, path) => { const localItem = localIndex.get(path); if (!localItem) { filesInitiatorMustSend.push(path); } else if (remoteItem.type === 'file' && localItem.type === 'file') { if (remoteItem.mtime > localItem.mtime + MTIME_TOLERANCE_MS) { filesInitiatorMustSend.push(path); } } }); this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`); this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend }); for (const path of filesReceiverWillSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } this.log("Full sync: receiver has sent all its files. Sending complete message."); this.sendData(conn.peer, { type: 'full-sync-complete'}); this.isSyncing = false; this.updateStatus(); }
+    async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { if (this.isSyncing) { this.showNotice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`, 'verbose'); return; } this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); this.isSyncing = true; this.updateStatus(); const remoteManifest = data.manifest; const localManifest = await this.buildVaultManifest(); const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); const localIndex = new Map(localManifest.map(item => [item.path, item])); const filesInitiatorMustSend: string[] = []; const filesReceiverWillSend: string[] = []; localIndex.forEach((localItem, path) => { const remoteItem = remoteIndex.get(path); if (!remoteItem) { filesReceiverWillSend.push(path); } else if (localItem.type === 'file' && remoteItem.type === 'file') { if (localItem.mtime > remoteItem.mtime + this.settings.mtimeTolerance) { filesReceiverWillSend.push(path); } } }); remoteIndex.forEach((remoteItem, path) => { const localItem = localIndex.get(path); if (!localItem) { filesInitiatorMustSend.push(path); } else if (remoteItem.type === 'file' && localItem.type === 'file') { if (remoteItem.mtime > localItem.mtime + this.settings.mtimeTolerance) { filesInitiatorMustSend.push(path); } } }); this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`); this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend }); for (const path of filesReceiverWillSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } this.log("Full sync: receiver has sent all its files. Sending complete message."); this.sendData(conn.peer, { type: 'full-sync-complete'}); this.isSyncing = false; this.updateStatus(); }
     async handleFullSyncResponse(data: FullSyncResponsePayload, conn: DataConnection) { if (!this.isSyncing) return; this.showNotice("Received sync plan. Exchanging files...", 'verbose'); this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, I will receive ${data.filesReceiverWillSend.length}`); for (const path of data.filesInitiatorMustSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } const dynamicTimeout = 30000 + (data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length) * 1000; if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = window.setTimeout(() => { if (this.isSyncing) { this.showNotice("Sync timed out. Some files may not have transferred.", 'error', 10000); this.handleFullSyncComplete(); } }, dynamicTimeout); }
     handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.updateStatus(); this.showNotice("✅ Full sync complete.", 'info'); }
     
@@ -1457,7 +1463,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
 
-        if (this.settings.syncMode === 'manual') {
+        if (this.settings.syncMode === 'manual' || this.settings.syncMode === 'advanced') {
             const included = this.settings.includedFolders.split('\n').map(p => p.trim()).filter(Boolean);
             if (included.length > 0 && !included.some(p => path.startsWith(p))) { return false; }
         }
@@ -2007,12 +2013,13 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Mode')
-            .setDesc('Auto mode syncs all files, snippets, and themes. Manual mode provides advanced configuration options.')
+            .setDesc('Auto mode syncs all files. Manual mode allows configuration. Advanced mode unlocks all settings.')
             .addDropdown(dd => dd
                 .addOption('auto', 'Auto (Recommended)')
                 .addOption('manual', 'Manual')
+                .addOption('advanced', 'Advanced')
                 .setValue(this.plugin.settings.syncMode)
-                .onChange(async (value: 'auto' | 'manual') => {
+                .onChange(async (value: 'auto' | 'manual' | 'advanced') => {
                     this.plugin.settings.syncMode = value;
                     await this.plugin.saveSettings();
                     this.display(); 
@@ -2038,7 +2045,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             .setDesc("Never sync folders in this list. One folder per line. Example: 'Attachments/Large Files'.")
             .addTextArea(text => text.setPlaceholder("Path/To/Exclude\nAnother/Path").setValue(this.plugin.settings.excludedFolders).onChange(async (value) => { this.plugin.settings.excludedFolders = value; await this.plugin.saveSettings(); }));
 
-        if (this.plugin.settings.syncMode === 'manual') {
+        if (this.plugin.settings.syncMode === 'manual' || this.plugin.settings.syncMode === 'advanced') {
             this.displayManualSettings(containerEl);
         } else {
              new Setting(containerEl)
@@ -2052,7 +2059,9 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     }));
         }
         
-        this.displayAdvancedSettings(containerEl);
+        if (this.plugin.settings.syncMode === 'advanced') {
+            this.displayAdvancedSettings(containerEl);
+        }
 
         if (this.statusInterval) clearInterval(this.statusInterval);
         this.statusInterval = window.setInterval(() => this.updateStatus(), 3000);
@@ -2104,18 +2113,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        containerEl.createEl('h4', { text: "Selective Sync" });
         new Setting(containerEl)
-            .setName("Included folders")
-            .setDesc("Only sync folders in this list. One folder per line. If empty, all folders are included (unless excluded). Example: 'Journal/Daily'.")
-            .addTextArea(text => text.setPlaceholder("Path/To/Include\nAnother/Path").setValue(this.plugin.settings.includedFolders).onChange(async (value) => { this.plugin.settings.includedFolders = value; await this.plugin.saveSettings(); }));
-    }
-
-    displayAdvancedSettings(containerEl: HTMLElement): void {
-        const advancedSettings = containerEl.createEl('details');
-        advancedSettings.createEl('summary', { text: 'Advanced Settings' });
-
-        new Setting(advancedSettings)
             .setName('Hide Obsidian Sync status')
             .setDesc('Hide the native Obsidian Sync button in the status bar.')
             .addToggle(toggle => toggle
@@ -2126,7 +2124,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(advancedSettings)
+        new Setting(containerEl)
             .setName("Enable Verbose Logging")
             .setDesc("Outputs detailed sync information to the developer console for troubleshooting.")
             .addToggle(toggle => toggle
@@ -2136,7 +2134,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(advancedSettings)
+        new Setting(containerEl)
             .setName("Use custom signaling server")
             .setDesc("For advanced users. Use your own self-hosted PeerJS server for a fully private syncing experience, even over the internet.")
             .addToggle(toggle => toggle
@@ -2149,18 +2147,75 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         if (this.plugin.settings.useCustomPeerServer) {
             const config = this.plugin.settings.customPeerServerConfig;
-            new Setting(advancedSettings).setName("Host").addText(text => text.setValue(config.host).onChange(async (value) => { config.host = value; await this.plugin.saveSettings(); }));
-            new Setting(advancedSettings).setName("Port").addText(text => text.setValue(config.port.toString()).onChange(async (value) => { config.port = parseInt(value, 10) || 9000; await this.plugin.saveSettings(); }));
-            new Setting(advancedSettings).setName("Path").addText(text => text.setValue(config.path).onChange(async (value) => { config.path = value; await this.plugin.saveSettings(); }));
-            new Setting(advancedSettings).setName("Secure (SSL)").addToggle(toggle => toggle.setValue(config.secure).onChange(async (value) => { config.secure = value; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Host").addText(text => text.setValue(config.host).onChange(async (value) => { config.host = value; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Port").addText(text => text.setValue(config.port.toString()).onChange(async (value) => { config.port = parseInt(value, 10) || 9000; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Path").addText(text => text.setValue(config.path).onChange(async (value) => { config.path = value; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Secure (SSL)").addToggle(toggle => toggle.setValue(config.secure).onChange(async (value) => { config.secure = value; await this.plugin.saveSettings(); }));
 
-            new Setting(advancedSettings)
+            new Setting(containerEl)
                 .addButton(btn => btn.setButtonText("Apply and Reconnect").setWarning()
                     .onClick(() => {
                         this.plugin.showNotice("Reconnecting to new PeerJS server...", 'info');
                         this.plugin.reinitializeConnectionManager();
                     }));
         }
+
+        containerEl.createEl('h4', { text: "Selective Sync" });
+        new Setting(containerEl)
+            .setName("Included folders")
+            .setDesc("Only sync folders in this list. One folder per line. If empty, all folders are included (unless excluded). Example: 'Journal/Daily'.")
+            .addTextArea(text => text.setPlaceholder("Path/To/Include\nAnother/Path").setValue(this.plugin.settings.includedFolders).onChange(async (value) => { this.plugin.settings.includedFolders = value; await this.plugin.saveSettings(); }));
+    }
+
+    displayAdvancedSettings(containerEl: HTMLElement): void {
+        containerEl.createEl('h4', { text: 'Advanced Settings' });
+
+        new Setting(containerEl)
+            .setName("Max Concurrent Transfers")
+            .setDesc("Maximum number of files to transfer at once. Leave empty for dynamic (auto-tuning).")
+            .addText(text => text
+                .setPlaceholder("Auto")
+                .setValue(this.plugin.settings.maximumConcurrentTransfers?.toString() || "")
+                .onChange(async (value) => {
+                    const num = parseInt(value);
+                    this.plugin.settings.maximumConcurrentTransfers = isNaN(num) ? null : num;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Chunk Size (Bytes)")
+            .setDesc("Size of file chunks in bytes. Default is dynamic (starts at 64KB).")
+            .addText(text => text
+                .setPlaceholder("Auto")
+                .setValue(this.plugin.settings.chunkSize?.toString() || "")
+                .onChange(async (value) => {
+                    const num = parseInt(value);
+                    this.plugin.settings.chunkSize = isNaN(num) ? null : num;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Debounce Delay (ms)")
+            .setDesc("Time to wait after a file change before syncing. Higher values reduce sync frequency.")
+            .addText(text => text
+                .setValue(this.plugin.settings.debounceDelay.toString())
+                .onChange(async (value) => {
+                    const num = parseInt(value);
+                    this.plugin.settings.debounceDelay = isNaN(num) ? 1500 : num;
+                    this.plugin.updateDebounceDelay();
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Modification Time Tolerance (ms)")
+            .setDesc("Time difference to consider files 'the same' to account for clock skew.")
+            .addText(text => text
+                .setValue(this.plugin.settings.mtimeTolerance.toString())
+                .onChange(async (value) => {
+                    const num = parseInt(value);
+                    this.plugin.settings.mtimeTolerance = isNaN(num) ? 2500 : num;
+                    await this.plugin.saveSettings();
+                }));
     }
 
     hide(): void {
