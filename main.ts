@@ -56,6 +56,7 @@ interface FailedSync {
     peerId: string | null;
     timestamp: number;
     type: 'file-update' | 'file-delete';
+    reason?: string;
 }
 
 type SyncData =
@@ -571,7 +572,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private statePath: string;
     public manualPingStart: Map<string, number> = new Map();
     private debouncedSaveState: () => void;
-    private failedSyncs: FailedSync[] = [];
+    public failedSyncs: FailedSync[] = [];
 
     async onload() {
         if (Platform.isMobile) {
@@ -885,7 +886,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         path: item.data.path,
                         peerId: item.peerId,
                         timestamp: Date.now(),
-                        type: item.data.type
+                        type: item.data.type,
+                        reason: e instanceof Error ? e.message : String(e)
                     });
                     this.debouncedSaveState();
                 }
@@ -2101,34 +2103,62 @@ class SyncProgressModal extends Modal {
 
     refresh() {
         this.container.empty();
-        if (this.plugin.activeTransfers.size === 0) {
+        const hasActive = this.plugin.activeTransfers.size > 0;
+        const hasFailed = this.plugin.failedSyncs.length > 0;
+
+        if (!hasActive && !hasFailed) {
             this.container.createEl('p', { text: 'No active file transfers.' });
             return;
         }
 
-        this.plugin.activeTransfers.forEach(transfer => {
-            const item = this.container.createDiv({ cls: 'od-transfer-item' });
-            const title = item.createDiv({ cls: 'od-transfer-title' });
-            title.createSpan({ text: (transfer.direction === 'upload' ? '⬆️ ' : '⬇️ ') + transfer.path, attr: { style: 'font-weight: bold;' } });
-            if (transfer.status === 'paused') title.createSpan({ text: ' (Paused)', attr: { style: 'color: var(--text-muted); font-size: 0.8em;' } });
+        if (hasActive) {
+            if (hasFailed) this.container.createEl('h4', { text: 'Active Transfers', attr: { style: 'margin-top: 0;' } });
+            this.plugin.activeTransfers.forEach(transfer => {
+                const item = this.container.createDiv({ cls: 'od-transfer-item' });
+                const title = item.createDiv({ cls: 'od-transfer-title' });
+                title.createSpan({ text: (transfer.direction === 'upload' ? '⬆️ ' : '⬇️ ') + transfer.path, attr: { style: 'font-weight: bold;' } });
+                if (transfer.status === 'paused') title.createSpan({ text: ' (Paused)', attr: { style: 'color: var(--text-muted); font-size: 0.8em;' } });
 
-            const progress = item.createEl('progress', { attr: { value: transfer.processedChunks, max: transfer.totalChunks } });
-            progress.style.width = '100%';
+                const progress = item.createEl('progress', { attr: { value: transfer.processedChunks, max: transfer.totalChunks } });
+                progress.style.width = '100%';
 
-            const now = Date.now();
-            const elapsedSeconds = (now - transfer.startTime) / 1000;
-            const chunkSize = transfer.chunkSize || this.plugin.getChunkSize();
-            const processedBytes = transfer.processedChunks * chunkSize;
-            const totalBytes = transfer.totalChunks * chunkSize;
-            const speedBytesPerSec = elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0;
-            const remainingBytes = totalBytes - processedBytes;
-            const remainingSeconds = speedBytesPerSec > 0 ? remainingBytes / speedBytesPerSec : 0;
+                const now = Date.now();
+                const elapsedSeconds = (now - transfer.startTime) / 1000;
+                const chunkSize = transfer.chunkSize || this.plugin.getChunkSize();
+                const processedBytes = transfer.processedChunks * chunkSize;
+                const totalBytes = transfer.totalChunks * chunkSize;
+                const speedBytesPerSec = elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0;
+                const remainingBytes = totalBytes - processedBytes;
+                const remainingSeconds = speedBytesPerSec > 0 ? remainingBytes / speedBytesPerSec : 0;
 
-            const meta = item.createDiv({ cls: 'od-transfer-meta' });
-            meta.createSpan({ text: `${formatBytes(speedBytesPerSec)}/s` });
-            meta.createSpan({ text: `${Math.round(remainingSeconds)}s remaining` });
-            meta.createSpan({ text: `${Math.round((transfer.processedChunks / transfer.totalChunks) * 100)}%` });
-        });
+                const meta = item.createDiv({ cls: 'od-transfer-meta' });
+                meta.createSpan({ text: `${formatBytes(speedBytesPerSec)}/s` });
+                meta.createSpan({ text: `${Math.round(remainingSeconds)}s remaining` });
+                meta.createSpan({ text: `${Math.round((transfer.processedChunks / transfer.totalChunks) * 100)}%` });
+            });
+        }
+
+        if (hasFailed) {
+            this.container.createEl('h4', { text: 'Pending Retries', attr: { style: hasActive ? 'margin-top: 20px;' : 'margin-top: 0;' } });
+            this.plugin.failedSyncs.forEach(fail => {
+                const item = this.container.createDiv({ cls: 'od-transfer-item' });
+                const title = item.createDiv({ cls: 'od-transfer-title' });
+                const icon = fail.type === 'file-delete' ? '🗑️ ' : '⚠️ ';
+                title.createSpan({ text: icon + fail.path, attr: { style: 'font-weight: bold;' } });
+
+                const meta = item.createDiv({ cls: 'od-transfer-meta' });
+                const peerName = fail.peerId ? (this.plugin.clusterPeers.get(fail.peerId)?.friendlyName || fail.peerId) : 'Broadcast';
+                meta.createSpan({ text: `To: ${peerName}` });
+                
+                const secondsAgo = Math.round((Date.now() - fail.timestamp) / 1000);
+                meta.createSpan({ text: `Failed ${secondsAgo}s ago` });
+
+                if (fail.reason) {
+                    const reasonMeta = item.createDiv({ cls: 'od-transfer-meta' });
+                    reasonMeta.createSpan({ text: `Error: ${fail.reason}`, attr: { style: 'color: var(--text-error);' } });
+                }
+            });
+        }
     }
 }
 
