@@ -34,6 +34,9 @@ type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: nu
 type FileChunkDataPayload = { type: 'file-chunk-data', transferId: string, index: number, data: ArrayBuffer };
 type PingPayload = { type: 'ping' };
 type PongPayload = { type: 'pong' };
+type ClusterForgetPayload = { type: 'cluster-forget'; targetDeviceId: string; };
+type ClusterKickPayload = { type: 'cluster-kick'; targetDeviceId: string; };
+type ClusterRenamePayload = { type: 'cluster-rename'; targetDeviceId: string; newName: string; };
 
 interface TransferStatus {
     id: string;
@@ -53,7 +56,8 @@ type SyncData =
     | FileUpdatePayload | FileDeletePayload | FileRenamePayload
     | FolderCreatePayload | FolderDeletePayload | FolderRenamePayload
     | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload
-    | FileChunkStartPayload | FileChunkDataPayload | PingPayload | PongPayload;
+    | FileChunkStartPayload | FileChunkDataPayload | PingPayload | PongPayload
+    | ClusterForgetPayload | ClusterKickPayload | ClusterRenamePayload;
 
 // Interfaces
 interface PeerServerConfig { host: string; port: number; path: string; secure: boolean; }
@@ -80,6 +84,7 @@ interface ObsidianDecentralizedSettings {
     chunkSize: number | null;
     debounceDelay: number;
     mtimeTolerance: number;
+    knownPeers: PeerInfo[];
 }
 const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     syncMode: 'auto',
@@ -103,6 +108,7 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     chunkSize: null,
     debounceDelay: 1500,
     mtimeTolerance: 2500,
+    knownPeers: [],
 };
 
 interface ILANDiscovery {
@@ -556,6 +562,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public directIpClient: DirectIpClient | null = null;
     private lastHeard: Map<string, number> = new Map();
     private statePath: string;
+    public manualPingStart: Map<string, number> = new Map();
     private debouncedSaveState: () => void;
 
     async onload() {
@@ -631,8 +638,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         };
         await this.app.vault.adapter.write(this.statePath, JSON.stringify(state, null, 2));
     }
-    async loadSettings() { this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); this.applyHideNativeSync(); }
+    async loadSettings() { 
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); 
+        this.applyHideNativeSync(); 
+        if (this.settings.knownPeers) {
+            this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, p));
+        }
+    }
     async saveSettings() { await this.saveData(this.settings); }
+    async saveKnownPeers() { this.settings.knownPeers = Array.from(this.clusterPeers.values()); await this.saveSettings(); }
 
     public updateDebounceDelay() {
         this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), this.settings.debounceDelay);
@@ -875,7 +889,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.directIpClient = null;
         this.directIpServer = null;
         this.connections.clear();
-        this.clusterPeers.clear();
         this.activeTransfers.clear();
         this.initializeConnectionManager();
     }
@@ -939,7 +952,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.peer = null;
         this.connections.forEach(conn => conn.close());
         this.connections.clear();
-        this.clusterPeers.clear();
         this.activeTransfers.clear();
     
         let userMessage = 'Connection Failed';
@@ -979,8 +991,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log("DataConnection closed with:", peerId);
             this.connections.delete(peerId);
             this.lastHeard.delete(peerId);
-            const peerInfo = this.clusterPeers.get(peerId);
-            this.clusterPeers.delete(peerId);
 
             for (const [id, transfer] of this.activeTransfers.entries()) {
                 if (transfer.peerId === peerId && transfer.direction === 'download') {
@@ -993,7 +1003,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log(`Connection to peer ${peerId} lost during transfer. Aborting relevant transfers.`);
                 this.pendingAcks.forEach((resolver) => resolver());
             }
-            if (peerInfo) this.log(`Peer disconnected: ${peerInfo.friendlyName} (${peerId})`);
+            this.log(`Peer disconnected: ${peerId}`);
             if (peerId === this.settings.companionPeerId) {
                 this.showNotice(`Companion disconnected. Will try to reconnect automatically.`, 'info');
                 this.log("Companion connection closed, restarting connection attempts.");
@@ -1088,7 +1098,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'file-chunk-start': this.handleFileChunkStart(data, conn); break;
             case 'file-chunk-data': this.handleFileChunkData(data, conn!); break;
             case 'ping': conn?.send({ type: 'pong' }); break;
-            case 'pong': /* Heartbeat ack */ break;
+            case 'pong': 
+                if (this.manualPingStart.has(conn!.peer)) {
+                    const start = this.manualPingStart.get(conn!.peer)!;
+                    const rtt = Date.now() - start;
+                    this.manualPingStart.delete(conn!.peer);
+                    this.showNotice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`);
+                }
+                break;
+            case 'cluster-forget': this.handleClusterForget(data); break;
+            case 'cluster-kick': this.handleClusterKick(data); break;
+            case 'cluster-rename': this.handleClusterRename(data); break;
         }
     }
 
@@ -1098,6 +1118,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.showNotice(`🤝 Connected to ${data.peerInfo.friendlyName}`, 'info', 4000);
         this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
+        this.saveKnownPeers();
         const existingPeers = Array.from(this.clusterPeers.values());
         conn.send({ type: 'cluster-gossip', peers: existingPeers });
         this.broadcastData({ type: 'cluster-gossip', peers: [this.getMyPeerInfo(), data.peerInfo] });
@@ -1107,6 +1128,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.getConnectionMode() !== 'peerjs') return;
         data.peers.forEach(peerInfo => {
             if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) return;
+            if (!this.clusterPeers.has(peerInfo.deviceId)) {
+                this.clusterPeers.set(peerInfo.deviceId, peerInfo);
+                this.saveKnownPeers();
+                this.updateStatus();
+            }
             if (this.peer && !this.peer.disconnected) { this.log("Gossip: attempting to connect to new peer", peerInfo.friendlyName); const conn = this.peer.connect(peerInfo.deviceId); this.setupConnection(conn); }
         });
     }
@@ -1128,6 +1154,40 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         };
         attemptConnection();
         this.companionConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS); this.registerInterval(this.companionConnectionInterval);
+    }
+
+    handleClusterForget(data: ClusterForgetPayload) {
+        this.log(`Received instruction to forget device: ${data.targetDeviceId}`);
+        if (this.connections.has(data.targetDeviceId)) {
+            this.connections.get(data.targetDeviceId)?.close();
+        }
+        this.clusterPeers.delete(data.targetDeviceId);
+        this.saveKnownPeers();
+        this.updateStatus();
+    }
+
+    handleClusterKick(data: ClusterKickPayload) {
+        if (data.targetDeviceId === this.settings.deviceId) {
+            this.showNotice("You have been kicked from the cluster.", 'error');
+            // Optionally close all connections or just let the others close them
+        } else if (this.connections.has(data.targetDeviceId)) {
+            this.log(`Kicking device: ${data.targetDeviceId}`);
+            this.connections.get(data.targetDeviceId)?.close();
+        }
+    }
+
+    handleClusterRename(data: ClusterRenamePayload) {
+        if (data.targetDeviceId === this.settings.deviceId) {
+            this.settings.friendlyName = data.newName;
+            this.saveSettings();
+            this.showNotice(`Your device was renamed to ${data.newName} by the cluster.`, 'info');
+        }
+        const peer = this.clusterPeers.get(data.targetDeviceId);
+        if (peer) {
+            peer.friendlyName = data.newName;
+            this.saveKnownPeers();
+            this.updateStatus();
+        }
     }
 
     public async forgetCompanion() {
@@ -1936,6 +1996,18 @@ class ConflictCenter { private conflicts: Map<string, string> = new Map(); priva
 class ConflictListModal extends Modal { constructor(app: App, private conflictCenter: ConflictCenter, private plugin: ObsidianDecentralizedPlugin) { super(app); } onOpen() { const { contentEl } = this; contentEl.createEl('h2', { text: 'Sync Conflicts' }); const conflicts: Map<string, string> = (this.conflictCenter as any).conflicts; if (conflicts.size === 0) { contentEl.createEl('p', { text: 'No conflicts to resolve.' }); return; } conflicts.forEach((conflictPath, originalPath) => { new Setting(contentEl).setName(originalPath).setDesc(`Conflict file: ${conflictPath}`) .addButton(btn => btn.setButtonText('Resolve').setCta().onClick(async () => { this.close(); await this.showResolutionModal(originalPath, conflictPath); })); }); } async showResolutionModal(originalPath: string, conflictPath: string) { const originalFile = this.app.vault.getAbstractFileByPath(originalPath) as TFile; const conflictFile = this.app.vault.getAbstractFileByPath(conflictPath) as TFile; if (!originalFile || !conflictFile) { this.plugin.showNotice("One of the conflict files is missing.", 'error'); this.conflictCenter.resolveConflict(originalPath); return; } const localContent = await this.app.vault.read(originalFile); const remoteContent = await this.app.vault.read(conflictFile); new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => { this.plugin.ignoreNextEventForPath(originalPath); await this.app.vault.modify(originalFile, chosenContent); this.plugin.ignoreNextEventForPath(conflictPath); await this.app.vault.delete(conflictFile); this.conflictCenter.resolveConflict(originalPath); this.plugin.showNotice(`${originalPath} has been resolved.`, 'info'); }).open(); } onClose() { this.contentEl.empty(); } }
 class ConflictResolutionModal extends Modal { constructor(app: App, private localContent: string, private remoteContent: string, private onResolve: (chosenContent: string) => void) { super(app); } onOpen() { const { contentEl } = this; contentEl.addClass('obsidian-decentralized-diff-modal'); contentEl.createEl('h2', { text: 'Resolve Conflict' }); const dmp = new DiffMatchPatch(); const diff = dmp.diff_main(this.localContent, this.remoteContent); dmp.diff_cleanupSemantic(diff); const diffEl = contentEl.createDiv({ cls: 'obsidian-decentralized-diff-view' }); diffEl.innerHTML = dmp.diff_prettyHtml(diff); new Setting(contentEl) .addButton(btn => btn.setButtonText('Keep My Version').onClick(() => { this.onResolve(this.localContent); this.close(); })) .addButton(btn => btn.setButtonText('Use Their Version').setWarning().onClick(() => { this.onResolve(this.remoteContent); this.close(); })); } onClose() { this.contentEl.empty(); } }
 
+class RenameModal extends Modal {
+    constructor(app: App, private currentName: string, private onRename: (newName: string) => void) { super(app); }
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h2', { text: 'Rename Device' });
+        let name = this.currentName;
+        new Setting(contentEl).setName("New Name").addText(text => text.setValue(name).onChange(v => name = v));
+        new Setting(contentEl).addButton(btn => btn.setButtonText("Save").setCta().onClick(() => { this.onRename(name); this.close(); }));
+    }
+    onClose() { this.contentEl.empty(); }
+}
+
 class SyncProgressModal extends Modal {
     private container: HTMLElement;
     private refreshInterval: number | null = null;
@@ -2235,7 +2307,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         }
         this.clusterStatusEl.empty();
 
-        const createEntry = (peer: PeerInfo, type: 'self' | 'companion' | 'peer' | 'host') => {
+        const createEntry = (peer: PeerInfo, type: 'self' | 'companion' | 'peer' | 'host' | 'disconnected') => {
             const settingItem = new Setting(this.clusterStatusEl!)
                 .setName(peer.friendlyName + (type === 'self' ? ' (This Device)' : ''))
                 .setDesc(`ID: ${peer.deviceId}`);
@@ -2246,7 +2318,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     this.updateStatus();
                 }));
             }
-            if (type === 'peer' || type === 'companion') {
+            if (type === 'peer' || type === 'companion' || type === 'disconnected') {
                 const conn = this.plugin.connections.get(peer.deviceId);
                 if (conn && conn.open) {
                     settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => {
@@ -2254,8 +2326,42 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                         this.plugin.showNotice(`Disconnecting from ${peer.friendlyName}`, 'info');
                         setTimeout(() => this.updateStatus(), 100);
                     }));
+                    // Connected Actions: Kick, Rename, Ping
+                    settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Kick Device').onClick(() => {
+                        this.plugin.broadcastData({ type: 'cluster-kick', targetDeviceId: peer.deviceId });
+                        if (this.plugin.connections.has(peer.deviceId)) this.plugin.connections.get(peer.deviceId)?.close();
+                    }));
+                    settingItem.addExtraButton(btn => btn.setIcon('pencil').setTooltip('Rename Device').onClick(() => {
+                        new RenameModal(this.app, peer.friendlyName, (newName) => {
+                            this.plugin.broadcastData({ type: 'cluster-rename', targetDeviceId: peer.deviceId, newName });
+                            peer.friendlyName = newName;
+                            this.plugin.saveKnownPeers();
+                            this.updateStatus();
+                        }).open();
+                    }));
+                    settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
+                        this.plugin.manualPingStart.set(peer.deviceId, Date.now());
+                        conn.send({ type: 'ping' });
+                    }));
                 } else {
-                    settingItem.setDesc(settingItem.descEl.textContent + ' (Connecting...)');
+                    settingItem.setDesc(settingItem.descEl.textContent + ' (Disconnected)');
+                    settingItem.nameEl.style.color = 'var(--text-muted)';
+                    
+                    // Disconnected Actions: Reconnect, Forget
+                    settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
+                        if (this.plugin.peer && !this.plugin.peer.disconnected) {
+                            this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`);
+                            const newConn = this.plugin.peer.connect(peer.deviceId);
+                            this.plugin.setupConnection(newConn);
+                        } else {
+                            this.plugin.showNotice("Cannot reconnect: Your sync is offline.", 'error');
+                        }
+                    }));
+                    settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(() => {
+                        this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
+                        this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
+                        this.plugin.saveKnownPeers();
+                    }));
                 }
             } else if (type === 'host') {
                 settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => {
@@ -2285,7 +2391,8 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         }
         this.plugin.clusterPeers.forEach(peer => {
             if (peer.deviceId !== companionId) {
-                createEntry(peer, 'peer');
+                const isConnected = this.plugin.connections.has(peer.deviceId) && this.plugin.connections.get(peer.deviceId)?.open;
+                createEntry(peer, isConnected ? 'peer' : 'disconnected');
             }
         });
 
