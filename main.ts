@@ -51,6 +51,13 @@ interface TransferStatus {
     chunkSize?: number;
 }
 
+interface FailedSync {
+    path: string;
+    peerId: string | null;
+    timestamp: number;
+    type: 'file-update' | 'file-delete';
+}
+
 type SyncData =
     | HandshakePayload | ClusterGossipPayload | CompanionPairPayload | AckPayload
     | FileUpdatePayload | FileDeletePayload | FileRenamePayload
@@ -564,6 +571,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private statePath: string;
     public manualPingStart: Map<string, number> = new Map();
     private debouncedSaveState: () => void;
+    private failedSyncs: FailedSync[] = [];
 
     async onload() {
         if (Platform.isMobile) {
@@ -601,6 +609,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.initializeConnectionManager();
         this.startHeartbeat();
         this.registerInterval(window.setInterval(() => this.cleanupPendingChunks(), 60000));
+        this.registerInterval(window.setInterval(() => this.retryFailedSyncs(), 60000));
         await this.loadState();
     }
 
@@ -626,6 +635,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                     this.updateStatus();
                 }
+                if (state.failedSyncs) {
+                    this.failedSyncs = state.failedSyncs;
+                }
             } catch (e) {
                 console.error("Failed to load state", e);
             }
@@ -634,7 +646,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async saveState() {
         const state = {
-            activeTransfers: Array.from(this.activeTransfers.values())
+            activeTransfers: Array.from(this.activeTransfers.values()),
+            failedSyncs: this.failedSyncs
         };
         await this.app.vault.adapter.write(this.statePath, JSON.stringify(state, null, 2));
     }
@@ -866,6 +879,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             } else if (item) {
                 this.showNotice(`File transfer failed permanently for ${(item.data as any).path || 'an item'}.`, 'error', 8000);
                 if (this.isSyncing) this.abortSync("Transfer failed permanently.");
+                
+                if (item.data.type === 'file-update' || item.data.type === 'file-delete') {
+                    this.failedSyncs.push({
+                        path: item.data.path,
+                        peerId: item.peerId,
+                        timestamp: Date.now(),
+                        type: item.data.type
+                    });
+                    this.debouncedSaveState();
+                }
             }
         } finally {
             if (transferId && !isPaused) {
@@ -878,6 +901,36 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.debouncedSaveState();
             }
             this.updateStatus();
+        }
+    }
+
+    async retryFailedSyncs() {
+        if (this.failedSyncs.length === 0) return;
+        if (!this.hasPeers()) return;
+
+        const now = Date.now();
+        // Retry items older than 30 seconds to avoid immediate loops
+        const toRetry = this.failedSyncs.filter(f => now - f.timestamp > 30000);
+        if (toRetry.length === 0) return;
+
+        this.failedSyncs = this.failedSyncs.filter(f => now - f.timestamp <= 30000);
+        this.debouncedSaveState();
+
+        this.log(`Retrying ${toRetry.length} failed syncs...`);
+        
+        for (const fail of toRetry) {
+            if (fail.type === 'file-update') {
+                const file = this.app.vault.getAbstractFileByPath(fail.path);
+                if (file instanceof TFile) {
+                    this.sendFileUpdate(file, fail.peerId || undefined);
+                }
+            } else if (fail.type === 'file-delete') {
+                 if (!this.app.vault.getAbstractFileByPath(fail.path)) {
+                     const payload: FileDeletePayload = { type: 'file-delete', path: fail.path, transferId: this.generateTransferId(fail.path) };
+                     if (fail.peerId) this.sendData(fail.peerId, payload);
+                     else this.broadcastData(payload);
+                 }
+            }
         }
     }
 
