@@ -558,7 +558,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private syncQueue: { peerId: string | null, data: SyncData, retries: number }[] = [];
     private activeQueueTransfers: number = 0;
-    private pendingAcks: Map<string, () => void> = new Map();
+    private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
     private currentConcurrency = 4;
     private currentChunkSize = 64 * 1024;
@@ -716,6 +716,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.isSyncing = false;
         this.syncQueue = [];
         this.activeTransfers.clear();
+        this.pendingAcks.forEach(ack => ack.reject(new Error(reason)));
         this.pendingAcks.clear();
         this.showNotice(`Sync aborted: ${reason}`, 'error');
         this.updateStatus();
@@ -800,10 +801,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     if (this.directIpClient) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
                             const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
-                            this.pendingAcks.set(transferId!, () => {
-                                clearTimeout(timeout);
-                                resolve();
-                            });
+                            this.pendingAcks.set(transferId!, {
+                                resolve: () => { clearTimeout(timeout); resolve(); },
+                                reject: (e) => { clearTimeout(timeout); reject(e); },
+                                peerId: 'direct-ip-host'
+                            }); 
                         });
                         await this.sendFileInChunks('direct-ip-host', fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!);
                         await ackPromise;
@@ -811,9 +813,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     } else if (this.directIpServer) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
                             const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
-                            this.pendingAcks.set(transferId!, () => {
-                                clearTimeout(timeout);
-                                resolve();
+                            this.pendingAcks.set(transferId!, {
+                                resolve: () => { clearTimeout(timeout); resolve(); },
+                                reject: (e) => { clearTimeout(timeout); reject(e); },
+                                peerId: 'direct-ip-client'
                             });
                         });
                         // PeerId is just a placeholder here as the server broadcasts to the queue
@@ -825,9 +828,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     if (peerId) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
                             const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 30000);
-                            this.pendingAcks.set(transferId!, () => {
-                                clearTimeout(timeout);
-                                resolve();
+                            this.pendingAcks.set(transferId!, {
+                                resolve: () => { clearTimeout(timeout); resolve(); },
+                                reject: (e) => { clearTimeout(timeout); reject(e); },
+                                peerId: peerId!
                             });
                         });
 
@@ -840,7 +844,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (data.type === 'file-update' && peerId) {
                     const ackPromise = new Promise<void>((resolve, reject) => {
                         const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 15000);
-                        this.pendingAcks.set(transferId!, () => { clearTimeout(timeout); resolve(); });
+                        this.pendingAcks.set(transferId!, {
+                            resolve: () => { clearTimeout(timeout); resolve(); },
+                            reject: (e) => { clearTimeout(timeout); reject(e); },
+                            peerId: peerId!
+                        });
                     });
 
                     if (this.getConnectionMode() === 'direct-ip') {
@@ -896,7 +904,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (transferId && !isPaused) {
                 this.reportTransferResult(success);
                 if (this.pendingAcks.has(transferId)) {
-                    this.pendingAcks.get(transferId)!();
+                    this.pendingAcks.get(transferId)!.resolve();
                     this.pendingAcks.delete(transferId);
                 }
                 this.activeTransfers.delete(transferId);
@@ -1055,8 +1063,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.updateStatus();
 
             if (this.pendingAcks.size > 0) {
-                this.log(`Connection to peer ${peerId} lost during transfer. Aborting relevant transfers.`);
-                this.pendingAcks.forEach((resolver) => resolver());
+                for (const [id, ack] of this.pendingAcks.entries()) {
+                    if (ack.peerId === peerId) {
+                        ack.reject(new Error("Connection closed"));
+                        this.pendingAcks.delete(id);
+                    }
+                }
             }
             this.log(`Peer disconnected: ${peerId}`);
             if (peerId === this.settings.companionPeerId) {
@@ -1082,7 +1094,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const content = await this.app.vault.readBinary(file);
                 const ackPromise = new Promise<void>((resolve, reject) => {
                     const timeout = setTimeout(() => reject(new Error(`Transfer ${t.id} timed out`)), 60000);
-                    this.pendingAcks.set(t.id, () => { clearTimeout(timeout); resolve(); });
+                    this.pendingAcks.set(t.id, {
+                        resolve: () => { clearTimeout(timeout); resolve(); },
+                        reject: (e) => { clearTimeout(timeout); reject(e); },
+                        peerId: peerId
+                    });
                 });
 
                 try {
@@ -1096,7 +1112,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     else this.log(`Resumed transfer ${t.id} failed:`, e);
                 } finally {
                     if (this.pendingAcks.has(t.id)) {
-                        this.pendingAcks.get(t.id)!();
+                        this.pendingAcks.get(t.id)!.resolve();
                         this.pendingAcks.delete(t.id);
                     }
                 }
@@ -1133,7 +1149,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'ack':
                 if (this.pendingAcks.has(data.transferId)) {
                     this.log(`Ack received for ${data.transferId}.`);
-                    this.pendingAcks.get(data.transferId)!();
+                    this.pendingAcks.get(data.transferId)!.resolve();
                     this.pendingAcks.delete(data.transferId);
                 }
                 break;
@@ -1285,7 +1301,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             conn = this.connections.get(peerId);
             if (!conn?.open) {
                 this.log(`No open connection to ${peerId} to send chunks. Aborting transfer.`);
-                this.pendingAcks.get(transferId)?.();
+                this.pendingAcks.get(transferId)?.reject(new Error("Connection closed"));
                 return;
             }
         }
@@ -1323,6 +1339,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         
         for (let i = startIndex; i < totalChunks; i++) {
+            if (!this.activeTransfers.has(transferId)) {
+                throw new Error("Transfer cancelled or timed out");
+            }
             if (!isDirectIp && !conn!.open) {
                 this.log(`Connection to ${peerId} closed mid-transfer. Pausing.`);
                 const t = this.activeTransfers.get(transferId);
@@ -1498,6 +1517,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
             if (data.mtime < existingFile.stat.mtime - this.settings.mtimeTolerance) {
                 this.log(`Ignoring update (local is newer): ${data.path}`);
+                return;
+            }
+
+            if (existingFile.stat.mtime > data.mtime + this.settings.mtimeTolerance) {
+                this.log(`File ${data.path} changed locally during processing. Aborting update.`);
                 return;
             }
 
