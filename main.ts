@@ -1018,6 +1018,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private handlePeerError(err: any) {
         console.error("PeerJS Error:", err);
+        
+        // Ignore missing peers. Do not tear down the entire sync network.
+        if (err.type === 'peer-unavailable') {
+            this.log("A requested peer is currently offline or unavailable.");
+            return;
+        }
+
         this.peer?.destroy();
         this.peer = null;
         this.connections.forEach(conn => conn.close());
@@ -1027,7 +1034,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let userMessage = 'Connection Failed';
         switch(err.type) {
             case 'network': userMessage = 'Network Error. Check internet connection.'; break;
-            case 'peer-unavailable': userMessage = 'Peer not found.'; break;
             case 'server-error': userMessage = 'Server Error. Try again later.'; break;
             case 'disconnected': userMessage = 'Disconnected from server.'; break;
         }
