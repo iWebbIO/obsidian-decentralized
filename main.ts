@@ -559,8 +559,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private activeQueueTransfers: number = 0;
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
-    private currentConcurrency = 4;
-    private currentChunkSize = 64 * 1024;
+    private currentConcurrency = 8;
+    private currentChunkSize = 256 * 1024;
     private successfulTransfersSinceLastIncrease = 0;
     private peerInitRetryTimeout: number | null = null;
     private peerInitAttempts = 0;
@@ -735,7 +735,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (success) {
             this.successfulTransfersSinceLastIncrease++;
             if (this.successfulTransfersSinceLastIncrease >= this.currentConcurrency) {
-                if (this.currentConcurrency < 20) {
+                if (this.currentConcurrency < 32) {
                     this.currentConcurrency++;
                     this.log(`Network stable. Increasing concurrency to ${this.currentConcurrency}`);
                 }
