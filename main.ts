@@ -379,7 +379,6 @@ class DirectIpServer {
             let totalSize = 0;
             const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB Limit
 
-            req.on('data', (chunk: any) => body += chunk.toString());
             req.on('data', (chunk: any) => {
                 totalSize += chunk.length;
                 if (totalSize > MAX_BODY_SIZE) {
@@ -491,7 +490,7 @@ class DirectIpClient {
             this.plugin.updateStatus('⚠️ Host Unreachable');
         }
         
-        this.pollTimeout = window.setTimeout(() => this.poll(), 2000);
+        this.pollTimeout = window.setTimeout(() => this.poll(), 1000);
     }
 
     async send(data: SyncData) {
@@ -728,6 +727,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     public getChunkSize() { 
         if (this.settings.chunkSize) return this.settings.chunkSize;
+        if (this.getConnectionMode() === 'direct-ip') return 1024 * 1024 * 2; // 2MB for direct-ip
         return this.currentChunkSize; 
     }
 
@@ -800,7 +800,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (this.getConnectionMode() === 'direct-ip') {
                     if (this.directIpClient) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
-                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
+                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 120000);
                             this.pendingAcks.set(transferId!, {
                                 resolve: () => { clearTimeout(timeout); resolve(); },
                                 reject: (e) => { clearTimeout(timeout); reject(e); },
@@ -812,7 +812,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         this.log(`Chunked transfer ${transferId} (DirectIP) completed.`);
                     } else if (this.directIpServer) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
-                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
+                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 120000);
                             this.pendingAcks.set(transferId!, {
                                 resolve: () => { clearTimeout(timeout); resolve(); },
                                 reject: (e) => { clearTimeout(timeout); reject(e); },
@@ -827,7 +827,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } else {
                     if (peerId) {
                         const ackPromise = new Promise<void>((resolve, reject) => {
-                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 30000);
+                            const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 120000);
                             this.pendingAcks.set(transferId!, {
                                 resolve: () => { clearTimeout(timeout); resolve(); },
                                 reject: (e) => { clearTimeout(timeout); reject(e); },
@@ -1326,7 +1326,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const totalChunks = Math.ceil(fileContent.byteLength / chunkSize);
         this.log(`Sending file in ${totalChunks} chunks to ${peerId}: ${path} (ID: ${transferId})`);
         
-        const YIELD_THRESHOLD_MS = 15;
+        const YIELD_THRESHOLD_MS = 50;
         let lastYieldTime = Date.now();
         
         if (startIndex === 0) {
@@ -1358,7 +1358,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     if (this.directIpClient) await this.directIpClient.send(chunkPayload);
                     else if (this.directIpServer) this.directIpServer.send(chunkPayload);
                 }
-                else conn!.send(chunkPayload);
+                else {
+                    conn!.send(chunkPayload);
+                    
+                    if ((conn! as any).dataChannel && (conn! as any).dataChannel.bufferedAmount > 1024 * 1024 * 2) {
+                        await new Promise<void>(resolve => {
+                            const check = () => {
+                                if (!(conn! as any).dataChannel || (conn! as any).dataChannel.bufferedAmount <= 1024 * 1024) {
+                                    resolve();
+                                } else {
+                                    setTimeout(check, 5);
+                                }
+                            };
+                            check();
+                        });
+                    }
+                }
 
                 const transfer = this.activeTransfers.get(transferId);
                 if (transfer) {
@@ -1373,7 +1388,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     lastYieldTime = Date.now();
                 }
                 
-                if (i % 20 === 0) this.debouncedSaveState();
+                if (i % 50 === 0) this.debouncedSaveState();
             } catch (e) {
                 this.log(`Error sending chunk ${i} for ${path}. Aborting.`, e);
                 throw e;
