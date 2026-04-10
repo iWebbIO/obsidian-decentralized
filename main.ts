@@ -59,6 +59,13 @@ interface FailedSync {
     reason?: string;
 }
 
+export interface SyncStatusState {
+    text: string;
+    icon: string;
+    spin?: boolean;
+    state: 'loading' | 'success' | 'error' | 'neutral';
+}
+
 type SyncData =
     | HandshakePayload | ClusterGossipPayload | CompanionPairPayload | AckPayload
     | FileUpdatePayload | FileDeletePayload | FileRenamePayload
@@ -487,7 +494,7 @@ class DirectIpClient {
             }
         } catch (e) {
             this.plugin.log('Direct IP Poll Error:', e);
-            this.plugin.updateStatus('⚠️ Host Unreachable');
+            this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
         }
         
         this.pollTimeout = window.setTimeout(() => this.poll(), 1000);
@@ -521,7 +528,7 @@ class DirectIpClient {
         } catch (e) {
             this.plugin.showNotice('Failed to send data to host.', 'error');
             this.plugin.log('Direct IP Push Error:', e);
-            this.plugin.updateStatus('⚠️ Host Unreachable');
+            this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
         }
     }
 
@@ -975,7 +982,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.peer && !this.peer.destroyed) { if (onOpen && !this.peer.disconnected) { onOpen(this.peer.id); } return; }
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.peer?.destroy();
-        this.updateStatus("🔌 Connecting...");
+        this.updateStatus({ text: 'Connecting...', icon: 'plug', spin: true, state: 'loading' });
 
         let peerOptions: PeerJSOption = {};
         if (this.settings.useCustomPeerServer) { peerOptions = { ...this.settings.customPeerServerConfig }; }
@@ -1005,7 +1012,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         this.peer.on('connection', (conn) => { this.log("Incoming PeerJS connection from:", conn.peer); this.setupConnection(conn); });
         this.peer.on('error', (err) => { clearTimeout(connectionTimeout); this.handlePeerError(err); });
-        this.peer.on('disconnected', () => { this.showNotice('Sync network disconnected. Attempting to reconnect...', 'info'); this.updateStatus("🔌 Reconnecting..."); });
+        this.peer.on('disconnected', () => { this.showNotice('Sync network disconnected. Attempting to reconnect...', 'info'); this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' }); });
         this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'info'); this.handlePeerError(new Error("Peer closed.")); });
     }
 
@@ -1024,7 +1031,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'server-error': userMessage = 'Server Error. Try again later.'; break;
             case 'disconnected': userMessage = 'Disconnected from server.'; break;
         }
-        this.updateStatus(`⚠️ Error: ${userMessage}`);
+        this.updateStatus({ text: `Error: ${userMessage}`, icon: 'alert-triangle', state: 'error' });
     
         this.peerInitAttempts++;
         const backoff = Math.min(30000, this.peerInitAttempts * 2000);
@@ -1032,7 +1039,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.peerInitRetryTimeout = window.setTimeout(() => {
-            this.updateStatus(`🔌 Retrying connection...`);
+            this.updateStatus({ text: 'Retrying connection...', icon: 'refresh-cw', spin: true, state: 'loading' });
             this.initializePeer();
         }, backoff);
     }
@@ -1189,7 +1196,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     handleHandshake(data: HandshakePayload, conn: DataConnection) {
         if (this.joinPin && data.pin !== this.joinPin) { this.showNotice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 'error', 10000); conn.close(); return; }
         if (this.joinPin) this.joinPin = null; 
-        this.showNotice(`🤝 Connected to ${data.peerInfo.friendlyName}`, 'info', 4000);
+        this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'info', 4000);
         this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
         this.saveKnownPeers();
@@ -1213,7 +1220,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleCompanionPair(data: CompanionPairPayload) {
         this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
-        this.showNotice(`✅ Paired with ${data.peerInfo.friendlyName} as a companion device.`, 'info', 4000);
+        this.showNotice(`Paired with ${data.peerInfo.friendlyName} as a companion device.`, 'info', 4000);
         this.tryToConnectToCompanion();
     }
 
@@ -1608,7 +1615,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async requestFullSyncFromPeer(peerId: string) { if (this.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } const conn = this.connections.get(peerId); if (!conn) { this.showNotice("Peer not found.", 'error'); return; } this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); this.isSyncing = true; this.updateStatus(); const localManifest = await this.buildVaultManifest(); this.log(`Sending sync request with ${localManifest.length} items.`); this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest }); }
     async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { if (this.isSyncing) { this.showNotice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`, 'verbose'); return; } this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); this.isSyncing = true; this.updateStatus(); const remoteManifest = data.manifest; const localManifest = await this.buildVaultManifest(); const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); const localIndex = new Map(localManifest.map(item => [item.path, item])); const filesInitiatorMustSend: string[] = []; const filesReceiverWillSend: string[] = []; localIndex.forEach((localItem, path) => { const remoteItem = remoteIndex.get(path); if (!remoteItem) { filesReceiverWillSend.push(path); } else if (localItem.type === 'file' && remoteItem.type === 'file') { if (localItem.mtime > remoteItem.mtime + this.settings.mtimeTolerance) { filesReceiverWillSend.push(path); } } }); remoteIndex.forEach((remoteItem, path) => { const localItem = localIndex.get(path); if (!localItem) { filesInitiatorMustSend.push(path); } else if (remoteItem.type === 'file' && localItem.type === 'file') { if (remoteItem.mtime > localItem.mtime + this.settings.mtimeTolerance) { filesInitiatorMustSend.push(path); } } }); this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`); this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend }); for (const path of filesReceiverWillSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } this.log("Full sync: receiver has sent all its files. Sending complete message."); this.sendData(conn.peer, { type: 'full-sync-complete'}); this.isSyncing = false; this.updateStatus(); }
     async handleFullSyncResponse(data: FullSyncResponsePayload, conn: DataConnection) { if (!this.isSyncing) return; this.showNotice("Received sync plan. Exchanging files...", 'verbose'); this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, I will receive ${data.filesReceiverWillSend.length}`); for (const path of data.filesInitiatorMustSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } const dynamicTimeout = 30000 + (data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length) * 1000; if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = window.setTimeout(() => { if (this.isSyncing) { this.showNotice("Sync timed out. Some files may not have transferred.", 'error', 10000); this.handleFullSyncComplete(); } }, dynamicTimeout); }
-    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.updateStatus(); this.showNotice("✅ Full sync complete.", 'info'); }
+    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.updateStatus(); this.showNotice("Full sync complete.", 'info'); }
     
     private async buildVaultManifest(): Promise<VaultManifest> { const manifest: VaultManifest = []; const allFiles = this.app.vault.getAllLoadedFiles(); for (const file of allFiles) { if (this.isPathSyncable(file.path)) { if (file instanceof TFolder) { if (file.path !== '/') manifest.push({ type: 'folder', path: file.path }); } else if (file instanceof TFile) { manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size }); } } } return manifest; }
     private isPathSyncable(path: string): boolean {
@@ -1662,20 +1669,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const style = document.createElement('style');
         style.id = styleId;
         style.innerHTML = `
-            .od-loading-spinner {
-                border: 2px solid var(--background-modifier-border);
-                border-top: 2px solid var(--interactive-accent);
-                border-radius: 50%;
-                width: 14px;
-                height: 14px;
-                animation: od-spin 1s linear infinite;
-                display: inline-block;
-                vertical-align: middle;
-                margin-right: 6px;
+            .lucide-spin {
+                animation: od-spin 2s linear infinite;
             }
             @keyframes od-spin {
                 from { transform: rotate(0deg); }
                 to { transform: rotate(360deg); }
+            }
+            .od-status-icon {
+                display: inline-flex;
+                align-items: center;
+                margin-right: 6px;
+            }
+            .od-status-icon svg {
+                width: 14px;
+                height: 14px;
             }
             .od-status-icon {
                 display: inline-block;
@@ -1687,13 +1695,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 align-items: center;
                 line-height: 1;
             }
+            .od-status-container:hover {
+                color: var(--text-normal);
+            }
             body.od-hide-native-sync .status-bar-item.plugin-sync {
                 display: none !important;
             }
             .od-status-container.mod-clickable { cursor: pointer; }
-            .od-status-container.mod-clickable:hover { color: var(--text-accent); }
             .od-progress-modal .od-transfer-item { margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); }
-            .od-progress-modal .od-transfer-meta { display: flex; justify-content: space-between; font-size: 0.85em; color: var(--text-muted); margin-top: 4px; }
+            .od-progress-modal .od-transfer-meta { display: flex; justify-content: space-between; font-size: 0.85em; color: var(--text-muted); margin-top: 6px; }
+            .od-progress-modal progress { width: 100%; height: 6px; border-radius: var(--radius-s); overflow: hidden; border: none; background: var(--background-modifier-border); margin-top: 8px; }
+            .od-progress-modal progress::-webkit-progress-bar { background: var(--background-modifier-border); }
+            .od-progress-modal progress::-webkit-progress-value { background: var(--interactive-accent); transition: width 0.2s ease; }
+            .od-transfer-icon { display: inline-flex; align-items: center; vertical-align: middle; color: var(--text-muted); }
+            .od-transfer-icon svg { width: 14px; height: 14px; }
             
             .od-editable-name-container {
                 display: inline-flex;
@@ -1701,7 +1716,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 gap: 8px;
                 padding: 4px 8px;
                 border: 1px solid transparent;
-                border-radius: 4px;
+                border-radius: var(--radius-s);
                 cursor: pointer;
                 transition: all 0.2s ease;
             }
@@ -1711,75 +1726,64 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             .od-editable-name-icon { color: var(--text-muted); opacity: 0.5; display: flex; }
             .od-editable-name-container:hover .od-editable-name-icon { opacity: 1; }
-            .od-editable-name-input { margin: 0; height: 28px; }
-            .od-editable-name-submit { color: var(--interactive-success); cursor: pointer; display: flex; padding: 4px; }
-            .od-editable-name-submit:hover { background-color: var(--background-modifier-hover); border-radius: 4px; }
+            .od-editable-name-input { margin: 0; height: 28px; background: var(--background-modifier-form-field); border: 1px solid var(--background-modifier-border-focus); border-radius: var(--radius-s); color: var(--text-normal); }
+            .od-editable-name-submit { color: var(--interactive-success); cursor: pointer; display: flex; padding: 4px; border-radius: var(--radius-s); transition: background-color 0.15s; }
+            .od-editable-name-submit:hover { background-color: var(--background-modifier-hover); }
             .od-setting-item-name-wrapper { display: flex; align-items: center; }
         `;
         document.head.appendChild(style);
     }
 
-    public calculateStatusText(): string {
-        if (this.isSyncing) { return "⚙️ Full Syncing..."; }
+    public calculateStatus(): SyncStatusState {
+        if (this.isSyncing) return { text: "Full Syncing...", icon: "refresh-cw", spin: true, state: 'loading' };
         if (this.activeTransfers.size > 0) {
             const count = Array.from(this.activeTransfers.values()).filter(t => t.status === 'active').length;
-            if (count === 0 && this.activeTransfers.size > 0) return "⏸️ Transfers Paused";
-            return `⏫ Syncing ${count} file${count > 1 ? 's' : ''}...`;
+            if (count === 0 && this.activeTransfers.size > 0) return { text: "Transfers Paused", icon: "pause-circle", state: 'neutral' };
+            return { text: `Syncing ${count} file${count > 1 ? 's' : ''}...`, icon: "arrow-up-down", spin: false, state: 'loading' };
         }
         if (this.activeQueueTransfers > 0 || this.syncQueue.length > 0) {
             const queueSize = this.syncQueue.length + this.activeQueueTransfers;
-            return `⏳ Syncing (${queueSize} item${queueSize > 1 ? 's' : ''})`;
+            return { text: `Syncing (${queueSize} item${queueSize > 1 ? 's' : ''})`, icon: "hourglass", state: 'loading' };
         }
         if (this.getConnectionMode() === 'direct-ip') {
-            if (this.directIpServer) return `📡 Host Mode`;
-            if (this.directIpClient) return `📲 Client Mode`;
-            return `🟡 Direct-IP mode`;
+            if (this.directIpServer) return { text: "Host Mode", icon: "server", state: 'success' };
+            if (this.directIpClient) return { text: "Client Mode", icon: "smartphone", state: 'success' };
+            return { text: "Direct-IP mode", icon: "network", state: 'neutral' };
         }
-        if (!this.peer || this.peer.disconnected) { return "🔴 Sync Offline"; }
-        if (!this.peer.id) { return "🔌 Connecting..."; }
+        if (!this.peer || this.peer.disconnected) return { text: "Sync Offline", icon: "wifi-off", state: 'error' };
+        if (!this.peer.id) return { text: "Connecting...", icon: "plug", spin: true, state: 'loading' };
         if (this.connections.size > 0) {
-            if (this.connections.size === 1) {
-                return "✅ Connected";
-            }
-            return `✅ Connected (${this.connections.size})`;
+            if (this.connections.size === 1) return { text: "Connected", icon: "check-circle", state: 'success' };
+            return { text: `Connected (${this.connections.size})`, icon: "users", state: 'success' };
         }
-        return "🟢 Online";
+        return { text: "Online", icon: "globe", state: 'neutral' };
     }
 
-    updateStatus(statusText?: string) {
+    updateStatus(customStatus?: SyncStatusState) {
         const now = Date.now();
         const isIdle = this.activeTransfers.size === 0 && this.activeQueueTransfers === 0 && this.syncQueue.length === 0;
-        if (!statusText && !isIdle && now - this.lastStatusUpdate < 200) return;
+        if (!customStatus && !isIdle && now - this.lastStatusUpdate < 200) return;
         this.lastStatusUpdate = now;
 
-        const currentStatus = statusText || this.calculateStatusText();
+        const status = customStatus || this.calculateStatus();
         this.statusBar.empty();
         const container = this.statusBar.createDiv({ cls: 'od-status-container' });
 
-        let state: 'loading' | 'success' | 'error' | 'neutral' = 'neutral';
-        
-        if (this.isSyncing || this.activeTransfers.size > 0 || this.activeQueueTransfers > 0 || currentStatus.includes('Connecting') || currentStatus.includes('Syncing')) {
-            state = 'loading';
-        } else if (currentStatus.includes('Offline') || currentStatus.includes('Error') || currentStatus.includes('Unreachable')) {
-            state = 'error';
-        } else if (currentStatus.includes('Online') || currentStatus.includes('Connected') || currentStatus.includes('Host') || currentStatus.includes('Client')) {
-            state = 'success';
-        }
-
-        if (state === 'loading') {
+        if (status.state === 'loading') {
             container.addClass('mod-clickable');
             container.onclick = () => new SyncProgressModal(this.app, this).open();
-            container.createDiv({ cls: 'od-loading-spinner' });
-        } else if (state === 'success') {
-            const icon = container.createDiv({ cls: 'od-status-icon' });
-            setIcon(icon, 'check');
-        } else if (state === 'error') {
-            const icon = container.createDiv({ cls: 'od-status-icon' });
-            setIcon(icon, 'alert-circle');
         }
 
-        const cleanText = currentStatus.replace(/^[\p{Emoji}\uFE0F\u200D]+\s*/u, '');
-        container.createSpan({ text: cleanText });
+        const iconEl = container.createDiv({ cls: 'od-status-icon' });
+        setIcon(iconEl, status.icon);
+        if (status.spin) iconEl.addClass('lucide-spin');
+
+        if (status.state === 'error') iconEl.style.color = 'var(--text-error)';
+        else if (status.state === 'success') iconEl.style.color = 'var(--text-success)';
+        else if (status.state === 'loading') iconEl.style.color = 'var(--interactive-accent)';
+        else iconEl.style.color = 'var(--text-muted)';
+
+        container.createSpan({ text: status.text });
     }
 }
 
@@ -1807,21 +1811,18 @@ class ConnectionModal extends Modal {
         style.id = styleId;
         style.innerHTML = `
             .od-dashboard-header { text-align: center; margin-bottom: 20px; font-weight: 600; color: var(--text-normal); }
-            .od-id-container { background: var(--background-primary-alt); padding: 15px; border-radius: 8px; user-select: all; font-family: var(--font-monospace); cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--background-modifier-border); transition: all 0.2s ease; }
-            .od-id-container:hover { border-color: var(--interactive-accent); box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+            .od-id-container { background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); user-select: all; font-family: var(--font-monospace); cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--background-modifier-border); transition: all 0.2s ease; }
+            .od-id-container:hover { border-color: var(--interactive-accent); box-shadow: 0 0 0 1px var(--interactive-accent); }
             .od-section-title { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; color: var(--text-muted); margin-top: 25px; margin-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 5px; }
             .od-peer-list { display: flex; flex-direction: column; gap: 8px; }
-            .od-peer-item { padding: 12px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: 6px; display: flex; align-items: center; justify-content: space-between; transition: background 0.1s; }
-            .od-peer-item:hover { background: var(--background-primary-alt); }
+            .od-peer-item { padding: 12px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); display: flex; align-items: center; justify-content: space-between; transition: background 0.1s; }
+            .od-peer-item:hover { background: var(--background-modifier-hover); }
             .od-peer-item .info { display: flex; flex-direction: column; }
             .od-peer-item .sub-text { font-size: 0.8em; color: var(--text-muted); margin-top: 2px; }
             .od-mode-switch { margin-top: 40px; text-align: center; font-size: 0.85em; color: var(--text-muted); cursor: pointer; text-decoration: none; opacity: 0.7; transition: opacity 0.2s; }
             .od-mode-switch:hover { opacity: 1; text-decoration: underline; }
             .od-input-row { display: flex; gap: 10px; margin-bottom: 5px; }
             .od-input-row input { flex-grow: 1; }
-
-            .od-companion-btn { background-color: #f1c40f !important; color: #000 !important; font-size: 12px !important; padding: 4px 12px !important; height: auto !important; box-shadow: none !important; border: none !important; margin-top: 5px; }
-            .od-companion-btn:hover { background-color: #f39c12 !important; }
             .od-right-align { display: flex; justify-content: flex-end; }
 
             .od-id-name { font-weight: bold; margin-bottom: 4px; }
@@ -1855,9 +1856,10 @@ class ConnectionModal extends Modal {
             .od-icon-button { padding: 4px; border-radius: 4px; color: var(--text-muted); display: flex; align-items: center; transition: color 0.2s; }
             .od-icon-button:hover { color: var(--text-normal); background-color: var(--background-modifier-hover); }
             
-            .od-qr-container { text-align: center; padding: 20px; background: white; border-radius: 8px; margin: 0 auto; max-width: 320px; }
-            .od-qr-text { word-break: break-all; font-family: var(--font-monospace); margin-top: 10px; color: black; }
-            #od-qr-reader { width: 100%; border-radius: 8px; overflow: hidden; }
+            .od-qr-container { text-align: center; padding: 20px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); margin: 0 auto; max-width: 320px; box-shadow: var(--shadow-s); }
+            .od-qr-text { word-break: break-all; font-family: var(--font-monospace); margin-top: 15px; color: var(--text-normal); }
+            .od-qr-image { border-radius: var(--radius-s); width: 100%; height: auto; }
+            #od-qr-reader { width: 100%; border-radius: var(--radius-m); overflow: hidden; border: 1px solid var(--background-modifier-border); }
         `;
         document.head.appendChild(style);
     }
@@ -1969,7 +1971,7 @@ class ConnectionModal extends Modal {
             }
         } else {
             const btnContainer = contentEl.createDiv({ cls: 'od-right-align' });
-            const pairBtn = btnContainer.createEl('button', { text: 'Set ID as Companion', cls: 'od-companion-btn' });
+            const pairBtn = btnContainer.createEl('button', { text: 'Set ID as Companion', cls: 'mod-cta' });
             pairBtn.onclick = async () => {
                 if (input.value.trim()) {
                     this.plugin.settings.companionPeerId = input.value.trim();
@@ -2082,8 +2084,8 @@ class QRCodeModal extends Modal {
         const container = contentEl.createDiv({ cls: 'od-qr-container' });
         try {
             const url = await QRCode.toDataURL(this.text, { width: 300, margin: 2 });
-            container.createEl('img', { attr: { src: url } });
-            container.createEl('p', { text: this.text, cls: 'od-qr-text' });
+            container.createEl('img', { attr: { src: url }, cls: 'od-qr-image' });
+            container.createDiv({ text: this.text, cls: 'od-qr-text' });
         } catch (e) {
             container.createEl('p', { text: 'Error generating QR code.' });
         }
@@ -2154,12 +2156,17 @@ class SyncProgressModal extends Modal {
             if (hasFailed) this.container.createEl('h4', { text: 'Active Transfers', attr: { style: 'margin-top: 0;' } });
             this.plugin.activeTransfers.forEach(transfer => {
                 const item = this.container.createDiv({ cls: 'od-transfer-item' });
-                const title = item.createDiv({ cls: 'od-transfer-title' });
-                title.createSpan({ text: (transfer.direction === 'upload' ? '⬆️ ' : '⬇️ ') + transfer.path, attr: { style: 'font-weight: bold;' } });
-                if (transfer.status === 'paused') title.createSpan({ text: ' (Paused)', attr: { style: 'color: var(--text-muted); font-size: 0.8em;' } });
-
+                const title = item.createDiv({ cls: 'od-transfer-title', attr: { style: 'display: flex; align-items: center; margin-bottom: 4px;' } });
+                
+                const iconSpan = title.createSpan({ cls: 'od-transfer-icon' });
+                setIcon(iconSpan, transfer.direction === 'upload' ? 'arrow-up-circle' : 'arrow-down-circle');
+                iconSpan.style.marginRight = '6px';
+                iconSpan.style.color = transfer.direction === 'upload' ? 'var(--text-success)' : 'var(--interactive-accent)';
+                
+                title.createSpan({ text: transfer.path, attr: { style: 'font-weight: 600;' } });
+                if (transfer.status === 'paused') title.createSpan({ text: ' (Paused)', attr: { style: 'color: var(--text-muted); font-size: 0.8em; margin-left: 6px;' } });
+                
                 const progress = item.createEl('progress', { attr: { value: transfer.processedChunks, max: transfer.totalChunks } });
-                progress.style.width = '100%';
 
                 const now = Date.now();
                 const elapsedSeconds = (now - transfer.startTime) / 1000;
@@ -2181,9 +2188,13 @@ class SyncProgressModal extends Modal {
             this.container.createEl('h4', { text: 'Pending Retries', attr: { style: hasActive ? 'margin-top: 20px;' : 'margin-top: 0;' } });
             this.plugin.failedSyncs.forEach(fail => {
                 const item = this.container.createDiv({ cls: 'od-transfer-item' });
-                const title = item.createDiv({ cls: 'od-transfer-title' });
-                const icon = fail.type === 'file-delete' ? '🗑️ ' : '⚠️ ';
-                title.createSpan({ text: icon + fail.path, attr: { style: 'font-weight: bold;' } });
+                const title = item.createDiv({ cls: 'od-transfer-title', attr: { style: 'display: flex; align-items: center; margin-bottom: 4px;' } });
+                
+                const iconSpan = title.createSpan({ cls: 'od-transfer-icon' });
+                setIcon(iconSpan, fail.type === 'file-delete' ? 'trash-2' : 'alert-circle');
+                iconSpan.style.marginRight = '6px';
+                iconSpan.style.color = 'var(--text-error)';
+                title.createSpan({ text: fail.path, attr: { style: 'font-weight: 600;' } });
 
                 const meta = item.createDiv({ cls: 'od-transfer-meta' });
                 const peerName = fail.peerId ? (this.plugin.clusterPeers.get(fail.peerId)?.friendlyName || fail.peerId) : 'Broadcast';
@@ -2476,7 +2487,12 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
     updateStatus() {
         if (this.statusTextEl) {
-            this.statusTextEl.setText(this.plugin.calculateStatusText());
+            const status = this.plugin.calculateStatus();
+            this.statusTextEl.empty();
+            const iconSpan = this.statusTextEl.createSpan({ cls: 'od-status-icon' });
+            setIcon(iconSpan, status.icon);
+            if (status.spin) iconSpan.addClass('lucide-spin');
+            this.statusTextEl.createSpan({ text: status.text });
         }
 
         if (!this.clusterStatusEl || !this.clusterStatusEl.isConnected) {
