@@ -1361,10 +1361,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 else {
                     conn!.send(chunkPayload);
                     
-                    if ((conn! as any).dataChannel && (conn! as any).dataChannel.bufferedAmount > 1024 * 1024 * 2) {
+                    if ((conn! as any).dataChannel && (conn! as any).dataChannel.bufferedAmount > 1024 * 1024 * 8) {
                         await new Promise<void>(resolve => {
                             const check = () => {
-                                if (!(conn! as any).dataChannel || (conn! as any).dataChannel.bufferedAmount <= 1024 * 1024) {
+                                if (!(conn! as any).dataChannel || (conn! as any).dataChannel.bufferedAmount <= 1024 * 1024 * 4) {
                                     resolve();
                                 } else {
                                     setTimeout(check, 5);
