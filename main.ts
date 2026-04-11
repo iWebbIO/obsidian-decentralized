@@ -1046,6 +1046,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log("DataConnection closed with:", peerId);
             this.connections.delete(peerId);
             this.lastHeard.delete(peerId);
+            this.manualPingStart.delete(peerId);
 
             for (const [id, transfer] of this.activeTransfers.entries()) {
                 if (transfer.peerId === peerId && transfer.direction === 'download') {
