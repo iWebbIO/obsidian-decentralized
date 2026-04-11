@@ -579,6 +579,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public manualPingStart: Map<string, number> = new Map();
     private debouncedSaveState: () => void;
     public failedSyncs: FailedSync[] = [];
+    private syncedHashes: Map<string, string> = new Map();
 
     async onload() {
         if (Platform.isMobile) {
@@ -1265,6 +1266,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.showNotice('Companion link forgotten.', 'info', 3000);
     }
 
+    private async getHash(buffer: ArrayBuffer | string): Promise<string> {
+        const data = typeof buffer === 'string' ? new TextEncoder().encode(buffer) : buffer;
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
     async sendFileUpdate(file: TFile, peerId?: string) {
         if (!this.isPathSyncable(file.path)) return;
         const isBinaryFile = this.isBinary(file.extension);
@@ -1274,6 +1282,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         try {
             let content: string | ArrayBuffer = isBinaryFile ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
             let encoding: 'utf8' | 'binary' | 'base64' = isBinaryFile ? 'binary' : 'utf8';
+
+            try {
+                const hash = await this.getHash(content);
+                if (this.syncedHashes.get(file.path) === hash) {
+                    this.log(`Ignoring echo event for ${file.path} (content unchanged)`);
+                    return;
+                }
+                this.syncedHashes.set(file.path, hash);
+            } catch(e) {}
 
             // Convert large strings to ArrayBuffer to ensure they get chunked
             if (typeof content === 'string' && content.length > this.getChunkSize()) {
@@ -1489,6 +1506,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async applyFileUpdate(data: FileUpdatePayload) {
         if (!this.isPathSyncable(data.path)) return;
+
+        try {
+            const hash = await this.getHash(data.content);
+            this.syncedHashes.set(data.path, hash);
+        } catch(e) {}
+
         const existingFile = this.app.vault.getAbstractFileByPath(data.path);
         if (!existingFile) {
             await this.handleNewFileCreation(data);
