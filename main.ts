@@ -91,7 +91,7 @@ interface ObsidianDecentralizedSettings {
     directIpHostPort: number;
     syncAllFileTypes: boolean;
     syncObsidianConfig: boolean;
-    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins' | 'attempt-auto-merge';
+    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins';
     includedFolders: string;
     excludedFolders: string;
     hideNativeSyncStatus: boolean;
@@ -1345,7 +1345,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (startIndex === 0) {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId };
             if (isDirectIp) {
-                if (this.directIpClient) await this.directIpClient.send(startPayload);
+                if (this.directIpClient) this.directIpClient.send(startPayload);
                 else if (this.directIpServer) this.directIpServer.send(startPayload);
             }
             else conn!.send(startPayload);
@@ -1355,7 +1355,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (!this.activeTransfers.has(transferId)) {
                 throw new Error("Transfer cancelled or timed out");
             }
-            if (!isDirectIp && !conn!.open) {
+            if (isDirectIp) {
+                const isHostOpen = this.directIpServer && this.directIpServer.isOpen;
+                const isClientOpen = this.directIpClient && this.directIpClient.isOpen;
+                if (!isHostOpen && !isClientOpen) {
+                    this.log(`Direct IP Connection closed mid-transfer. Pausing.`);
+                    const t = this.activeTransfers.get(transferId);
+                    if (t) { t.status = 'paused'; t.lastUpdate = Date.now(); }
+                    this.updateStatus();
+                    this.debouncedSaveState();
+                    throw new Error("Paused");
+                }
+            } else if (!conn!.open) {
                 this.log(`Connection to ${peerId} closed mid-transfer. Pausing.`);
                 const t = this.activeTransfers.get(transferId);
                 if (t) { t.status = 'paused'; t.lastUpdate = Date.now(); }
@@ -1368,7 +1379,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk };
                 
                 if (isDirectIp) {
-                    if (this.directIpClient) await this.directIpClient.send(chunkPayload);
+                    if (this.directIpClient) this.directIpClient.send(chunkPayload);
                     else if (this.directIpServer) this.directIpServer.send(chunkPayload);
                 }
                 else {
@@ -1596,11 +1607,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } else {
                     this.log(`Conflict resolved by 'last-write-wins' (local wins): ${data.path}`);
                 }
-                break;
-
-            case 'attempt-auto-merge':
-                this.log(`Auto-merge not supported without base revision, creating conflict file: ${data.path}`);
-                await this.createConflictFile(data);
                 break;
 
             case 'create-conflict-file':
@@ -2317,9 +2323,8 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             .addDropdown(dd => dd
                 .addOption('create-conflict-file', 'Create Conflict File (Safest)')
                 .addOption('last-write-wins', 'Last Write Wins (Newest file is kept)')
-                .addOption('attempt-auto-merge', 'Attempt Auto-Merge (For Markdown)')
                 .setValue(this.plugin.settings.conflictResolutionStrategy)
-                .onChange(async (value: 'create-conflict-file' | 'last-write-wins' | 'attempt-auto-merge') => {
+                .onChange(async (value: 'create-conflict-file' | 'last-write-wins') => {
                     this.plugin.settings.conflictResolutionStrategy = value;
                     await this.plugin.saveSettings();
                 }));
