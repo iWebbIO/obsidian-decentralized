@@ -1447,8 +1447,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const totalSize = transfer.chunks.reduce((sum, chunk) => sum + (chunk ? chunk.byteLength : 0), 0); 
             const reassembled = new Uint8Array(totalSize); 
             let offset = 0;
-            for (const chunk of transfer.chunks) { 
-                if (chunk) { reassembled.set(new Uint8Array(chunk), offset); offset += chunk.byteLength; }
+            for (let i = 0; i < transfer.chunks.length; i++) { 
+                const chunk = transfer.chunks[i];
+                if (chunk) { 
+                    reassembled.set(new Uint8Array(chunk), offset); 
+                    offset += chunk.byteLength; 
+                }
+                transfer.chunks[i] = null as any; // Free chunk memory immediately to prevent OOM crash
             }
             
             try {
@@ -1662,7 +1667,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             port: port
         }; 
     }
-    public startDirectIpHost() { if (Platform.isMobile) return; this.reinitializeConnectionManager(); const pin = Math.floor(1000 + Math.random() * 9000).toString().padStart(4, '0'); this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin); this.updateStatus(); return pin; }
+    public startDirectIpHost() { if (Platform.isMobile) return; this.reinitializeConnectionManager(); const pin = Array.from(window.crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join(''); this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin); this.updateStatus(); return pin; }
     public async connectToDirectIpHost(config: DirectIpConfig) { this.reinitializeConnectionManager(); this.directIpClient = new DirectIpClient(this, config); this.clusterPeers.set(config.host, { deviceId: config.host, friendlyName: `Host (${config.host})`, ip: config.host }); this.updateStatus(); }
     
     injectStatusBarStyles() {
@@ -2016,7 +2021,7 @@ class ConnectionModal extends Modal {
                     contentEl.empty();
                     contentEl.createEl('h2', { text: 'Hosting Active', cls: 'od-dashboard-header' });
                     contentEl.createDiv({ text: `IP: ${this.plugin.getLocalIp()}`, cls: 'od-ip-display' });
-                    contentEl.createDiv({ text: `PIN: ${pin}`, cls: 'od-pin-display' });
+                    contentEl.createDiv({ text: `Token: ${pin}`, cls: 'od-pin-display', attr: { style: 'font-size: 1.2em; word-break: break-all;' } });
                     contentEl.createEl('button', { text: 'Done', cls: 'od-full-width', attr: { style: 'margin-top: 20px;' } }).onclick = () => this.close();
                 }
             };
@@ -2058,7 +2063,7 @@ class ConnectionModal extends Modal {
         ipInput.value = this.plugin.settings.directIpHostAddress;
         if (Platform.isMobile) { ipInput.style.width = '100%'; ipInput.style.marginBottom = '10px'; }
         
-        const pinInput = container.createEl('input', { type: 'number', placeholder: 'PIN' });
+        const pinInput = container.createEl('input', { type: 'text', placeholder: 'Security Token' });
         if (Platform.isMobile) { pinInput.style.width = '100%'; pinInput.style.marginBottom = '10px'; }
 
         const connectBtn = container.createEl('button', { text: 'Connect', cls: 'mod-cta od-full-width' });
