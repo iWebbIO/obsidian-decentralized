@@ -315,9 +315,9 @@ class DesktopLANDiscovery implements ILANDiscovery {
 
 class DirectIpServer {
     private server: any | null = null;
-    private messageQueue: SyncData[] = [];
     private pin: string;
-    private readonly MAX_QUEUE_SIZE = 2000;
+    private pc: RTCPeerConnection | null = null;
+    private dc: RTCDataChannel | null = null;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
         if (Platform.isMobile) {
@@ -341,7 +341,7 @@ class DirectIpServer {
         });
     }
 
-    private handleRequest(req: any, res: any) {
+    private async handleRequest(req: any, res: any) {
         const CORS_HEADERS = {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -361,68 +361,41 @@ class DirectIpServer {
             return;
         }
 
-        if (req.url === '/poll' && req.method === 'GET') {
-            res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            const messagesToSend = this.messageQueue.splice(0, 200);
-            const messages = messagesToSend.map(msg => {
-                if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
-                    return {
-                        ...msg,
-                        content: arrayBufferToBase64(msg.content),
-                        encoding: 'base64'
-                    };
-                }
-                if (msg.type === 'file-chunk-data' && msg.data instanceof ArrayBuffer) {
-                    return {
-                        ...msg,
-                        data: arrayBufferToBase64(msg.data)
-                    };
-                }
-                return msg;
-            });
-            res.end(JSON.stringify(messages));
-        } else if (req.url === '/push' && req.method === 'POST') {
+        if (req.url === '/signaling' && req.method === 'POST') {
             let body = '';
-            let totalSize = 0;
-            const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB Limit
+            const MAX_BODY_SIZE = 10 * 1024 * 1024;
 
             req.on('data', (chunk: any) => {
-                totalSize += chunk.length;
-                if (totalSize > MAX_BODY_SIZE) {
-                    res.writeHead(413, CORS_HEADERS);
-                    res.end(JSON.stringify({ error: 'Payload too large' }));
-                    req.destroy();
-                    return;
-                }
                 body += chunk.toString();
+                if (body.length > MAX_BODY_SIZE) req.destroy();
             });
-            req.on('end', () => {
+            req.on('end', async () => {
                 try {
-                    let data: SyncData = JSON.parse(body);
-                    if (data.type === 'file-update' && data.encoding === 'base64' && typeof data.content === 'string') {
-                         data = {
-                            ...data,
-                            content: base64ToArrayBuffer(data.content),
-                            encoding: 'binary'
+                    const { offer } = JSON.parse(body);
+                    this.pc = new RTCPeerConnection({ iceServers: [] });
+                    
+                    this.pc.ondatachannel = (event) => {
+                        this.dc = event.channel;
+                        this.setupDataChannel(this.dc);
+                    };
+
+                    await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
+                    const answer = await this.pc.createAnswer();
+                    await this.pc.setLocalDescription(answer);
+
+                    await new Promise<void>(resolve => {
+                        if (this.pc!.iceGatheringState === 'complete') resolve();
+                        else this.pc!.onicegatheringstatechange = () => {
+                            if (this.pc!.iceGatheringState === 'complete') resolve();
                         };
-                    }
-                    if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
-                        (data as any).data = base64ToArrayBuffer((data as any).data);
-                    }
+                        setTimeout(resolve, 2000);
+                    });
 
-                    // Create a mock connection for Direct IP to handle ACKs
-                    const mockConn = {
-                        send: (msg: SyncData) => this.send(msg),
-                        peer: 'direct-ip-client',
-                        open: true,
-                    } as any;
-
-                    this.plugin.processIncomingData(data, mockConn);
-                    res.writeHead(200, CORS_HEADERS);
-                    res.end(JSON.stringify({ status: 'ok' }));
+                    res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ answer: this.pc.localDescription }));
                 } catch (e) {
                     res.writeHead(400, CORS_HEADERS);
-                    res.end(JSON.stringify({ error: 'Invalid data format' }));
+                    res.end(JSON.stringify({ error: 'Signaling failed' }));
                 }
             });
         } else {
@@ -431,23 +404,64 @@ class DirectIpServer {
         }
     }
 
+    private setupDataChannel(dc: RTCDataChannel) {
+        dc.binaryType = 'arraybuffer';
+        dc.onopen = () => {
+            this.plugin.log("Offline WebRTC Data Channel OPEN");
+            this.plugin.showNotice("Direct IP Mode Connected! (WebRTC)", 'info');
+            if (this.server) { this.server.close(); this.server = null; }
+            this.plugin.updateStatus();
+        };
+        dc.onmessage = (event) => {
+            try {
+                let msg: SyncData = JSON.parse(event.data as string);
+                if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
+                    msg = { ...msg, content: base64ToArrayBuffer(msg.content), encoding: 'binary' } as FileUpdatePayload;
+                }
+                if (msg.type === 'file-chunk-data' && typeof (msg as any).data === 'string') {
+                    (msg as any).data = base64ToArrayBuffer((msg as any).data);
+                }
+                const mockConn = { send: (data: SyncData) => this.send(data), peer: 'direct-ip-client', open: true } as any;
+                this.plugin.processIncomingData(msg, mockConn);
+            } catch (e) {
+                this.plugin.log("Data parsing error:", e);
+            }
+        };
+        dc.onclose = () => {
+            this.plugin.log("Offline WebRTC Data Channel CLOSED");
+            this.stop();
+        };
+    }
+
+    public get isOpen(): boolean { return this.dc?.readyState === 'open'; }
+
     send(data: SyncData) {
-        if (this.messageQueue.length >= this.MAX_QUEUE_SIZE) {
-            // Drop oldest messages if queue is full to prevent memory issues
-            this.messageQueue.splice(0, this.messageQueue.length - this.MAX_QUEUE_SIZE + 1);
+        if (this.isOpen) {
+            let payloadToSend = data as any;
+            if (data.type === 'file-update' && data.encoding === 'binary' && data.content instanceof ArrayBuffer) {
+                payloadToSend = { ...data, content: arrayBufferToBase64(data.content), encoding: 'base64' };
+            }
+            if (data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer) {
+                payloadToSend = { ...data, data: arrayBufferToBase64(data.data) };
+            }
+            try { this.dc!.send(JSON.stringify(payloadToSend)); } 
+            catch (e) { this.plugin.log("Failed to send RTC data:", e); }
         }
-        this.messageQueue.push(data);
     }
 
     stop() {
         this.server?.close();
-        this.server = null;
+        this.dc?.close();
+        this.pc?.close();
+        this.server = null; this.dc = null; this.pc = null;
         this.plugin.log("Direct IP Server stopped.");
+        this.plugin.updateStatus();
     }
 }
 
 class DirectIpClient {
-    private pollTimeout: number | null = null;
+    private pc: RTCPeerConnection | null = null;
+    private dc: RTCDataChannel | null = null;
     private baseUrl: string;
     private headers: Record<string, string>;
 
@@ -458,89 +472,97 @@ class DirectIpClient {
             'X-Device-Id': plugin.settings.deviceId,
             'X-Pin': config.pin,
         };
-        this.startPolling();
-        this.plugin.showNotice(`Connected to Direct IP Host at ${config.host}`, 'info', 3000);
+        this.connect();
+        this.plugin.showNotice(`Connecting to Host at ${config.host}...`, 'info');
     }
 
-    private async poll() {
+    private async connect() {
         try {
-            const response = await requestUrl({
-                url: `${this.baseUrl}/poll`,
-                method: 'GET',
-                headers: this.headers,
+            this.pc = new RTCPeerConnection({ iceServers: [] });
+            this.dc = this.pc.createDataChannel('sync-channel', { negotiated: false });
+            this.setupDataChannel(this.dc);
+
+            const offer = await this.pc.createOffer();
+            await this.pc.setLocalDescription(offer);
+
+            await new Promise<void>(resolve => {
+                if (this.pc!.iceGatheringState === 'complete') resolve();
+                else this.pc!.onicegatheringstatechange = () => {
+                    if (this.pc!.iceGatheringState === 'complete') resolve();
+                };
+                setTimeout(resolve, 2000);
             });
-            if (response.status === 200) {
-                const messages: SyncData[] = response.json;
-                for (let msg of messages) {
-                    if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
-                        msg = {
-                            ...msg,
-                            content: base64ToArrayBuffer(msg.content),
-                            encoding: 'binary'
-                        } as FileUpdatePayload;
-                    }
-                    if (msg.type === 'file-chunk-data' && typeof (msg as any).data === 'string') {
-                        (msg as any).data = base64ToArrayBuffer((msg as any).data);
-                    }
 
-                    const mockConn = {
-                        send: (data: SyncData) => this.send(data),
-                        peer: 'direct-ip-host',
-                        open: true
-                    } as any;
-
-                    this.plugin.processIncomingData(msg, mockConn);
-                }
-            }
-        } catch (e) {
-            this.plugin.log('Direct IP Poll Error:', e);
-            this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
-        }
-        
-        this.pollTimeout = window.setTimeout(() => this.poll(), 1000);
-    }
-
-    async send(data: SyncData) {
-        let payloadToSend = data;
-        
-        if (data.type === 'file-update' && data.encoding === 'binary' && data.content instanceof ArrayBuffer) {
-            payloadToSend = {
-                ...data,
-                content: arrayBufferToBase64(data.content),
-                encoding: 'base64'
-            };
-        }
-        
-        if (data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer) {
-            payloadToSend = {
-                ...data,
-                data: arrayBufferToBase64(data.data)
-            } as any;
-        }
-
-        try {
-            await requestUrl({
-                url: `${this.baseUrl}/push`,
+            const response = await requestUrl({
+                url: `${this.baseUrl}/signaling`,
                 method: 'POST',
                 headers: this.headers,
-                body: JSON.stringify(payloadToSend),
+                body: JSON.stringify({ offer: this.pc.localDescription })
             });
+
+            if (response.status === 200) {
+                const { answer } = response.json;
+                await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
+            } else {
+                this.plugin.showNotice('Connection rejected by host', 'error');
+                this.stop();
+            }
         } catch (e) {
-            this.plugin.showNotice('Failed to send data to host.', 'error');
-            this.plugin.log('Direct IP Push Error:', e);
+            this.plugin.log('Direct IP WebRTC Error:', e);
             this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
+            this.stop();
         }
     }
 
-    startPolling() {
-        if (this.pollTimeout) clearTimeout(this.pollTimeout);
-        this.poll();
+    private setupDataChannel(dc: RTCDataChannel) {
+        dc.binaryType = 'arraybuffer';
+        dc.onopen = () => {
+            this.plugin.log("Offline WebRTC Data Channel OPEN");
+            this.plugin.showNotice("Direct IP Mode Connected! (WebRTC)", 'info');
+            this.plugin.updateStatus();
+        };
+        dc.onmessage = (event) => {
+            try {
+                let msg: SyncData = JSON.parse(event.data as string);
+                if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
+                    msg = { ...msg, content: base64ToArrayBuffer(msg.content), encoding: 'binary' } as FileUpdatePayload;
+                }
+                if (msg.type === 'file-chunk-data' && typeof (msg as any).data === 'string') {
+                    (msg as any).data = base64ToArrayBuffer((msg as any).data);
+                }
+                const mockConn = { send: (data: SyncData) => this.send(data), peer: 'direct-ip-host', open: true } as any;
+                this.plugin.processIncomingData(msg, mockConn);
+            } catch (e) {
+                this.plugin.log("Data parsing error:", e);
+            }
+        };
+        dc.onclose = () => {
+            this.plugin.showNotice("Disconnected from Direct IP Host.", 'info');
+            this.stop();
+        };
+    }
+
+    public get isOpen(): boolean { return this.dc?.readyState === 'open'; }
+
+    send(data: SyncData) {
+        if (this.isOpen) {
+            let payloadToSend = data as any;
+            if (data.type === 'file-update' && data.encoding === 'binary' && data.content instanceof ArrayBuffer) {
+                payloadToSend = { ...data, content: arrayBufferToBase64(data.content), encoding: 'base64' };
+            }
+            if (data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer) {
+                payloadToSend = { ...data, data: arrayBufferToBase64(data.data) };
+            }
+            try { this.dc!.send(JSON.stringify(payloadToSend)); } 
+            catch (e) { this.plugin.log("Failed to send RTC data:", e); }
+        }
     }
 
     stop() {
-        if (this.pollTimeout) clearTimeout(this.pollTimeout);
-        this.pollTimeout = null;
-        this.plugin.showNotice("Disconnected from Direct IP Host.", 'info', 3000);
+        this.dc?.close();
+        this.pc?.close();
+        this.dc = null; this.pc = null;
+        this.plugin.updateStatus();
     }
 }
 
@@ -1345,7 +1367,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (startIndex === 0) {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId };
             if (isDirectIp) {
-                if (this.directIpClient) this.directIpClient.send(startPayload);
+                if (this.directIpClient) await this.directIpClient.send(startPayload);
                 else if (this.directIpServer) this.directIpServer.send(startPayload);
             }
             else conn!.send(startPayload);
@@ -1355,18 +1377,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (!this.activeTransfers.has(transferId)) {
                 throw new Error("Transfer cancelled or timed out");
             }
-            if (isDirectIp) {
-                const isHostOpen = this.directIpServer && this.directIpServer.isOpen;
-                const isClientOpen = this.directIpClient && this.directIpClient.isOpen;
-                if (!isHostOpen && !isClientOpen) {
-                    this.log(`Direct IP Connection closed mid-transfer. Pausing.`);
-                    const t = this.activeTransfers.get(transferId);
-                    if (t) { t.status = 'paused'; t.lastUpdate = Date.now(); }
-                    this.updateStatus();
-                    this.debouncedSaveState();
-                    throw new Error("Paused");
-                }
-            } else if (!conn!.open) {
+            if (!isDirectIp && !conn!.open) {
                 this.log(`Connection to ${peerId} closed mid-transfer. Pausing.`);
                 const t = this.activeTransfers.get(transferId);
                 if (t) { t.status = 'paused'; t.lastUpdate = Date.now(); }
@@ -1379,7 +1390,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk };
                 
                 if (isDirectIp) {
-                    if (this.directIpClient) this.directIpClient.send(chunkPayload);
+                    if (this.directIpClient) await this.directIpClient.send(chunkPayload);
                     else if (this.directIpServer) this.directIpServer.send(chunkPayload);
                 }
                 else {
