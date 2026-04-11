@@ -1752,9 +1752,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             return { text: `Syncing (${queueSize} item${queueSize > 1 ? 's' : ''})`, icon: "hourglass", state: 'loading' };
         }
         if (this.getConnectionMode() === 'direct-ip') {
-            if (this.directIpServer) return { text: "Host Mode", icon: "server", state: 'success' };
-            if (this.directIpClient) return { text: "Client Mode", icon: "smartphone", state: 'success' };
-            return { text: "Direct-IP mode", icon: "network", state: 'neutral' };
+            const isAuto = this.settings.syncMode === 'auto';
+            if (this.directIpServer) return { text: isAuto ? "Hosting Offline" : "Host Mode", icon: "server", state: 'success' };
+            if (this.directIpClient) return { text: isAuto ? "Connected Offline" : "Client Mode", icon: "smartphone", state: 'success' };
+            return { text: isAuto ? "Offline Mode" : "Direct-IP mode", icon: "network", state: 'neutral' };
         }
         if (!this.peer || this.peer.disconnected) return { text: "Sync Offline", icon: "wifi-off", state: 'error' };
         if (!this.peer.id) return { text: "Connecting...", icon: "plug", spin: true, state: 'loading' };
@@ -1873,13 +1874,14 @@ class ConnectionModal extends Modal {
     renderDashboard() {
         const { contentEl } = this;
         contentEl.empty();
+        const isAuto = this.plugin.settings.syncMode === 'auto';
 
         if (this.plugin.settings.connectionMode === 'direct-ip') {
             this.renderDirectIpDashboard();
             return;
         }
 
-        contentEl.createEl('h2', { text: 'Connection Manager', cls: 'od-dashboard-header' });
+        contentEl.createEl('h2', { text: isAuto ? 'Connect Devices' : 'Connection Manager', cls: 'od-dashboard-header' });
 
         // 1. My Identity
         const myInfo = this.plugin.getMyPeerInfo();
@@ -1908,7 +1910,7 @@ class ConnectionModal extends Modal {
 
         // 2. LAN Discovery
         if (!Platform.isMobile) {
-            contentEl.createDiv({ cls: 'od-section-title', text: 'Nearby Devices (LAN)' });
+            contentEl.createDiv({ cls: 'od-section-title', text: isAuto ? 'Discovered on Local Network' : 'Nearby Devices (LAN)' });
             const lanList = contentEl.createDiv({ cls: 'od-peer-list' });
             const renderLanList = () => {
                 lanList.empty();
@@ -1938,9 +1940,9 @@ class ConnectionModal extends Modal {
         }
 
         // 3. Manual Connection
-        contentEl.createDiv({ cls: 'od-section-title', text: 'Manual Connection' });
+        contentEl.createDiv({ cls: 'od-section-title', text: isAuto ? 'Connect using Device ID' : 'Manual Connection' });
         const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
-        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter Peer ID' });
+        const input = inputRow.createEl('input', { type: 'text', placeholder: isAuto ? 'Enter Device ID' : 'Enter Peer ID' });
         
         const scanBtn = inputRow.createEl('button', { cls: 'clickable-icon', attr: { 'aria-label': 'Scan QR Code' } });
         setIcon(scanBtn, 'qr-code');
@@ -1962,7 +1964,7 @@ class ConnectionModal extends Modal {
         // 4. Companion
         const companionId = this.plugin.settings.companionPeerId;
         if (companionId) {
-            contentEl.createDiv({ cls: 'od-section-title', text: 'Saved Companion' });
+            contentEl.createDiv({ cls: 'od-section-title', text: isAuto ? 'Companion Device (Auto-Connect)' : 'Saved Companion' });
             const item = contentEl.createDiv({ cls: 'od-peer-item' });
             const info = item.createDiv({ cls: 'info' });
             const peerInfo = this.plugin.clusterPeers.get(companionId);
@@ -1992,7 +1994,7 @@ class ConnectionModal extends Modal {
 
         // Footer
         const footer = contentEl.createDiv({ cls: 'od-mode-switch' });
-        footer.setText("Switch to Direct IP Mode (Offline)");
+        footer.setText(isAuto ? "Advanced: Completely Offline Mode (Direct IP)" : "Switch to Direct IP Mode (Offline)");
         footer.onclick = async () => {
             this.plugin.settings.connectionMode = 'direct-ip';
             await this.plugin.saveSettings();
@@ -2003,13 +2005,14 @@ class ConnectionModal extends Modal {
 
     renderDirectIpDashboard() {
         const { contentEl } = this;
-        contentEl.createEl('h2', { text: 'Direct IP (Offline)', cls: 'od-dashboard-header' });
+        const isAuto = this.plugin.settings.syncMode === 'auto';
+        contentEl.createEl('h2', { text: isAuto ? 'Completely Offline Mode' : 'Direct IP (Offline)', cls: 'od-dashboard-header' });
         
         const container = contentEl.createDiv({ cls: 'od-direct-ip-wrapper' });
 
-        container.createDiv({ cls: 'od-section-title', text: 'Host Mode' });
+        container.createDiv({ cls: 'od-section-title', text: isAuto ? 'Step 1: Host a Network (On your main device)' : 'Host Mode' });
         if (!Platform.isMobile) {
-            const hostBtn = container.createEl('button', { text: 'Start Hosting', cls: 'mod-cta od-full-width' });
+            const hostBtn = container.createEl('button', { text: isAuto ? 'Start Offline Network' : 'Start Hosting', cls: 'mod-cta od-full-width' });
             hostBtn.onclick = () => {
                 const pin = this.plugin.startDirectIpHost();
                 if (pin) {
@@ -2025,7 +2028,7 @@ class ConnectionModal extends Modal {
         }
 
         if (!Platform.isMobile) {
-            container.createDiv({ cls: 'od-section-title', text: 'Discovered Hosts' });
+            container.createDiv({ cls: 'od-section-title', text: isAuto ? 'Discovered Networks' : 'Discovered Hosts' });
             const lanList = container.createDiv({ cls: 'od-peer-list' });
             const renderLanList = () => {
                 lanList.empty();
@@ -2053,8 +2056,8 @@ class ConnectionModal extends Modal {
             renderLanList();
         }
 
-        container.createDiv({ cls: 'od-section-title', text: 'Client Mode' });
-        const ipInput = container.createEl('input', { type: 'text', placeholder: 'Host IP' });
+        container.createDiv({ cls: 'od-section-title', text: isAuto ? 'Step 2: Join a Network (On your other devices)' : 'Client Mode' });
+        const ipInput = container.createEl('input', { type: 'text', placeholder: isAuto ? 'Network IP Address' : 'Host IP' });
         ipInput.value = this.plugin.settings.directIpHostAddress;
         if (Platform.isMobile) { ipInput.style.width = '100%'; ipInput.style.marginBottom = '10px'; }
         
@@ -2072,7 +2075,7 @@ class ConnectionModal extends Modal {
         };
 
         const footer = contentEl.createDiv({ cls: 'od-mode-switch' });
-        footer.setText("Switch to Standard Mode (PeerJS)");
+        footer.setText(isAuto ? "Return to Standard Mode (Internet / Wi-Fi)" : "Switch to Standard Mode (PeerJS)");
         footer.onclick = async () => {
             this.plugin.settings.connectionMode = 'peerjs';
             await this.plugin.saveSettings();
@@ -2235,6 +2238,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         containerEl.empty();
         containerEl.createEl('h2', { text: 'Obsidian Decentralized' });
+        const isAuto = this.plugin.settings.syncMode === 'auto';
 
         const statusContainer = containerEl.createDiv();
         statusContainer.createEl('h3', { text: 'Live Status' });
@@ -2243,8 +2247,8 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         this.statusTextEl.style.marginBottom = '1em';
 
         new Setting(containerEl)
-            .setName('Mode')
-            .setDesc('Auto mode syncs all files. Manual mode allows configuration. Advanced mode unlocks all settings.')
+            .setName(isAuto ? 'Settings Profile' : 'Mode')
+            .setDesc(isAuto ? 'Auto mode is easiest and syncs everything safely. Manual lets you pick folders and behaviors. Advanced unlocks all technical settings.' : 'Auto mode syncs all files. Manual mode allows configuration. Advanced mode unlocks all settings.')
             .addDropdown(dd => dd
                 .addOption('auto', 'Auto (Recommended)')
                 .addOption('manual', 'Manual')
