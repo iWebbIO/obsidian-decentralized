@@ -551,6 +551,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     connections: Map<string, DataConnection> = new Map();
     clusterPeers: Map<string, PeerInfo> = new Map();
     lanDiscovery: ILANDiscovery;
+    private fileLocks: Map<string, Promise<void>> = new Map();
 
     private isSyncing: boolean = false;
     private ignoreEvents: Map<string, number> = new Map();
@@ -683,6 +684,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     public log(...args: any[]) { if (this.settings.verboseLogging) { console.log("Obsidian Decentralized:", ...args); } }
 
+    private async runLocked(path: string, callback: () => Promise<void>) {
+        const existingLock = this.fileLocks.get(path) || Promise.resolve();
+        const newLock = existingLock.then(async () => {
+            await callback();
+        }).catch(err => {
+            this.log(`Lock error for ${path}:`, err);
+        });
+        this.fileLocks.set(path, newLock);
+        return newLock;
+    }
+
     public showNotice(message: string, level: 'info' | 'verbose' | 'error' = 'info', timeout?: number) {
         if (level === 'error') {
             new Notice(message, timeout || 10000);
@@ -710,9 +722,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private generateTransferId(path: string): string { return `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
     private handleEvent(file: TAbstractFile) { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; if (!this.hasPeers()) return; if (!this.app.vault.getAbstractFileByPath(file.path)) { this.handleFileDelete(file); return; } this.debouncedHandleFileChange(file); }
-    private async handleFileChange(file: TAbstractFile) { this.log(`Processing debounced change for: ${file.path}`); if (file instanceof TFile) { this.sendFileUpdate(file); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-create', path: file.path, transferId: this.generateTransferId(file.path) }); } }
-    private handleFileDelete(file: TAbstractFile) { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; this.log(`Processing delete: ${file.path}`); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-delete', path: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-delete', path: file.path, transferId }); } }
-    private handleRenameEvent(file: TAbstractFile, oldPath: string) { if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; if (!this.hasPeers()) return; this.log(`Processing rename: ${oldPath} -> ${file.path}`); this.ignoreNextEventForPath(file.path); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId }); } }
+    private async handleFileChange(file: TAbstractFile) { await this.runLocked(file.path, async () => { this.log(`Processing debounced change for: ${file.path}`); if (file instanceof TFile) { await this.sendFileUpdate(file); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-create', path: file.path, transferId: this.generateTransferId(file.path) }); } }); }
+    private async handleFileDelete(file: TAbstractFile) { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; this.log(`Processing delete: ${file.path}`); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-delete', path: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-delete', path: file.path, transferId }); } }); }
+    private async handleRenameEvent(file: TAbstractFile, oldPath: string) { await this.runLocked(oldPath, async () => { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; if (!this.hasPeers()) return; this.log(`Processing rename: ${oldPath} -> ${file.path}`); this.ignoreNextEventForPath(file.path); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId }); } }); }); }
     
     broadcastData(data: SyncData) { this.addToQueue(null, data); }
     sendData(peerId: string, data: SyncData) { this.addToQueue(peerId, data); }
@@ -1507,19 +1519,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async applyFileUpdate(data: FileUpdatePayload) {
         if (!this.isPathSyncable(data.path)) return;
 
-        try {
-            const hash = await this.getHash(data.content);
-            this.syncedHashes.set(data.path, hash);
-        } catch(e) {}
+        await this.runLocked(data.path, async () => {
+            try {
+                const hash = await this.getHash(data.content);
+                this.syncedHashes.set(data.path, hash);
+            } catch(e) {}
 
-        const existingFile = this.app.vault.getAbstractFileByPath(data.path);
-        if (!existingFile) {
-            await this.handleNewFileCreation(data);
-        } else if (existingFile instanceof TFile) {
-            await this.handleFileModification(data, existingFile);
-        } else {
-            this.log(`Received file update for a path that is a folder: ${data.path}. Ignoring.`);
-        }
+            const existingFile = this.app.vault.getAbstractFileByPath(data.path);
+            if (!existingFile) {
+                await this.handleNewFileCreation(data);
+            } else if (existingFile instanceof TFile) {
+                await this.handleFileModification(data, existingFile);
+            } else {
+                this.log(`Received file update for a path that is a folder: ${data.path}. Ignoring.`);
+            }
+        });
     }
 
     private async handleNewFileCreation(data: FileUpdatePayload) {
