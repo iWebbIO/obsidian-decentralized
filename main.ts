@@ -2472,7 +2472,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.debounceDelay.toString())
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.debounceDelay = isNaN(num) ? 1500 : num;
+                    this.plugin.settings.debounceDelay = isNaN(num) ? DEFAULT_SETTINGS.debounceDelay : num;
                     this.plugin.updateDebounceDelay();
                     await this.plugin.saveSettings();
                 }));
@@ -2484,7 +2484,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.mtimeTolerance.toString())
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.mtimeTolerance = isNaN(num) ? 2500 : num;
+                    this.plugin.settings.mtimeTolerance = isNaN(num) ? DEFAULT_SETTINGS.mtimeTolerance : num;
                     await this.plugin.saveSettings();
                 }));
     }
