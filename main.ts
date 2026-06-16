@@ -121,8 +121,8 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     hideNativeSyncStatus: false,
     maximumConcurrentTransfers: null,
     chunkSize: null,
-    debounceDelay: 1500,
-    mtimeTolerance: 2500,
+    debounceDelay: 2000,
+    mtimeTolerance: 1500,
     knownPeers: [],
 };
 
@@ -1581,9 +1581,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log(`Applying update (remote is newer): ${data.path}`);
                 this.ignoreNextEventForPath(data.path);
                 if (data.encoding === 'binary' || data.encoding === 'base64') {
-                    await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer);
+                    await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
                 } else {
-                    await this.app.vault.modify(existingFile, data.content as string);
+                    await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
                 }
                 return;
             }
@@ -1634,9 +1634,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`);
                     this.ignoreNextEventForPath(data.path);
                     if (data.encoding === 'binary' || data.encoding === 'base64') {
-                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer);
+                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
                     } else {
-                        await this.app.vault.modify(existingFile, data.content as string);
+                        await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
                     }
                 } else {
                     this.log(`Conflict resolved by 'last-write-wins' (local wins): ${data.path}`);
