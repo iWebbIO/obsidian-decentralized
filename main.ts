@@ -57,6 +57,7 @@ interface FailedSync {
     timestamp: number;
     type: 'file-update' | 'file-delete';
     reason?: string;
+    retryCount: number;
 }
 
 export interface SyncStatusState {
@@ -100,11 +101,13 @@ interface ObsidianDecentralizedSettings {
     debounceDelay: number;
     mtimeTolerance: number;
     knownPeers: PeerInfo[];
+    requirePinForAllConnections: boolean;
+    fullSyncTimeoutMs: number;
 }
 const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     syncMode: 'auto',
     showToasts: false,
-    deviceId: `device-${Math.random().toString(36).slice(2, 10)}`,
+    deviceId: '',
     friendlyName: 'My New Device',
     companionPeerId: undefined,
     useCustomPeerServer: false,
@@ -124,10 +127,13 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     debounceDelay: 1500,
     mtimeTolerance: 2500,
     knownPeers: [],
+    requirePinForAllConnections: false,
+    fullSyncTimeoutMs: 900000,
 };
 
 interface ILANDiscovery {
     on(event: string, listener: (...args: any[]) => void): this;
+    off(event: string, listener: (...args: any[]) => void): this;
     startBroadcasting(peerInfo: PeerInfo): void;
     stopBroadcasting(): void;
     startListening(): void;
@@ -166,6 +172,7 @@ function formatBytes(bytes: number, decimals = 2) {
 
 class DummyLANDiscovery implements ILANDiscovery {
     on(event: string, listener: (...args: any[]) => void): this { return this; }
+    off(event: string, listener: (...args: any[]) => void): this { return this; }
     startBroadcasting(peerInfo: PeerInfo): void { }
     stopBroadcasting(): void { }
     startListening(): void { }
@@ -191,6 +198,11 @@ class DesktopLANDiscovery implements ILANDiscovery {
         return this;
     }
 
+    public off(event: string, listener: (...args: any[]) => void): this {
+        this._emitter.removeListener(event, listener);
+        return this;
+    }
+
     private emit(event: string, ...args: any[]): boolean {
         return this._emitter.emit(event, ...args);
     }
@@ -211,8 +223,6 @@ class DesktopLANDiscovery implements ILANDiscovery {
             try {
                 this.socket?.setMulticastTTL(128);
 
-                // Attempt to add membership on all IPv4 interfaces.
-                // This fixes discovery issues on devices with multiple interfaces (VPNs, VMs, etc).
                 const os = require('os');
                 const interfaces = os.networkInterfaces();
                 let membershipAdded = false;
@@ -315,7 +325,7 @@ class DesktopLANDiscovery implements ILANDiscovery {
 
 class DirectIpServer {
     private server: any | null = null;
-    private messageQueue: SyncData[] = [];
+    private clients: Map<string, { lastSeen: number, queue: SyncData[], bufferedAmount: number }> = new Map();
     private pin: string;
     private readonly MAX_QUEUE_SIZE = 2000;
 
@@ -341,6 +351,36 @@ class DirectIpServer {
         });
     }
 
+    getClients(): string[] {
+        const now = Date.now();
+        for (const [id, client] of this.clients.entries()) {
+            if (now - client.lastSeen > 10000) {
+                this.clients.delete(id);
+            }
+        }
+        return Array.from(this.clients.keys());
+    }
+
+    sendTo(peerId: string, data: SyncData) {
+        const client = this.clients.get(peerId);
+        if (client) {
+            if (client.queue.length >= this.MAX_QUEUE_SIZE) {
+                client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
+            }
+            client.queue.push(data);
+            client.bufferedAmount += JSON.stringify(data).length;
+        }
+    }
+
+    hasClient(peerId: string): boolean {
+        this.getClients();
+        return this.clients.has(peerId);
+    }
+
+    getBufferedAmount(peerId: string): number {
+        return this.clients.get(peerId)?.bufferedAmount || 0;
+    }
+
     private handleRequest(req: any, res: any) {
         const CORS_HEADERS = {
             'Access-Control-Allow-Origin': '*',
@@ -354,6 +394,7 @@ class DirectIpServer {
         }
 
         const pin = req.headers['x-pin'];
+        const deviceId = req.headers['x-device-id'] as string || 'unknown';
 
         if (pin !== this.pin) {
             res.writeHead(403, CORS_HEADERS);
@@ -361,9 +402,24 @@ class DirectIpServer {
             return;
         }
 
+        if (deviceId !== 'unknown') {
+            if (!this.clients.has(deviceId)) {
+                this.clients.set(deviceId, { lastSeen: Date.now(), queue: [], bufferedAmount: 0 });
+            } else {
+                this.clients.get(deviceId)!.lastSeen = Date.now();
+            }
+        }
+
         if (req.url === '/poll' && req.method === 'GET') {
             res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            const messagesToSend = this.messageQueue.splice(0, 200);
+            let messagesToSend: SyncData[] = [];
+            
+            if (deviceId !== 'unknown' && this.clients.has(deviceId)) {
+                const client = this.clients.get(deviceId)!;
+                messagesToSend = client.queue.splice(0, 200);
+                client.bufferedAmount = 0;
+            }
+
             const messages = messagesToSend.map(msg => {
                 if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
                     return {
@@ -385,10 +441,13 @@ class DirectIpServer {
             let body = '';
             let totalSize = 0;
             const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB Limit
+            let destroyed = false;
 
             req.on('data', (chunk: any) => {
+                if (destroyed) return;
                 totalSize += chunk.length;
                 if (totalSize > MAX_BODY_SIZE) {
+                    destroyed = true;
                     res.writeHead(413, CORS_HEADERS);
                     res.end(JSON.stringify({ error: 'Payload too large' }));
                     req.destroy();
@@ -397,6 +456,7 @@ class DirectIpServer {
                 body += chunk.toString();
             });
             req.on('end', () => {
+                if (destroyed) return;
                 try {
                     let data: SyncData = JSON.parse(body);
                     if (data.type === 'file-update' && data.encoding === 'base64' && typeof data.content === 'string') {
@@ -410,10 +470,9 @@ class DirectIpServer {
                         (data as any).data = base64ToArrayBuffer((data as any).data);
                     }
 
-                    // Create a mock connection for Direct IP to handle ACKs
                     const mockConn = {
-                        send: (msg: SyncData) => this.send(msg),
-                        peer: 'direct-ip-client',
+                        send: (msg: SyncData) => this.sendTo(deviceId, msg),
+                        peer: deviceId !== 'unknown' ? deviceId : 'direct-ip-client',
                         open: true,
                     } as any;
 
@@ -432,11 +491,13 @@ class DirectIpServer {
     }
 
     send(data: SyncData) {
-        if (this.messageQueue.length >= this.MAX_QUEUE_SIZE) {
-            // Drop oldest messages if queue is full to prevent memory issues
-            this.messageQueue.splice(0, this.messageQueue.length - this.MAX_QUEUE_SIZE + 1);
+        for (const client of this.clients.values()) {
+            if (client.queue.length >= this.MAX_QUEUE_SIZE) {
+                client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
+            }
+            client.queue.push(data);
+            client.bufferedAmount += JSON.stringify(data).length;
         }
-        this.messageQueue.push(data);
     }
 
     stop() {
@@ -447,9 +508,11 @@ class DirectIpServer {
 }
 
 class DirectIpClient {
+    public isOpen: boolean = false;
     private pollTimeout: number | null = null;
     private baseUrl: string;
     private headers: Record<string, string>;
+    private pendingBytes: number = 0;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, config: DirectIpConfig) {
         this.baseUrl = `http://${config.host}:${config.port}`;
@@ -461,6 +524,10 @@ class DirectIpClient {
         this.startPolling();
         this.plugin.showNotice(`Connected to Direct IP Host at ${config.host}`, 'info', 3000);
     }
+    
+    getBufferedAmount(): number {
+        return this.pendingBytes;
+    }
 
     private async poll() {
         try {
@@ -470,6 +537,7 @@ class DirectIpClient {
                 headers: this.headers,
             });
             if (response.status === 200) {
+                this.isOpen = true;
                 const messages: SyncData[] = response.json;
                 for (let msg of messages) {
                     if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
@@ -493,6 +561,7 @@ class DirectIpClient {
                 }
             }
         } catch (e) {
+            this.isOpen = false;
             this.plugin.log('Direct IP Poll Error:', e);
             this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
         }
@@ -518,17 +587,22 @@ class DirectIpClient {
             } as any;
         }
 
+        const bodyStr = JSON.stringify(payloadToSend);
+        this.pendingBytes += bodyStr.length;
+
         try {
             await requestUrl({
                 url: `${this.baseUrl}/push`,
                 method: 'POST',
                 headers: this.headers,
-                body: JSON.stringify(payloadToSend),
+                body: bodyStr,
             });
         } catch (e) {
             this.plugin.showNotice('Failed to send data to host.', 'error');
             this.plugin.log('Direct IP Push Error:', e);
             this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
+        } finally {
+            this.pendingBytes = Math.max(0, this.pendingBytes - bodyStr.length);
         }
     }
 
@@ -538,6 +612,7 @@ class DirectIpClient {
     }
 
     stop() {
+        this.isOpen = false;
         if (this.pollTimeout) clearTimeout(this.pollTimeout);
         this.pollTimeout = null;
         this.plugin.showNotice("Disconnected from Direct IP Host.", 'info', 3000);
@@ -580,7 +655,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public manualPingStart: Map<string, number> = new Map();
     private debouncedSaveState: () => void;
     public failedSyncs: FailedSync[] = [];
-    private syncedHashes: Map<string, string> = new Map();
+    private syncedHashes: Map<string, { hash: string, timestamp: number }> = new Map();
 
     async onload() {
         if (Platform.isMobile) {
@@ -639,7 +714,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const state = JSON.parse(stateStr);
                 if (state.activeTransfers) {
                     for (const t of state.activeTransfers) {
-                        // Restore as paused
                         this.activeTransfers.set(t.id, { ...t, status: 'paused' });
                     }
                     this.updateStatus();
@@ -662,6 +736,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     async loadSettings() { 
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); 
+        if (!this.settings.deviceId) {
+            this.settings.deviceId = `device-${Array.from(window.crypto.getRandomValues(new Uint8Array(4))).map(b => b.toString(16).padStart(2, '0')).join('')}`;
+            await this.saveData(this.settings);
+        }
         this.applyHideNativeSync(); 
         if (this.settings.knownPeers) {
             this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, p));
@@ -771,6 +849,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
+    extendFullSyncTimeout() {
+        if (this.isSyncing && this.fullSyncTimeout) {
+            clearTimeout(this.fullSyncTimeout);
+            this.fullSyncTimeout = window.setTimeout(() => {
+                if (this.isSyncing) {
+                    this.showNotice("Sync timed out due to inactivity.", 'error', 10000);
+                    this.handleFullSyncComplete();
+                }
+            }, this.settings.fullSyncTimeoutMs || 900000);
+        }
+    }
+
     private processQueue() {
         this.updateStatus();
         while (this.activeQueueTransfers < this.getConcurrencyLimit() && this.syncQueue.length > 0) {
@@ -794,7 +884,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             let { peerId, data } = item;
             transferId = (data as any).transferId;
 
-            // Handle broadcast splitting for file updates to ensure concurrency tracking and ACKs
             if (!peerId && data.type === 'file-update') {
                 let connectedPeers: string[] = [];
                 if (this.getConnectionMode() === 'direct-ip') {
@@ -805,14 +894,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
 
                 if (connectedPeers.length === 0) {
-                    success = true; // No peers to send to is not a failure
+                    success = true;
                     return;
                 }
                 
-                // Assign first peer to this task
                 peerId = connectedPeers[0];
                 
-                // Queue the rest with new transferIds
                 for (let i = 1; i < connectedPeers.length; i++) {
                     const newData = { ...data, transferId: this.generateTransferId((data as any).path) };
                     this.addToQueue(connectedPeers[i], newData);
@@ -882,32 +969,50 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (item && item.retries < 3) {
                 this.log(`Retrying transfer ${transferId} (Attempt ${item.retries + 1}/3)`);
                 this.syncQueue.push({ peerId: item.peerId, data: item.data, retries: item.retries + 1 });
-                // Add a small delay before processing the retry to let network stabilize
                 await new Promise(resolve => setTimeout(resolve, 1000));
             } else if (item) {
                 this.showNotice(`File transfer failed permanently for ${(item.data as any).path || 'an item'}.`, 'error', 8000);
                 if (this.isSyncing) this.abortSync("Transfer failed permanently.");
                 
                 if (item.data.type === 'file-update' || item.data.type === 'file-delete') {
-                    this.failedSyncs.push({
-                        path: item.data.path,
-                        peerId: item.peerId,
-                        timestamp: Date.now(),
-                        type: item.data.type,
-                        reason: e instanceof Error ? e.message : String(e)
-                    });
+                    const existing = this.failedSyncs.find(f => f.path === (item.data as any).path && f.peerId === item.peerId && f.type === item.data.type);
+                    if (!existing) {
+                        this.failedSyncs.push({
+                            path: (item.data as any).path,
+                            peerId: item.peerId,
+                            timestamp: Date.now(),
+                            type: item.data.type as any,
+                            reason: e instanceof Error ? e.message : String(e),
+                            retryCount: 0
+                        });
+                    } else {
+                        existing.timestamp = Date.now();
+                        existing.reason = e instanceof Error ? e.message : String(e);
+                    }
                     this.debouncedSaveState();
                 }
             }
         } finally {
             if (transferId && !isPaused) {
                 this.reportTransferResult(success);
+                
+                if (success) {
+                    const path = (item.data as any).path;
+                    if (path) {
+                        const failIndex = this.failedSyncs.findIndex(f => f.path === path && f.peerId === item.peerId && f.type === item.data.type);
+                        if (failIndex !== -1) {
+                            this.failedSyncs.splice(failIndex, 1);
+                        }
+                    }
+                }
+
                 if (this.pendingAcks.has(transferId)) {
                     this.pendingAcks.get(transferId)!.resolve();
                     this.pendingAcks.delete(transferId);
                 }
                 this.activeTransfers.delete(transferId);
                 this.debouncedSaveState();
+                this.extendFullSyncTimeout();
             }
             this.updateStatus();
         }
@@ -918,29 +1023,44 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.hasPeers()) return;
 
         const now = Date.now();
-        // Retry items older than 30 seconds to avoid immediate loops
-        const toRetry = this.failedSyncs.filter(f => now - f.timestamp > 30000);
-        if (toRetry.length === 0) return;
+        let changed = false;
 
-        this.failedSyncs = this.failedSyncs.filter(f => now - f.timestamp <= 30000);
-        this.debouncedSaveState();
+        for (let i = this.failedSyncs.length - 1; i >= 0; i--) {
+            const fail = this.failedSyncs[i];
+            const backoffMs = 30000 * Math.pow(2, fail.retryCount || 0);
 
-        this.log(`Retrying ${toRetry.length} failed syncs...`);
-        
-        for (const fail of toRetry) {
-            if (fail.type === 'file-update') {
-                const file = this.app.vault.getAbstractFileByPath(fail.path);
-                if (file instanceof TFile) {
-                    this.sendFileUpdate(file, fail.peerId || undefined);
+            if (now - fail.timestamp > backoffMs) {
+                if ((fail.retryCount || 0) >= 5) {
+                    this.failedSyncs.splice(i, 1);
+                    changed = true;
+                    continue;
                 }
-            } else if (fail.type === 'file-delete') {
-                 if (!this.app.vault.getAbstractFileByPath(fail.path)) {
-                     const payload: FileDeletePayload = { type: 'file-delete', path: fail.path, transferId: this.generateTransferId(fail.path) };
-                     if (fail.peerId) this.sendData(fail.peerId, payload);
-                     else this.broadcastData(payload);
-                 }
+
+                fail.retryCount = (fail.retryCount || 0) + 1;
+                fail.timestamp = now;
+                changed = true;
+
+                this.log(`Retrying failed sync: ${fail.path} (Attempt ${fail.retryCount})`);
+                
+                if (fail.type === 'file-update') {
+                    const file = this.app.vault.getAbstractFileByPath(fail.path);
+                    if (file instanceof TFile) {
+                        this.sendFileUpdate(file, fail.peerId || undefined);
+                    } else {
+                        this.failedSyncs.splice(i, 1);
+                    }
+                } else if (fail.type === 'file-delete') {
+                     if (!this.app.vault.getAbstractFileByPath(fail.path)) {
+                         const payload: FileDeletePayload = { type: 'file-delete', path: fail.path, transferId: this.generateTransferId(fail.path) };
+                         if (fail.peerId) this.sendData(fail.peerId, payload);
+                         else this.broadcastData(payload);
+                     } else {
+                         this.failedSyncs.splice(i, 1);
+                     }
+                }
             }
         }
+        if (changed) this.debouncedSaveState();
     }
 
     public reinitializeConnectionManager() {
@@ -1011,7 +1131,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private handlePeerError(err: any) {
         console.error("PeerJS Error:", err);
         
-        // Ignore missing peers. Do not tear down the entire sync network.
         if (err.type === 'peer-unavailable') {
             this.log("A requested peer is currently offline or unavailable.");
             return;
@@ -1183,7 +1302,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const rtt = Date.now() - start;
                     this.manualPingStart.delete(conn!.peer);
                     this.showNotice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`);
-                    new Notice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`);
                 }
                 break;
             case 'cluster-forget': this.handleClusterForget(data); break;
@@ -1193,8 +1311,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     handleHandshake(data: HandshakePayload, conn: DataConnection) {
-        if (this.joinPin && data.pin !== this.joinPin) { this.showNotice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 'error', 10000); conn.close(); return; }
-        if (this.joinPin) this.joinPin = null; 
+        if (this.joinPin && data.pin !== this.joinPin) { 
+            this.showNotice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 'error', 10000); 
+            conn.close(); 
+            return; 
+        }
+        if (this.joinPin && !this.settings.requirePinForAllConnections) { 
+            this.joinPin = null; 
+        } 
         this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'info', 4000);
         this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
@@ -1249,7 +1373,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     handleClusterKick(data: ClusterKickPayload) {
         if (data.targetDeviceId === this.settings.deviceId) {
             this.showNotice("You have been kicked from the cluster.", 'error');
-            // Optionally close all connections or just let the others close them
         } else if (this.connections.has(data.targetDeviceId)) {
             this.log(`Kicking device: ${data.targetDeviceId}`);
             this.connections.get(data.targetDeviceId)?.close();
@@ -1297,14 +1420,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
             try {
                 const hash = await this.getHash(content);
-                if (this.syncedHashes.get(file.path) === hash) {
+                if (this.syncedHashes.get(file.path)?.hash === hash) {
                     this.log(`Ignoring echo event for ${file.path} (content unchanged)`);
                     return;
                 }
-                this.syncedHashes.set(file.path, hash);
+                this.syncedHashes.set(file.path, { hash, timestamp: Date.now() });
             } catch(e) {}
 
-            // Convert large strings to ArrayBuffer to ensure they get chunked
             if (typeof content === 'string' && content.length > this.getChunkSize()) {
                 content = new TextEncoder().encode(content).buffer;
                 encoding = 'binary';
@@ -1391,7 +1513,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     if (this.directIpClient) this.directIpClient.send(chunkPayload);
                     else if (this.directIpServer) this.directIpServer.sendTo(peerId, chunkPayload);
 
-                    // Safely yield chunking to let WebRTC hardware buffer drain over Local IP
                     const getBuffer = () => this.directIpClient ? this.directIpClient.getBufferedAmount() : this.directIpServer!.getBufferedAmount(peerId);
                     if (getBuffer() > 1024 * 1024 * 8) {
                         await new Promise<void>(resolve => {
@@ -1483,7 +1604,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     reassembled.set(new Uint8Array(chunk), offset); 
                     offset += chunk.byteLength; 
                 }
-                transfer.chunks[i] = null as any; // Free chunk memory immediately to prevent OOM crash
+                transfer.chunks[i] = null as any; 
             }
             
             try {
@@ -1500,17 +1621,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let statusChanged = false;
 
         for (const [id, transfer] of this.pendingFileChunks.entries()) {
-            if (now - transfer.lastUpdated > 60000 * 5) { // 5 minutes TTL
+            if (now - transfer.lastUpdated > 60000 * 5) { 
                 this.log(`Cleaning up stale chunk transfer: ${id}`);
                 this.pendingFileChunks.delete(id);
             }
         }
         for (const [id, transfer] of this.activeTransfers.entries()) {
             if (transfer.status === 'paused') continue;
-            if (now - transfer.lastUpdate > 60000) { // 1 minute TTL for stalled UI
+            if (now - transfer.lastUpdate > 60000) { 
                 this.log(`Cleaning up stale active transfer: ${id}`);
                 this.activeTransfers.delete(id);
                 statusChanged = true;
+            }
+        }
+        const hashTTL = 5 * 60 * 1000; 
+        for (const [path, data] of this.syncedHashes.entries()) {
+            if (now - data.timestamp > hashTTL) {
+                this.syncedHashes.delete(path);
             }
         }
         if (statusChanged) this.updateStatus();
@@ -1522,7 +1649,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         await this.runLocked(data.path, async () => {
             try {
                 const hash = await this.getHash(data.content);
-                this.syncedHashes.set(data.path, hash);
+                this.syncedHashes.set(data.path, { hash, timestamp: Date.now() });
             } catch(e) {}
 
             const existingFile = this.app.vault.getAbstractFileByPath(data.path);
@@ -1603,7 +1730,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 : await this.app.vault.cachedRead(existingFile);
 
             const contentIsSame = (data.encoding === 'binary' || data.encoding === 'base64')
-                ? this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
+                ? await this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
                 : localContent === data.content;
 
             if (contentIsSame) {
@@ -1652,24 +1779,74 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); this.ignoreNextEventForPath(conflictPath); if (data.encoding === 'binary' || data.encoding === 'base64') { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
-    async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.delete(existingFile); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); this.showNotice(`Failed to delete file: ${data.path}`, 'error'); } } }
-    async applyFileRename(data: FileRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); if (fileToRename instanceof TFile) { try { this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.newPath); await this.app.vault.rename(fileToRename, data.newPath); } catch (e) { console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); this.showNotice(`Failed to rename file: ${data.oldPath}`, 'error'); } } }
-    async applyFolderCreate(data: FolderCreatePayload) { if (!this.isPathSyncable(data.path)) return; if (this.app.vault.getAbstractFileByPath(data.path)) return; this.log(`Creating folder: ${data.path}`); this.ignoreNextEventForPath(data.path); try { await this.app.vault.createFolder(data.path); } catch (e) { console.error(`Failed to create folder ${data.path}`, e); } }
-    async applyFolderDelete(data: FolderDeletePayload) { if (!this.isPathSyncable(data.path)) return; const folder = this.app.vault.getAbstractFileByPath(data.path); if (folder instanceof TFolder) { this.log(`Deleting folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); try { await this.app.vault.delete(folder, true); } catch (e) { console.error(`Failed to delete folder ${data.path}`, e); } } }
-    async applyFolderRename(data: FolderRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const folder = this.app.vault.getAbstractFileByPath(data.oldPath); if (folder instanceof TFolder) { this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.oldPath); this.ignoreNextEventForPath(data.newPath); try { await this.app.vault.rename(folder, data.newPath); } catch (e) { console.error(`Failed to rename folder ${data.oldPath}`, e); } } }
+    async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.delete(existingFile); } catch (e) { consoleerror(`Error deleting file: ${data.path}`, e); this.showNotice(`Failed to delete file: ${data.path}`, 'error'); } } }
+    async applyFileRename(data: FileRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); if (fileToRename instanceof TFile) { try { this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.newPath); await this.app.vault.rename(fileToRename, data.newPath); } catch (e) { consoleerror(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); this.showNotice(`Failed to rename file: ${data.oldPath}`, 'error'); } } }
+    async applyFolderCreate(data: FolderCreatePayload) { if (!this.isPathSyncable(data.path)) return; if (this.app.vault.getAbstractFileByPath(data.path)) return; this.log(`Creating folder: ${data.path}`); this.ignoreNextEventForPath(data.path); try { await this.app.vault.createFolder(data.path); } catch (e) { consoleerror(`Failed to create folder ${data.path}`, e); } }
+    async applyFolderDelete(data: FolderDeletePayload) { if (!this.isPathSyncable(data.path)) return; const folder = this.app.vault.getAbstractFileByPath(data.path); if (folder instanceof TFolder) { this.log(`Deleting folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); try { await this.app.vault.delete(folder, true); } catch (e) { consoleerror(`Failed to delete folder ${data.path}`, e); } } }
+    async applyFolderRename(data: FolderRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const folder = this.app.vault.getAbstractFileByPath(data.oldPath); if (folder instanceof TFolder) { this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.oldPath); this.ignoreNextEventForPath(data.newPath); try { await this.app.vault.rename(folder, data.newPath); } catch (e) { consoleerror(`Failed to rename folder ${data.oldPath}`, e); } } }
 
     async requestFullSyncFromPeer(peerId: string) { if (this.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } const conn = this.connections.get(peerId); if (!conn) { this.showNotice("Peer not found.", 'error'); return; } this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); this.isSyncing = true; this.updateStatus(); const localManifest = await this.buildVaultManifest(); this.log(`Sending sync request with ${localManifest.length} items.`); this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest }); }
-    async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { if (this.isSyncing) { this.showNotice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`, 'verbose'); return; } this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); this.isSyncing = true; this.updateStatus(); const remoteManifest = data.manifest; const localManifest = await this.buildVaultManifest(); const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); const localIndex = new Map(localManifest.map(item => [item.path, item])); const filesInitiatorMustSend: string[] = []; const filesReceiverWillSend: string[] = []; localIndex.forEach((localItem, path) => { const remoteItem = remoteIndex.get(path); if (!remoteItem) { filesReceiverWillSend.push(path); } else if (localItem.type === 'file' && remoteItem.type === 'file') { if (localItem.mtime > remoteItem.mtime + this.settings.mtimeTolerance) { filesReceiverWillSend.push(path); } } }); remoteIndex.forEach((remoteItem, path) => { const localItem = localIndex.get(path); if (!localItem) { filesInitiatorMustSend.push(path); } else if (remoteItem.type === 'file' && localItem.type === 'file') { if (remoteItem.mtime > localItem.mtime + this.settings.mtimeTolerance) { filesInitiatorMustSend.push(path); } } }); this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`); this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend }); for (const path of filesReceiverWillSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { while (this.syncQueue.length > 20) await new Promise(r => setTimeout(r, 100)); await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } this.log("Full sync: receiver has sent all its files. Sending complete message."); this.sendData(conn.peer, { type: 'full-sync-complete'}); this.isSyncing = false; this.updateStatus(); }
-    async handleFullSyncResponse(data: FullSyncResponsePayload, conn: DataConnection) { if (!this.isSyncing) return; this.showNotice("Received sync plan. Exchanging files...", 'verbose'); this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, I will receive ${data.filesReceiverWillSend.length}`); for (const path of data.filesInitiatorMustSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { while (this.syncQueue.length > 20) await new Promise(r => setTimeout(r, 100)); await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } const dynamicTimeout = 30000 + (data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length) * 1000; if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = window.setTimeout(() => { if (this.isSyncing) { this.showNotice("Sync timed out. Some files may not have transferred.", 'error', 10000); this.handleFullSyncComplete(); } }, dynamicTimeout); }
-    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.updateStatus(); this.showNotice("Full sync complete.", 'info'); }
+    async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { 
+        if (this.isSyncing) { 
+            this.showNotice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`, 'verbose'); 
+            return; 
+        } 
+        this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); 
+        this.isSyncing = true; 
+        this.updateStatus(); 
+        
+        try {
+            const remoteManifest = data.manifest; 
+            const localManifest = await this.buildVaultManifest(); 
+            const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); 
+            const localIndex = new Map(localManifest.map(item => [item.path, item])); 
+            const filesInitiatorMustSend: string[] = []; 
+            const filesReceiverWillSend: string[] = []; 
+            
+            localIndex.forEach((localItem, path) => { 
+                const remoteItem = remoteIndex.get(path); 
+                if (!remoteItem) { filesReceiverWillSend.push(path); } 
+                else if (localItem.type === 'file' && remoteItem.type === 'file') { 
+                    if (localItem.mtime > remoteItem.mtime + this.settings.mtimeTolerance) { filesReceiverWillSend.push(path); } 
+                } 
+            }); 
+            
+            remoteIndex.forEach((remoteItem, path) => { 
+                const localItem = localIndex.get(path); 
+                if (!localItem) { filesInitiatorMustSend.push(path); } 
+                else if (remoteItem.type === 'file' && localItem.type === 'file') { 
+                    if (remoteItem.mtime > localItem.mtime + this.settings.mtimeTolerance) { filesInitiatorMustSend.push(path); } 
+                } 
+            }); 
+            
+            this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`); 
+            this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend }); 
+            
+            for (const path of filesReceiverWillSend) { 
+                const item = this.app.vault.getAbstractFileByPath(path); 
+                if (item instanceof TFile) { 
+                    while (this.syncQueue.length > 20) await new Promise(r => setTimeout(r, 100)); 
+                    await this.sendFileUpdate(item, conn.peer); 
+                } else if (item instanceof TFolder) { 
+                    this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); 
+                } 
+            } 
+            
+            this.log("Full sync: receiver has sent all its files. Sending complete message."); 
+            this.sendData(conn.peer, { type: 'full-sync-complete'}); 
+        } finally {
+            this.isSyncing = false; 
+            this.updateStatus(); 
+        }
+    }
+    async handleFullSyncResponse(data: FullSyncResponsePayload, conn: DataConnection) { if (!this.isSyncing) return; this.showNotice("Received sync plan. Exchanging files...", 'verbose'); this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, I will receive ${data.filesReceiverWillSend.length}`); for (const path of data.filesInitiatorMustSend) { const item = this.app.vault.getAbstractFileByPath(path); if (item instanceof TFile) { while (this.syncQueue.length > 20) await new Promise(r => setTimeout(r, 100)); await this.sendFileUpdate(item, conn.peer); } else if (item instanceof TFolder) { this.sendData(conn.peer, { type: 'folder-create', path: path, transferId: this.generateTransferId(path) }); } } if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = window.setTimeout(() => { if (this.isSyncing) { this.showNotice("Sync timed out. Some files may not have transferred.", 'error', 10000); this.handleFullSyncComplete(); } }, this.settings.fullSyncTimeoutMs || 900000); }
+    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.syncedHashes.clear(); this.updateStatus(); this.showNotice("Full sync complete.", 'info'); }
     
     private async buildVaultManifest(): Promise<VaultManifest> { const manifest: VaultManifest = []; const allFiles = this.app.vault.getAllLoadedFiles(); for (const file of allFiles) { if (this.isPathSyncable(file.path)) { if (file instanceof TFolder) { if (file.path !== '/') manifest.push({ type: 'folder', path: file.path }); } else if (file instanceof TFile) { manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size }); } } } return manifest; }
     private isPathSyncable(path: string): boolean {
-        // 1. Check Exclusions (Global)
         const excluded = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
         if (excluded.length > 0 && excluded.some(p => path.startsWith(p))) { return false; }
 
-        // 2. Handle .obsidian folder
         if (path.startsWith('.obsidian/')) {
             if (this.settings.syncMode === 'auto') {
                 const safePaths = ['.obsidian/snippets/', '.obsidian/themes/', '.obsidian/appearance.json'];
@@ -1686,7 +1863,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return true;
     }
     public isBinary(extension: string): boolean { const textExtensions = ['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml']; return !textExtensions.includes((extension || '').toLowerCase()); }
-    private areArrayBuffersEqual(buf1: ArrayBuffer, buf2: ArrayBuffer): boolean { if (buf1.byteLength !== buf2.byteLength) return false; const view1 = new Uint8Array(buf1); const view2 = new Uint8Array(buf2); for (let i = 0; i < buf1.byteLength; i++) { if (view1[i] !== view2[i]) return false; } return true; }
+    private async areArrayBuffersEqual(buf1: ArrayBuffer, buf2: ArrayBuffer): Promise<boolean> { 
+        if (buf1.byteLength !== buf2.byteLength) return false; 
+        if (buf1.byteLength < 50 * 1024) {
+            const view1 = new Uint8Array(buf1); 
+            const view2 = new Uint8Array(buf2); 
+            for (let i = 0; i < buf1.byteLength; i++) { 
+                if (view1[i] !== view2[i]) return false; 
+            } 
+            return true; 
+        }
+        const hash1 = await this.getHash(buf1);
+        const hash2 = await this.getHash(buf2);
+        return hash1 === hash2;
+    }
     private shouldIgnoreEvent(path: string): boolean { const ignoreUntil = this.ignoreEvents.get(path); if (ignoreUntil && Date.now() < ignoreUntil) { return true; } this.ignoreEvents.delete(path); return false; }
     public ignoreNextEventForPath(path: string, durationMs = 2000) { this.ignoreEvents.set(path, Date.now() + durationMs); }
     getConflictPath(originalPath: string): string { const extension = originalPath.split('.').pop() || ''; const base = originalPath.substring(0, originalPath.lastIndexOf('.')); const date = new Date().toISOString().split('T')[0]; return `${base} (conflict on ${date}).${extension}`; }
@@ -1836,6 +2026,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
 class ConnectionModal extends Modal {
     private discoveredPeers: Map<string, PeerInfo> = new Map();
+    private discoverListener: ((p: PeerInfo) => void) | null = null;
+    private loseListener: ((p: PeerInfo) => void) | null = null;
 
     constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
 
@@ -1846,7 +2038,8 @@ class ConnectionModal extends Modal {
     }
 
     onClose() {
-        this.plugin.lanDiscovery.stop();
+        if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
+        if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
         this.contentEl.empty();
     }
 
@@ -1972,8 +2165,15 @@ class ConnectionModal extends Modal {
                     });
                 }
             };
-            this.plugin.lanDiscovery.on('discover', (p) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); });
-            this.plugin.lanDiscovery.on('lose', (p) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); });
+            
+            if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
+            if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
+
+            this.discoverListener = (p: PeerInfo) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); };
+            this.loseListener = (p: PeerInfo) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); };
+
+            this.plugin.lanDiscovery.on('discover', this.discoverListener);
+            this.plugin.lanDiscovery.on('lose', this.loseListener);
             this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
             this.plugin.lanDiscovery.startListening();
             renderLanList();
@@ -2089,8 +2289,15 @@ class ConnectionModal extends Modal {
                     });
                 }
             };
-            this.plugin.lanDiscovery.on('discover', (p) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); });
-            this.plugin.lanDiscovery.on('lose', (p) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); });
+            
+            if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
+            if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
+
+            this.discoverListener = (p: PeerInfo) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); };
+            this.loseListener = (p: PeerInfo) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); };
+
+            this.plugin.lanDiscovery.on('discover', this.discoverListener);
+            this.plugin.lanDiscovery.on('lose', this.loseListener);
             this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
             this.plugin.lanDiscovery.startListening();
             renderLanList();
@@ -2251,7 +2458,7 @@ class SyncProgressModal extends Modal {
                 meta.createSpan({ text: `To: ${peerName}` });
                 
                 const secondsAgo = Math.round((Date.now() - fail.timestamp) / 1000);
-                meta.createSpan({ text: `Failed ${secondsAgo}s ago` });
+                meta.createSpan({ text: `Failed ${secondsAgo}s ago (Attempt ${fail.retryCount || 0})` });
 
                 if (fail.reason) {
                     const reasonMeta = item.createDiv({ cls: 'od-transfer-meta' });
@@ -2442,6 +2649,27 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         containerEl.createEl('h4', { text: 'Advanced Settings' });
 
         new Setting(containerEl)
+            .setName("Require PIN for all connections")
+            .setDesc("If set, the join PIN is never cleared and must be provided by all incoming connections.")
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.requirePinForAllConnections)
+                .onChange(async (value) => {
+                    this.plugin.settings.requirePinForAllConnections = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Full Sync Timeout (ms)")
+            .setDesc("Maximum time to wait for a full sync operation without progress.")
+            .addText(text => text
+                .setValue(this.plugin.settings.fullSyncTimeoutMs?.toString() || "900000")
+                .onChange(async (value) => {
+                    const num = parseInt(value);
+                    this.plugin.settings.fullSyncTimeoutMs = isNaN(num) ? 900000 : num;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
             .setName("Max Concurrent Transfers")
             .setDesc("Maximum number of files to transfer at once. Leave empty for dynamic (auto-tuning).")
             .addText(text => text
@@ -2507,7 +2735,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         const switchToEdit = () => {
             this.isEditingName = true;
             wrapper.empty();
-            wrapper.removeClass('od-editable-name-container'); // Remove hover styles during edit
+            wrapper.removeClass('od-editable-name-container'); 
             wrapper.addClass('od-setting-item-name-wrapper');
 
             const inputEl = wrapper.createEl('input', { type: 'text', value: editValue });
@@ -2517,7 +2745,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 this.isEditingName = false;
                 const newName = inputEl.value.trim();
                 if (newName && newName !== editValue) onSave(newName);
-                else this.createEditableName(container, displayName, editValue, onSave); // Revert
+                else this.createEditableName(container, displayName, editValue, onSave); 
             };
 
             const submitBtn = wrapper.createSpan({ cls: 'od-editable-name-submit' });
@@ -2555,7 +2783,6 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             const settingItem = new Setting(this.clusterStatusEl!)
                 .setDesc(`ID: ${peer.deviceId}`);
 
-            // Use custom editable name for Self and Peers
             if (type === 'self') {
                 this.createEditableName(settingItem.nameEl, peer.friendlyName + ' (This Device)', peer.friendlyName, async (newName) => {
                     this.plugin.settings.friendlyName = newName;
@@ -2588,7 +2815,6 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                         this.plugin.showNotice(`Disconnecting from ${peer.friendlyName}`, 'info');
                         setTimeout(() => this.updateStatus(), 100);
                     }));
-                    // Connected Actions: Kick, Rename, Ping
                     settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Kick Device').onClick(() => {
                         this.plugin.broadcastData({ type: 'cluster-kick', targetDeviceId: peer.deviceId });
                         if (this.plugin.connections.has(peer.deviceId)) this.plugin.connections.get(peer.deviceId)?.close();
@@ -2601,7 +2827,6 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     settingItem.setDesc(settingItem.descEl.textContent + ' (Disconnected)');
                     settingItem.nameEl.style.color = 'var(--text-muted)';
                     
-                    // Disconnected Actions: Reconnect, Forget
                     settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
                         if (this.plugin.peer && !this.plugin.peer.disconnected) {
                             this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`);
