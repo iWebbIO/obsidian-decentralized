@@ -21,7 +21,8 @@ type HandshakePayload = { type: 'handshake'; peerInfo: PeerInfo; pin?: string; }
 type ClusterGossipPayload = { type: 'cluster-gossip'; peers: PeerInfo[]; };
 type CompanionPairPayload = { type: 'companion-pair'; peerInfo: PeerInfo; };
 type AckPayload = { type: 'ack', transferId: string };
-type FileUpdatePayload = BasePayload & { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary' | 'base64' };
+type NackPayload = { type: 'nack', transferId: string, reason: 'integrity-failure' | 'write-error' };
+type FileUpdatePayload = BasePayload & { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary' | 'base64'; fileHash?: string; };
 type FileDeletePayload = BasePayload & { type: 'file-delete'; path: string; };
 type FileRenamePayload = BasePayload & { type: 'file-rename'; oldPath: string; newPath: string; };
 type FolderCreatePayload = BasePayload & { type: 'folder-create', path: string; };
@@ -30,7 +31,7 @@ type FolderRenamePayload = BasePayload & { type: 'folder-rename', oldPath: strin
 type FullSyncRequestPayload = { type: 'request-full-sync', manifest: VaultManifest };
 type FullSyncResponsePayload = { type: 'response-full-sync'; filesReceiverWillSend: string[]; filesInitiatorMustSend: string[]; };
 type FullSyncCompletePayload = { type: 'full-sync-complete' };
-type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: number, totalChunks: number, transferId: string };
+type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: number, totalChunks: number, transferId: string, fileHash: string };
 type FileChunkDataPayload = { type: 'file-chunk-data', transferId: string, index: number, data: ArrayBuffer };
 type PingPayload = { type: 'ping' };
 type PongPayload = { type: 'pong' };
@@ -68,7 +69,7 @@ export interface SyncStatusState {
 }
 
 type SyncData =
-    | HandshakePayload | ClusterGossipPayload | CompanionPairPayload | AckPayload
+    | HandshakePayload | ClusterGossipPayload | CompanionPairPayload | AckPayload | NackPayload
     | FileUpdatePayload | FileDeletePayload | FileRenamePayload
     | FolderCreatePayload | FolderDeletePayload | FolderRenamePayload
     | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload
@@ -513,6 +514,8 @@ class DirectIpClient {
     private baseUrl: string;
     private headers: Record<string, string>;
     private pendingBytes: number = 0;
+    private pollInterval: number = 1000;
+    private consecutiveEmptyPolls: number = 0;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, config: DirectIpConfig) {
         this.baseUrl = `http://${config.host}:${config.port}`;
@@ -530,6 +533,7 @@ class DirectIpClient {
     }
 
     private async poll() {
+        let hasMessages = false;
         try {
             const response = await requestUrl({
                 url: `${this.baseUrl}/poll`,
@@ -539,6 +543,7 @@ class DirectIpClient {
             if (response.status === 200) {
                 this.isOpen = true;
                 const messages: SyncData[] = response.json;
+                if (messages && messages.length > 0) hasMessages = true;
                 for (let msg of messages) {
                     if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
                         msg = {
@@ -566,7 +571,17 @@ class DirectIpClient {
             this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
         }
         
-        this.pollTimeout = window.setTimeout(() => this.poll(), 1000);
+        if (hasMessages) {
+            this.consecutiveEmptyPolls = 0;
+            this.pollInterval = 100;
+        } else {
+            this.consecutiveEmptyPolls++;
+            if (this.consecutiveEmptyPolls > 3) {
+                this.pollInterval = Math.min(2000, Math.floor(this.pollInterval * 1.5));
+            }
+        }
+        
+        this.pollTimeout = window.setTimeout(() => this.poll(), Math.max(100, this.pollInterval));
     }
 
     async send(data: SyncData) {
@@ -635,7 +650,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public activeTransfers: Map<string, TransferStatus> = new Map();
     public joinPin: string | null = null;
     private companionConnectionInterval: number | null = null;
-    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, receivedCount: number, lastUpdated: number }> = new Map();
+    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, receivedCount: number, lastUpdated: number, fileHash: string }> = new Map();
     private fullSyncTimeout: number | null = null;
 
     private syncQueue: { peerId: string | null, data: SyncData, retries: number }[] = [];
@@ -643,7 +658,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
     private currentConcurrency = 8;
-    private currentChunkSize = 256 * 1024;
+    private currentChunkSize = 512 * 1024;
     private successfulTransfersSinceLastIncrease = 0;
     private peerInitRetryTimeout: number | null = null;
     private peerInitAttempts = 0;
@@ -965,7 +980,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 isPaused = true;
                 return;
             }
-            console.error(`Error processing queue item ${transferId}:`, e);
+            if (e instanceof Error && e.message.includes('IntegrityError')) {
+                this.log(`Integrity failure for transfer ${transferId}. Re-queueing.`);
+            } else {
+                console.error(`Error processing queue item ${transferId}:`, e);
+            }
             if (item && item.retries < 3) {
                 this.log(`Retrying transfer ${transferId} (Attempt ${item.retries + 1}/3)`);
                 this.syncQueue.push({ peerId: item.peerId, data: item.data, retries: item.retries + 1 });
@@ -1278,11 +1297,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.pendingAcks.delete(data.transferId);
                 }
                 break;
+            case 'nack':
+                if (this.pendingAcks.has(data.transferId)) {
+                    this.log(`Nack received for ${data.transferId} (Reason: ${data.reason}).`);
+                    this.pendingAcks.get(data.transferId)!.reject(new Error(`IntegrityError: ${data.reason}`));
+                    this.pendingAcks.delete(data.transferId);
+                }
+                break;
             case 'file-update': 
                 this.applyFileUpdate(data).then(() => {
                     if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
                 }).catch(e => {
                     this.log(`Failed to apply file update: ${data.path}`, e);
+                    if (conn && data.transferId) {
+                        const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
+                        conn.send({ type: 'nack', transferId: data.transferId, reason });
+                    }
                 }); 
                 break;
             case 'file-delete': this.applyFileDelete(data); break;
@@ -1418,8 +1448,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             let content: string | ArrayBuffer = isBinaryFile ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
             let encoding: 'utf8' | 'binary' | 'base64' = isBinaryFile ? 'binary' : 'utf8';
 
+            let hash = '';
             try {
-                const hash = await this.getHash(content);
+                hash = await this.getHash(content);
                 if (this.syncedHashes.get(file.path)?.hash === hash) {
                     this.log(`Ignoring echo event for ${file.path} (content unchanged)`);
                     return;
@@ -1432,7 +1463,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 encoding = 'binary';
             }
 
-            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding, transferId: this.generateTransferId(file.path) };
+            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding, transferId: this.generateTransferId(file.path), fileHash: hash };
             if (peerId) { this.sendData(peerId, payload); } else { this.broadcastData(payload); }
         } catch (e) { console.error(`Error reading file ${file.path} for sync:`, e); }
     }
@@ -1470,11 +1501,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const totalChunks = Math.ceil(fileContent.byteLength / chunkSize);
         this.log(`Sending file in ${totalChunks} chunks to ${peerId}: ${path} (ID: ${transferId})`);
         
-        const YIELD_THRESHOLD_MS = 50;
+        let fileHash = '';
+        try { fileHash = await this.getHash(fileContent); } catch(e) {}
+
+        const YIELD_THRESHOLD_MS = 100;
         let lastYieldTime = Date.now();
         
         if (startIndex === 0) {
-            const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId };
+            const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash };
             if (isDirectIp) {
                 if (this.directIpClient) this.directIpClient.send(startPayload);
                 else if (this.directIpServer) this.directIpServer.sendTo(peerId, startPayload);
@@ -1514,10 +1548,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     else if (this.directIpServer) this.directIpServer.sendTo(peerId, chunkPayload);
 
                     const getBuffer = () => this.directIpClient ? this.directIpClient.getBufferedAmount() : this.directIpServer!.getBufferedAmount(peerId);
-                    if (getBuffer() > 1024 * 1024 * 8) {
+                    if (getBuffer() > 1024 * 1024 * 16) {
                         await new Promise<void>(resolve => {
                             const check = () => {
-                                if (getBuffer() <= 1024 * 1024 * 4) resolve();
+                                if (getBuffer() <= 1024 * 1024 * 8) resolve();
                                 else setTimeout(check, 5);
                             };
                             check();
@@ -1527,10 +1561,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 else {
                     conn!.send(chunkPayload);
                     
-                    if ((conn! as any).dataChannel && (conn! as any).dataChannel.bufferedAmount > 1024 * 1024 * 8) {
+                    if ((conn! as any).dataChannel && (conn! as any).dataChannel.bufferedAmount > 1024 * 1024 * 16) {
                         await new Promise<void>(resolve => {
                             const check = () => {
-                                if (!(conn! as any).dataChannel || (conn! as any).dataChannel.bufferedAmount <= 1024 * 1024 * 4) {
+                                if (!(conn! as any).dataChannel || (conn! as any).dataChannel.bufferedAmount <= 1024 * 1024 * 8) {
                                     resolve();
                                 } else {
                                     setTimeout(check, 5);
@@ -1554,7 +1588,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     lastYieldTime = Date.now();
                 }
                 
-                if (i % 50 === 0) this.debouncedSaveState();
+                if (i % 100 === 0) this.debouncedSaveState();
             } catch (e) {
                 this.log(`Error sending chunk ${i} for ${path}. Aborting.`, e);
                 throw e;
@@ -1563,7 +1597,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.log(`Finished sending all chunks for ${path} to ${peerId}. Waiting for ack.`);
     }
     handleFileChunkStart(payload: FileChunkStartPayload, conn: DataConnection | null) { 
-        this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, receivedCount: 0, lastUpdated: Date.now() }); 
+        this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, receivedCount: 0, lastUpdated: Date.now(), fileHash: payload.fileHash || '' }); 
         this.activeTransfers.set(payload.transferId, {
             id: payload.transferId,
             path: payload.path,
@@ -1608,10 +1642,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             
             try {
-                await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId });
+                const computedHash = await this.getHash(reassembled.buffer);
+                if (transfer.fileHash && computedHash && transfer.fileHash !== computedHash) {
+                    this.log(`Integrity check failed for chunked transfer ${transfer.path}. Rejecting.`);
+                    conn.send({ type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
+                    return;
+                }
+
+                await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId, fileHash: transfer.fileHash });
                 conn.send({ type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
             } catch (e) {
                 this.log(`Failed to apply chunked file update: ${transfer.path}`, e);
+                if (e instanceof Error && e.message.includes('IntegrityError')) {
+                    conn.send({ type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
+                } else {
+                    conn.send({ type: 'nack', transferId: payload.transferId, reason: 'write-error' });
+                }
             }
         }
     }
@@ -1646,11 +1692,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async applyFileUpdate(data: FileUpdatePayload) {
         if (!this.isPathSyncable(data.path)) return;
 
+        let computedHash = '';
+        try {
+            computedHash = await this.getHash(data.content);
+        } catch(e) {}
+
+        if (data.fileHash && computedHash && data.fileHash !== computedHash) {
+            throw new Error('IntegrityError: fileHash mismatch');
+        }
+
         await this.runLocked(data.path, async () => {
-            try {
-                const hash = await this.getHash(data.content);
-                this.syncedHashes.set(data.path, { hash, timestamp: Date.now() });
-            } catch(e) {}
+            if (computedHash) {
+                this.syncedHashes.set(data.path, { hash: computedHash, timestamp: Date.now() });
+            }
 
             const existingFile = this.app.vault.getAbstractFileByPath(data.path);
             if (!existingFile) {
