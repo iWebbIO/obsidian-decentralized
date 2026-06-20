@@ -35,7 +35,7 @@ type CompanionPairPayload = { type: 'companion-pair'; peerInfo: PeerInfo; };
 type AckPayload = { type: 'ack', transferId: string };
 type NackPayload = { type: 'nack', transferId: string, reason: 'integrity-failure' | 'write-error' };
 type FileUpdatePayload = BasePayload & { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary' | 'base64'; fileHash?: string; compressed?: boolean; versionVector?: VersionVector; };
-type FileDeltaPayload = BasePayload & { type: 'file-delta'; path: string; mtime: number; patches: any[]; baseHash: string; versionVector?: VersionVector; };
+type FileDeltaPayload = BasePayload & { type: 'file-delta'; path: string; mtime: number; patches: string; baseHash: string; versionVector?: VersionVector; };
 type FileDeletePayload = BasePayload & { type: 'file-delete'; path: string; };
 type FileRenamePayload = BasePayload & { type: 'file-rename'; oldPath: string; newPath: string; };
 type FolderCreatePayload = BasePayload & { type: 'folder-create', path: string; };
@@ -60,7 +60,7 @@ type LockGrantPayload = { type: 'lock-grant', path: string, requestId: string, g
 type LockDenyPayload = { type: 'lock-deny', path: string, requestId: string, reason: string };
 type LockReleasePayload = { type: 'lock-release', path: string };
 type EditorActivatePayload = { type: 'editor-active', path: string };
-type EditorDeltaPayload = { type: 'editor-delta', path: string, patches: any[] };
+type EditorDeltaPayload = { type: 'editor-delta', path: string, patches: string };
 
 // Merkle Tree Payloads
 type MerkleRootPayload = { type: 'merkle-root', rootHash: string };
@@ -1074,7 +1074,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const dmp = new DiffMatchPatch();
             const patches = dmp.patch_make(cached.content, currentText);
             if (patches.length > 0) {
-                const payload: EditorDeltaPayload = { type: 'editor-delta', path, patches };
+                const patchText = dmp.patch_toText(patches);
+                const payload: EditorDeltaPayload = { type: 'editor-delta', path, patches: patchText };
                 this.sendData(this.twoDevicePeerId!, payload);
             }
         }
@@ -1373,7 +1374,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (data.type === 'file-update') {
                 bytesTransferred = data.content instanceof ArrayBuffer ? data.content.byteLength : (typeof data.content === 'string' ? data.content.length : 0);
             } else if (data.type === 'file-delta') {
-                bytesTransferred = JSON.stringify((data as FileDeltaPayload).patches).length;
+                bytesTransferred = (data as FileDeltaPayload).patches.length;
             }
             if (bytesTransferred > 0) {
                 this.recordTransferSample(bytesTransferred, Date.now() - startTime);
@@ -2068,9 +2069,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 
                 const currentText = view.editor.getValue();
                 const dmp = new DiffMatchPatch();
-                const [newText, results] = dmp.patch_apply(data.patches, currentText);
+                const patches = dmp.patch_fromText(data.patches);
+                const [newText, results] = dmp.patch_apply(patches, currentText);
                 
-                if (results.every(r => r === true)) {
+                if (results.every((r: boolean) => r === true)) {
                     const diff = dmp.diff_main(currentText, newText);
                             dmp.diff_cleanupSemantic(diff);
                             let offset = 0;
@@ -2140,7 +2142,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                 type: 'file-delta',
                                 path: file.path,
                                 mtime: file.stat.mtime,
-                                patches,
+                                patches: patchText,
                                 baseHash,
                                 versionVector: vv,
                                 transferId: this.generateTransferId(file.path)
@@ -2427,7 +2429,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             
             const dmp = new DiffMatchPatch();
-            const [newContent, results] = dmp.patch_apply(data.patches, localContent);
+            const patches = dmp.patch_fromText(data.patches);
+            const [newContent, results] = dmp.patch_apply(patches, localContent);
             
             const success = results.every((r: boolean) => r === true);
             if (!success) {
