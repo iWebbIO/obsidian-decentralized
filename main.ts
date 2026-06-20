@@ -2490,9 +2490,14 @@ class ConnectionModal extends Modal {
             .od-status-banner.error { background: var(--background-modifier-error); color: var(--text-error); border: 1px solid var(--background-modifier-error-hover); }
 
             /* Quick Pair specifics */
-            .od-inline-qr-container { text-align: center; margin: 15px 0; padding: 20px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); }
-            .od-inline-qr-container img { border-radius: var(--radius-s); width: 200px; height: 200px; display: inline-block; margin-bottom: 15px; }
-            .od-qr-label { font-weight: 600; margin-bottom: 15px; color: var(--text-normal); }
+            .od-step-header { font-size: 1.1em; font-weight: 600; color: var(--text-normal); margin-top: 20px; margin-bottom: 10px; }
+            .od-pairing-code-container { display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); border: 1px solid var(--background-modifier-border); margin: 10px 0; }
+            .od-pairing-code-text { font-family: var(--font-monospace); font-size: 1.5em; font-weight: bold; letter-spacing: 0.05em; color: var(--text-normal); user-select: all; }
+            .od-instruction-text { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 15px; }
+            
+            .od-qr-section { display: flex; flex-direction: column; align-items: center; margin-top: 15px; padding: 15px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); }
+            .od-qr-section img { width: 150px; height: 150px; border-radius: var(--radius-s); margin-bottom: 10px; }
+            .od-qr-label { font-size: 0.9em; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; }
             
             .od-lan-card { padding: 15px; background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); cursor: pointer; transition: all 0.2s; text-align: center; display: flex; flex-direction: column; gap: 4px; }
             .od-lan-card:hover { border-color: var(--interactive-accent); background: var(--background-modifier-hover); transform: translateY(-1px); }
@@ -2517,6 +2522,27 @@ class ConnectionModal extends Modal {
             .od-icon-button:hover { color: var(--text-normal); background-color: var(--background-modifier-hover); }
         `;
         document.head.appendChild(style);
+    }
+
+    formatPairingCodeForDisplay(deviceId: string): string {
+        if (deviceId.startsWith('device-') && deviceId.length === 15) {
+            const hex = deviceId.substring(7);
+            return `device-${hex.substring(0, 4)}-${hex.substring(4)}`;
+        }
+        return deviceId;
+    }
+
+    normalizePairingCodeInput(input: string): string {
+        let cleaned = input.trim().replace(/\s+/g, '');
+        if (cleaned.startsWith('device-')) {
+            const hexPart = cleaned.substring(7).replace(/-/g, '');
+            return `device-${hexPart}`;
+        }
+        const justHex = cleaned.replace(/-/g, '');
+        if (justHex.length === 8 && /^[0-9a-fA-F]{8}$/.test(justHex)) {
+            return `device-${justHex.toLowerCase()}`;
+        }
+        return cleaned;
     }
 
     render() {
@@ -2592,42 +2618,61 @@ class ConnectionModal extends Modal {
     renderQuickPairTab() {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Quick Pair', cls: 'od-dashboard-header' });
-        contentEl.createDiv({ text: 'Connect devices by scanning a QR code', cls: 'od-dashboard-subtitle' });
+        contentEl.createDiv({ text: 'Connect devices easily using codes or QR', cls: 'od-dashboard-subtitle' });
 
         const myInfo = this.plugin.getMyPeerInfo();
 
-        // QR Code & My Identity
-        const qrContainer = contentEl.createDiv({ cls: 'od-inline-qr-container' });
-        qrContainer.createDiv({ text: `Scan to connect to ${myInfo.friendlyName}`, cls: 'od-qr-label' });
+        // Step 1: Share Your Code
+        contentEl.createDiv({ text: 'Step 1: Share Your Code', cls: 'od-step-header' });
         
-        const imgEl = qrContainer.createEl('img');
-        QRCode.toDataURL(myInfo.deviceId, { width: 200, margin: 2 }).then(url => {
-            imgEl.src = url;
-        }).catch(err => {
-            qrContainer.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
-        });
-
-        const copyBtn = qrContainer.createEl('button', { text: 'Copy Pairing Code' });
+        const codeContainer = contentEl.createDiv({ cls: 'od-pairing-code-container' });
+        const formattedCode = this.formatPairingCodeForDisplay(myInfo.deviceId);
+        codeContainer.createDiv({ text: formattedCode, cls: 'od-pairing-code-text' });
+        
+        const copyBtn = codeContainer.createEl('button', { text: 'Copy' });
         copyBtn.onclick = () => {
             navigator.clipboard.writeText(myInfo.deviceId);
             copyBtn.setText('Copied!');
-            setTimeout(() => copyBtn.setText('Copy Pairing Code'), 2000);
+            setTimeout(() => copyBtn.setText('Copy'), 2000);
+        };
+        
+        contentEl.createDiv({ text: 'Type this code on your other device to connect', cls: 'od-instruction-text' });
+        
+        const qrSection = contentEl.createDiv({ cls: 'od-qr-section' });
+        qrSection.createDiv({ text: 'Or scan QR code', cls: 'od-qr-label' });
+        
+        const imgEl = qrSection.createEl('img');
+        QRCode.toDataURL(myInfo.deviceId, { width: 150, margin: 2 }).then(url => {
+            imgEl.src = url;
+        }).catch(err => {
+            qrSection.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
+        });
+        
+        const scanBtn = qrSection.createEl('button', { text: 'Scan QR Code', cls: 'od-full-width' });
+        scanBtn.onclick = () => {
+            new QRScannerModal(this.app, (scannedId) => {
+                this.attemptConnection(this.normalizePairingCodeInput(scannedId));
+            }).open();
         };
 
         contentEl.createDiv({ cls: 'od-section-divider' });
 
-        // Scan Action
-        const scanBtn = contentEl.createEl('button', { text: 'Scan QR Code', cls: 'mod-cta od-full-width' });
-        scanBtn.onclick = () => {
-            new QRScannerModal(this.app, (scannedId) => {
-                this.attemptConnection(scannedId);
-            }).open();
+        // Step 2: Enter Their Code
+        contentEl.createDiv({ text: 'Step 2: Enter Their Code', cls: 'od-step-header' });
+        
+        const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
+        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter their pairing code' });
+        
+        const connectBtn = inputRow.createEl('button', { text: 'Connect', cls: 'mod-cta' });
+        connectBtn.onclick = () => {
+            const normalized = this.normalizePairingCodeInput(input.value);
+            this.attemptConnection(normalized);
         };
 
         // LAN Discovery
         if (!Platform.isMobile) {
             contentEl.createDiv({ cls: 'od-section-divider' });
-            contentEl.createDiv({ cls: 'od-section-title', text: 'Nearby Devices (LAN)' });
+            contentEl.createDiv({ text: 'Or connect to nearby devices', cls: 'od-step-header' });
             
             const lanList = contentEl.createDiv({ cls: 'od-peer-list' });
             
@@ -2672,16 +2717,6 @@ class ConnectionModal extends Modal {
         contentEl.createEl('h2', { text: 'Advanced Configuration', cls: 'od-dashboard-header' });
         contentEl.createDiv({ text: 'Manual connection options and settings', cls: 'od-dashboard-subtitle' });
 
-        // Manual Connection
-        contentEl.createDiv({ cls: 'od-section-title', text: 'Manual Connection' });
-        const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
-        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter Pairing Code' });
-        
-        const connectBtn = inputRow.createEl('button', { text: 'Connect', cls: 'mod-cta' });
-        connectBtn.onclick = () => this.attemptConnection(input.value);
-
-        contentEl.createDiv({ cls: 'od-section-divider' });
-
         // Paired Device
         const companionId = this.plugin.settings.companionPeerId;
         const pairedTitleContainer = contentEl.createDiv({ attr: { style: 'display: flex; align-items: center; gap: 8px;' } });
@@ -2703,16 +2738,18 @@ class ConnectionModal extends Modal {
                 btn.onclick = () => { this.plugin.tryToConnectToClusterPeers(); this.close(); };
             }
         } else {
-            const btnContainer = contentEl.createDiv({ cls: 'od-right-align' });
-            const pairBtn = btnContainer.createEl('button', { text: 'Set Code as Partner', cls: 'mod-cta' });
+            const partnerInputRow = contentEl.createDiv({ cls: 'od-input-row' });
+            const partnerInput = partnerInputRow.createEl('input', { type: 'text', placeholder: 'Enter Pairing Code' });
+            const pairBtn = partnerInputRow.createEl('button', { text: 'Set as Partner', cls: 'mod-cta' });
             pairBtn.onclick = async () => {
-                if (input.value.trim()) {
-                    this.plugin.settings.companionPeerId = input.value.trim();
+                const normalized = this.normalizePairingCodeInput(partnerInput.value);
+                if (normalized) {
+                    this.plugin.settings.companionPeerId = normalized;
                     await this.plugin.saveSettings();
                     this.plugin.tryToConnectToClusterPeers();
                     this.render();
                 } else {
-                    new Notice("Enter a Pairing Code in the manual entry first.");
+                    new Notice("Enter a valid Pairing Code first.");
                 }
             };
         }
