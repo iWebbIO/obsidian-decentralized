@@ -20,7 +20,7 @@ const LOCK_EXPIRATION_MS = 30000;
 // --- Type Definitions ---
 type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; port?: number; mode?: 'peerjs' | 'direct-ip'; };
 type DiscoveryBeacon = { type: 'obsidian-decentralized-beacon'; peerInfo: PeerInfo; };
-type FileManifestEntry = { path: string; mtime: number; size: number; type: 'file'; hash?: string; versionVector?: VersionVector };
+type FileManifestEntry = { path: string; mtime: number; size: number; type: 'file' | 'deleted'; hash?: string; versionVector?: VersionVector };
 type FolderManifestEntry = { path: string; type: 'folder' };
 type VaultManifest = (FileManifestEntry | FolderManifestEntry)[];
 
@@ -42,8 +42,10 @@ type FolderCreatePayload = BasePayload & { type: 'folder-create', path: string; 
 type FolderDeletePayload = BasePayload & { type: 'folder-delete', path: string; };
 type FolderRenamePayload = BasePayload & { type: 'folder-rename', oldPath: string, newPath: string; };
 type FullSyncRequestPayload = { type: 'request-full-sync', manifest: VaultManifest };
-type FullSyncResponsePayload = { type: 'response-full-sync'; filesReceiverWillSend: string[]; filesInitiatorMustSend: string[]; };
+type FullSyncResponsePayload = { type: 'response-full-sync'; filesReceiverWillSend: string[]; filesInitiatorMustSend: string[]; filesReceiverMustDelete?: string[]; filesInitiatorMustDelete?: string[]; };
 type FullSyncCompletePayload = { type: 'full-sync-complete' };
+type InitiatorSyncDonePayload = { type: 'initiator-sync-done' };
+type RequestFilePayload = { type: 'request-file', path: string };
 type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: number, totalChunks: number, transferId: string, fileHash: string, compressed?: boolean, versionVector?: VersionVector };
 type FileChunkDataPayload = { type: 'file-chunk-data', transferId: string, index: number, data: ArrayBuffer };
 type PingPayload = { type: 'ping' };
@@ -104,7 +106,7 @@ type SyncData =
     | HandshakePayload | RoleAnnouncementPayload | ClusterGossipPayload | CompanionPairPayload | AckPayload | NackPayload
     | FileUpdatePayload | FileDeltaPayload | FileDeletePayload | FileRenamePayload
     | FolderCreatePayload | FolderDeletePayload | FolderRenamePayload
-    | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload
+    | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload | InitiatorSyncDonePayload | RequestFilePayload
     | FileChunkStartPayload | FileChunkDataPayload | PingPayload | PongPayload
     | ClusterForgetPayload | ClusterKickPayload | ClusterRenamePayload
     | LockRequestPayload | LockGrantPayload | LockDenyPayload | LockReleasePayload
@@ -433,7 +435,9 @@ class DirectIpServer {
         const client = this.clients.get(peerId);
         if (client) {
             if (client.queue.length >= this.MAX_QUEUE_SIZE) {
-                client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
+                const evicted = client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
+                const evictedSize = evicted.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+                client.bufferedAmount = Math.max(0, client.bufferedAmount - evictedSize);
             }
             client.queue.push(data);
             client.bufferedAmount += JSON.stringify(data).length;
@@ -550,7 +554,9 @@ class DirectIpServer {
     send(data: any) {
         for (const client of this.clients.values()) {
             if (client.queue.length >= this.MAX_QUEUE_SIZE) {
-                client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
+                const evicted = client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
+                const evictedSize = evicted.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+                client.bufferedAmount = Math.max(0, client.bufferedAmount - evictedSize);
             }
             client.queue.push(data);
             client.bufferedAmount += JSON.stringify(data).length;
@@ -726,6 +732,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // Two-Device Mode State
     public currentRole: DeviceRole | null = null;
     public twoDeviceState: TwoDeviceState = { fileVersions: {}, merkleTreeRoot: null };
+    public tombstones: Record<string, number> = {};
+    public currentSyncIsTwoDeviceMode: boolean | null = null;
+    private syncDrainCallback: (() => void) | null = null;
+    private mySyncDone: boolean = false;
+    private peerSyncDone: boolean = false;
     
     // File Locking State
     public heldLocks: Map<string, { peerId: string, expiresAt: number }> = new Map();
@@ -892,6 +903,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (state.failedSyncs) {
                     this.failedSyncs = state.failedSyncs;
                 }
+                if (state.tombstones) {
+                    this.tombstones = state.tombstones;
+                }
                 if (state.twoDeviceState) {
                     this.twoDeviceState = state.twoDeviceState;
                     if (!this.twoDeviceState.fileVersions) this.twoDeviceState.fileVersions = {};
@@ -906,7 +920,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const state = {
             activeTransfers: Array.from(this.activeTransfers.values()),
             failedSyncs: this.failedSyncs,
-            twoDeviceState: this.twoDeviceState
+            twoDeviceState: this.twoDeviceState,
+            tombstones: this.tombstones
         };
         await this.app.vault.adapter.write(this.statePath, JSON.stringify(state, null, 2));
     }
@@ -1027,7 +1042,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }); 
     }
     
-    private async handleFileDelete(file: TAbstractFile) { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; this.log(`Processing delete: ${file.path}`); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { if (this.isTwoDeviceMode()) this.incrementVersion(file.path); this.broadcastData({ type: 'file-delete', path: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-delete', path: file.path, transferId }); } }); }
+    private async handleFileDelete(file: TAbstractFile) { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; this.log(`Processing delete: ${file.path}`); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { if (this.isTwoDeviceMode()) this.incrementVersion(file.path); this.tombstones[file.path] = Date.now(); this.debouncedSaveState(); this.broadcastData({ type: 'file-delete', path: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-delete', path: file.path, transferId }); } }); }
     private async handleRenameEvent(file: TAbstractFile, oldPath: string) { await this.runLocked(oldPath, async () => { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; if (!this.hasPeers()) return; this.log(`Processing rename: ${oldPath} -> ${file.path}`); this.ignoreNextEventForPath(file.path); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { if (this.isTwoDeviceMode()) { this.incrementVersion(oldPath); this.incrementVersion(file.path); } this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId }); } }); }); }
 
     // --- Real-time Editor Sync ---
@@ -1113,14 +1128,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     sendData(peerId: string, data: SyncData) { this.addToQueue(peerId, data); }
     
     private computePriority(data: SyncData): number {
-        if (data.type === 'editor-delta' || data.type === 'editor-active' || data.type.startsWith('lock-')) return -1; 
-        if (data.type === 'folder-create' || data.type === 'folder-delete' || data.type === 'folder-rename') return 0;
+        if (data.type === 'editor-delta' || data.type === 'editor-active' || data.type.startsWith('lock-')) return 1000000; 
+        if (data.type === 'folder-create' || data.type === 'folder-delete' || data.type === 'folder-rename') return 100000;
+        if (data.type === 'file-delete' || data.type === 'file-rename' || data.type === 'file-delta') return 50000;
         if (data.type === 'file-update') {
             const size = data.content instanceof ArrayBuffer ? data.content.byteLength : (typeof data.content === 'string' ? data.content.length : 0);
-            return 1 + size;
+            return Math.max(0, 10000 - size);
         }
-        if (data.type === 'file-delete' || data.type === 'file-rename' || data.type === 'file-delta') return 1;
-        return 1000000;
+        return -1;
     }
 
     private addToQueue(peerId: string | null, data: SyncData) { 
@@ -1129,7 +1144,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let low = 0, high = this.syncQueue.length;
         while (low < high) {
             const mid = (low + high) >>> 1;
-            if (this.syncQueue[mid].priority > priority) {
+            if (this.syncQueue[mid].priority < priority) {
                 high = mid;
             } else {
                 low = mid + 1;
@@ -1146,6 +1161,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private abortSync(reason: string) {
         if (!this.isSyncing) return;
         this.isSyncing = false;
+        this.currentSyncIsTwoDeviceMode = null;
+        this.syncDrainCallback = null;
         this.syncQueue = [];
         this.activeTransfers.clear();
         this.pendingAcks.forEach(ack => ack.reject(new Error(reason)));
@@ -1244,6 +1261,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.processQueue();
                 });
             }
+        }
+        if (this.activeQueueTransfers === 0 && this.syncQueue.length === 0 && this.syncDrainCallback) {
+            this.syncDrainCallback();
+            this.syncDrainCallback = null;
+        }
+    }
+
+    private checkBidirectionalCompletion() {
+        if (this.mySyncDone && this.peerSyncDone) {
+            this.handleFullSyncComplete();
         }
     }
 
@@ -1380,7 +1407,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 let low = 0, high = this.syncQueue.length;
                 while (low < high) {
                     const mid = (low + high) >>> 1;
-                    if (this.syncQueue[mid].priority > priority) high = mid;
+                    if (this.syncQueue[mid].priority < priority) high = mid;
                     else low = mid + 1;
                 }
                 this.syncQueue.splice(low, 0, item);
@@ -1780,7 +1807,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'folder-rename': this.applyFolderRename(data); break;
             case 'request-full-sync': this.handleFullSyncRequest(data, conn!); break;
             case 'response-full-sync': this.handleFullSyncResponse(data, conn!); break;
-            case 'full-sync-complete': this.handleFullSyncComplete(); break;
+            case 'initiator-sync-done': this.peerSyncDone = true; this.checkBidirectionalCompletion(); break;
+            case 'full-sync-complete': this.peerSyncDone = true; this.checkBidirectionalCompletion(); break;
+            case 'request-file': this.handleRequestFile(data, conn!); break;
             case 'file-chunk-start': this.handleFileChunkStart(data, conn); break;
             case 'file-chunk-data': this.handleFileChunkData(data, conn!); break;
             case 'ping': conn?.send({ type: 'pong' }); break;
@@ -2588,7 +2617,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                 } else {
                     this.log(`Conflict resolved by 'role-based' (Secondary yields - adopting remote): ${data.path}`);
-                    this.ignoreNextEventForPath(data.path);
+                    this.ignoreNextEventForPath(existingFile.path);
                     if (data.encoding === 'binary' || data.encoding === 'base64') {
                         await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
                     } else {
@@ -2601,7 +2630,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'last-write-wins':
                 if (data.mtime > existingFile.stat.mtime) {
                     this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`);
-                    this.ignoreNextEventForPath(data.path);
+                    this.ignoreNextEventForPath(existingFile.path);
                     if (data.encoding === 'binary' || data.encoding === 'base64') {
                         await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
                     } else {
@@ -2621,7 +2650,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); this.ignoreNextEventForPath(conflictPath); if (data.encoding === 'binary' || data.encoding === 'base64') { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
-    async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.delete(existingFile); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); this.showNotice(`Failed to delete file: ${data.path}`, 'error'); } } }
+    async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; this.tombstones[data.path] = Date.now(); this.debouncedSaveState(); const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.delete(existingFile); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); this.showNotice(`Failed to delete file: ${data.path}`, 'error'); } } }
     async applyFileRename(data: FileRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); if (fileToRename instanceof TFile) { try { this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.newPath); await this.app.vault.rename(fileToRename, data.newPath); } catch (e) { console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); this.showNotice(`Failed to rename file: ${data.oldPath}`, 'error'); } } }
     async applyFolderCreate(data: FolderCreatePayload) { if (!this.isPathSyncable(data.path)) return; if (this.app.vault.getAbstractFileByPath(data.path)) return; this.log(`Creating folder: ${data.path}`); this.ignoreNextEventForPath(data.path); try { await this.app.vault.createFolder(data.path); } catch (e) { console.error(`Failed to create folder ${data.path}`, e); } }
     async applyFolderDelete(data: FolderDeletePayload) { if (!this.isPathSyncable(data.path)) return; const folder = this.app.vault.getAbstractFileByPath(data.path); if (folder instanceof TFolder) { this.log(`Deleting folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); try { await this.app.vault.delete(folder, true); } catch (e) { console.error(`Failed to delete folder ${data.path}`, e); } } }
@@ -2633,9 +2662,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!conn) { this.showNotice("Peer not found.", 'error'); return; } 
         this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); 
         this.isSyncing = true; 
+        this.mySyncDone = false;
+        this.peerSyncDone = false;
+        this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
         this.updateStatus(); 
         
-        if (this.isTwoDeviceMode()) {
+        if (this.currentSyncIsTwoDeviceMode) {
             const tree = await this.buildMerkleTree();
             this.sendData(peerId, { type: 'merkle-root', rootHash: tree.hash });
         } else {
@@ -2647,7 +2679,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
     // --- Merkle Handlers ---
     async handleMerkleRoot(data: MerkleRootPayload, conn: DataConnection) {
-        if (!this.isSyncing) { this.isSyncing = true; this.updateStatus(); }
+        if (!this.isSyncing) { 
+            this.isSyncing = true; 
+            this.mySyncDone = false;
+            this.peerSyncDone = false;
+            this.currentSyncIsTwoDeviceMode = true;
+            this.updateStatus(); 
+        }
         const tree = await this.buildMerkleTree();
         if (tree.hash === data.rootHash) {
             this.log("Merkle roots match! Skipping full sync.");
@@ -2710,7 +2748,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (file instanceof TFolder || (!file && !fullPath.includes('.'))) {
                     this.sendData(conn.peer, { type: 'merkle-node-request', path: fullPath });
                 } else {
-                    if (file instanceof TFile) {
+                    if (!myHash && remoteHash) {
+                        this.sendData(conn.peer, { type: 'request-file', path: fullPath });
+                    } else if (file instanceof TFile) {
                         this.sendFileUpdate(file, conn.peer);
                     }
                 }
@@ -2728,6 +2768,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         } 
         this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); 
         this.isSyncing = true; 
+        this.mySyncDone = false;
+        this.peerSyncDone = false;
+        this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
         this.updateStatus(); 
         
         try {
@@ -2737,37 +2780,51 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const localIndex = new Map(localManifest.map(item => [item.path, item])); 
             const filesInitiatorMustSend: string[] = []; 
             const filesReceiverWillSend: string[] = []; 
+            const filesInitiatorMustDelete: string[] = [];
+            const filesReceiverMustDelete: string[] = [];
             
-            localIndex.forEach((localItem, path) => { 
-                const remoteItem = remoteIndex.get(path); 
-                if (!remoteItem) { filesReceiverWillSend.push(path); } 
-                else if (localItem.type === 'file' && remoteItem.type === 'file') { 
-                    if (localItem.hash && remoteItem.hash && localItem.hash === remoteItem.hash) {
-                        // Content matches, skip
-                    } else if (this.isTwoDeviceMode() && localItem.versionVector && remoteItem.versionVector) {
-                        if (this.isNewerThan(localItem.versionVector, remoteItem.versionVector)) filesReceiverWillSend.push(path);
-                    } else if (localItem.mtime > remoteItem.mtime + this.settings.mtimeTolerance) { 
-                        filesReceiverWillSend.push(path); 
-                    } 
-                } 
-            }); 
+            const allPaths = new Set([...localIndex.keys(), ...remoteIndex.keys()]);
             
-            remoteIndex.forEach((remoteItem, path) => { 
-                const localItem = localIndex.get(path); 
-                if (!localItem) { filesInitiatorMustSend.push(path); } 
-                else if (remoteItem.type === 'file' && localItem.type === 'file') { 
-                    if (remoteItem.hash && localItem.hash && remoteItem.hash === localItem.hash) {
-                        // Content matches, skip
-                    } else if (this.isTwoDeviceMode() && localItem.versionVector && remoteItem.versionVector) {
-                        if (this.isNewerThan(remoteItem.versionVector, localItem.versionVector)) filesInitiatorMustSend.push(path);
-                    } else if (remoteItem.mtime > localItem.mtime + this.settings.mtimeTolerance) { 
-                        filesInitiatorMustSend.push(path); 
-                    } 
-                } 
-            }); 
+            allPaths.forEach(path => {
+                const localItem = localIndex.get(path);
+                const remoteItem = remoteIndex.get(path);
+                
+                if (localItem && !remoteItem) {
+                    if (localItem.type === 'file') filesReceiverWillSend.push(path);
+                } else if (!localItem && remoteItem) {
+                    if (remoteItem.type === 'file') filesInitiatorMustSend.push(path);
+                } else if (localItem && remoteItem) {
+                    if (localItem.type === 'file' && remoteItem.type === 'file') {
+                        if (localItem.hash && remoteItem.hash && localItem.hash === remoteItem.hash) {
+                            // Match
+                        } else if (this.currentSyncIsTwoDeviceMode && localItem.versionVector && remoteItem.versionVector) {
+                            if (this.isNewerThan(localItem.versionVector, remoteItem.versionVector)) filesReceiverWillSend.push(path);
+                            else if (this.isNewerThan(remoteItem.versionVector, localItem.versionVector)) filesInitiatorMustSend.push(path);
+                        } else if (localItem.mtime > remoteItem.mtime + this.settings.mtimeTolerance) {
+                            filesReceiverWillSend.push(path);
+                        } else if (remoteItem.mtime > localItem.mtime + this.settings.mtimeTolerance) {
+                            filesInitiatorMustSend.push(path);
+                        }
+                    } else if (localItem.type === 'deleted' && remoteItem.type === 'file') {
+                        if (localItem.mtime > remoteItem.mtime) filesInitiatorMustDelete.push(path);
+                        else filesInitiatorMustSend.push(path);
+                    } else if (localItem.type === 'file' && remoteItem.type === 'deleted') {
+                        if (remoteItem.mtime > localItem.mtime) filesReceiverMustDelete.push(path);
+                        else filesReceiverWillSend.push(path);
+                    }
+                }
+            });
             
-            this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}`); 
-            this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend }); 
+            this.log(`Sync plan: They send ${filesInitiatorMustSend.length}, I send ${filesReceiverWillSend.length}, They delete ${filesInitiatorMustDelete.length}, I delete ${filesReceiverMustDelete.length}`); 
+            this.sendData(conn.peer, { type: 'response-full-sync', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete }); 
+            
+            for (const path of filesReceiverMustDelete) {
+                const file = this.app.vault.getAbstractFileByPath(path);
+                if (file) {
+                    this.ignoreNextEventForPath(path);
+                    await this.app.vault.delete(file);
+                }
+            }
             
             for (const path of filesReceiverWillSend) { 
                 const item = this.app.vault.getAbstractFileByPath(path); 
@@ -2780,11 +2837,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } 
             } 
             
-            this.log("Full sync: receiver has sent all its files. Sending complete message."); 
-            this.sendData(conn.peer, { type: 'full-sync-complete'}); 
-        } finally {
-            this.isSyncing = false; 
-            this.updateStatus(); 
+            this.fullSyncTimeout = window.setTimeout(() => { 
+                if (this.isSyncing) { 
+                    this.showNotice("Sync timed out. Some files may not have transferred.", 'error', 10000); 
+                    this.handleFullSyncComplete(); 
+                } 
+            }, this.settings.fullSyncTimeoutMs || 900000);
+            
+            this.syncDrainCallback = () => {
+                this.mySyncDone = true;
+                this.sendData(conn.peer, { type: 'full-sync-complete' });
+                this.checkBidirectionalCompletion();
+            };
+            this.processQueue();
+            
+        } catch (e) {
+            this.abortSync(`Error during sync request: ${e}`);
         }
     }
     
@@ -2792,6 +2860,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.isSyncing) return; 
         this.showNotice("Received sync plan. Exchanging files...", 'verbose'); 
         this.log(`Sync plan: I must send ${data.filesInitiatorMustSend.length}, I will receive ${data.filesReceiverWillSend.length}`); 
+        
+        for (const path of data.filesInitiatorMustDelete || []) {
+            const file = this.app.vault.getAbstractFileByPath(path);
+            if (file) {
+                this.ignoreNextEventForPath(path);
+                await this.app.vault.delete(file);
+            }
+        }
+        
         for (const path of data.filesInitiatorMustSend) { 
             const item = this.app.vault.getAbstractFileByPath(path); 
             if (item instanceof TFile) { 
@@ -2809,9 +2886,33 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.handleFullSyncComplete(); 
             } 
         }, this.settings.fullSyncTimeoutMs || 900000); 
+        
+        this.syncDrainCallback = () => {
+            this.mySyncDone = true;
+            this.sendData(conn.peer, { type: 'initiator-sync-done' });
+            this.checkBidirectionalCompletion();
+        };
+        this.processQueue();
     }
     
-    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.syncedHashes.clear(); this.updateStatus(); this.showNotice("Full sync complete.", 'important'); }
+    handleFullSyncComplete() { 
+        if (!this.isSyncing) return; 
+        if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } 
+        this.isSyncing = false; 
+        this.currentSyncIsTwoDeviceMode = null;
+        this.syncDrainCallback = null;
+        this.processQueue(); 
+        this.syncedHashes.clear(); 
+        this.updateStatus(); 
+        this.showNotice("Full sync complete.", 'important'); 
+    }
+
+    handleRequestFile(data: RequestFilePayload, conn: DataConnection) {
+        const file = this.app.vault.getAbstractFileByPath(data.path);
+        if (file instanceof TFile) {
+            this.sendFileUpdate(file, conn.peer);
+        }
+    }
     
     private async buildVaultManifest(): Promise<VaultManifest> { 
         const manifest: VaultManifest = []; 
@@ -2838,7 +2939,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             this.syncedHashes.set(file.path, { hash, timestamp: Date.now() });
                         }
                     }
-                    let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[file.path] : undefined;
+                    let vv = (this.currentSyncIsTwoDeviceMode ?? this.isTwoDeviceMode()) ? this.twoDeviceState.fileVersions[file.path] : undefined;
                     manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash, versionVector: vv }); 
                     
                     count++;
@@ -2848,7 +2949,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                 } 
             } 
-        } 
+        }
+        for (const [path, timestamp] of Object.entries(this.tombstones)) {
+            manifest.push({ type: 'deleted', path, mtime: timestamp, size: 0 });
+        }
         return manifest; 
     }
 
