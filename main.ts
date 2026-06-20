@@ -1522,7 +1522,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 
                 if (peerId) {
                     const ackPromise = new Promise<void>((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 120000);
+                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 300000);
                         this.pendingAcks.set(transferId!, {
                             resolve: () => { clearTimeout(timeout); resolve(); },
                             reject: (e) => { clearTimeout(timeout); reject(e); },
@@ -1546,7 +1546,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
                 if ((data.type === 'file-update' || data.type === 'file-delta') && peerId) {
                     const ackPromise = new Promise<void>((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 15000);
+                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
                         this.pendingAcks.set(transferId!, {
                             resolve: () => { clearTimeout(timeout); resolve(); },
                             reject: (e) => { clearTimeout(timeout); reject(e); },
@@ -1964,15 +1964,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const now = Date.now();
             this.connections.forEach((conn, peerId) => {
                 if (conn.open) {
-                    this.sendData(peerId, { type: 'ping' });
+                    // Send directly to bypass the sync queue
+                    conn.send({ type: 'ping' });
                     const last = this.lastHeard.get(peerId);
-                    if (last && now - last > 6000) {
+                    if (last && now - last > 20000) { // Increased timeout to 20 seconds
                         this.log(`Peer ${peerId} timed out (Heartbeat).`);
                         conn.close();
                     }
                 }
             });
-        }, 2000));
+        }, 5000)); // Check every 5 seconds
     }
     
     startSyncKeepAlive() {
@@ -1980,7 +1981,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.syncKeepAliveInterval = window.setInterval(() => {
             if (this.isSyncing) {
                 this.connections.forEach((conn, peerId) => {
-                    this.sendData(peerId, { type: 'sync-ping' });
+                    if (conn.open) conn.send({ type: 'sync-ping' }); // Send directly
                 });
             } else {
                 if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
