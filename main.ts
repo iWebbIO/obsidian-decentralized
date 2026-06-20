@@ -356,7 +356,7 @@ class DirectIpServer {
 
     constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
         if (Platform.isMobile) {
-            this.plugin.showNotice("Offline Host mode is only available on Desktop.", 'info');
+            this.plugin.showNotice("Offline Host mode is only available on Desktop.", 'important');
             return;
         }
         this.pin = pin;
@@ -549,7 +549,7 @@ class DirectIpClient {
             'X-Pin': config.pin,
         };
         this.startPolling();
-        this.plugin.showNotice(`Connected to Offline Host at ${config.host}`, 'info', 3000);
+        this.plugin.showNotice(`Connected to Offline Host at ${config.host}`, 'important', 3000);
     }
     
     getBufferedAmount(): number {
@@ -654,7 +654,7 @@ class DirectIpClient {
         this.isOpen = false;
         if (this.pollTimeout) clearTimeout(this.pollTimeout);
         this.pollTimeout = null;
-        this.plugin.showNotice("Disconnected from Offline Host.", 'info', 3000);
+        this.plugin.showNotice("Disconnected from Offline Host.", 'important', 3000);
     }
 }
 
@@ -819,9 +819,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return newLock;
     }
 
-    public showNotice(message: string, level: 'info' | 'verbose' | 'error' = 'info', timeout?: number) {
+    public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' = 'info', timeout?: number) {
         if (level === 'error') {
             new Notice(message, timeout || 10000);
+            return;
+        }
+        if (level === 'important') {
+            new Notice(message, timeout);
             return;
         }
         if (!this.settings.showToasts) {
@@ -1270,8 +1274,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         this.peer.on('connection', (conn) => { this.log("Incoming PeerJS connection from:", conn.peer); this.setupConnection(conn); });
         this.peer.on('error', (err) => { clearTimeout(connectionTimeout); this.handlePeerError(err); });
-        this.peer.on('disconnected', () => { this.showNotice('Sync network disconnected. Attempting to reconnect...', 'info'); this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' }); });
-        this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'info'); this.handlePeerError(new Error("Peer closed.")); });
+        this.peer.on('disconnected', () => { this.showNotice('Sync network disconnected. Attempting to reconnect...', 'important'); this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' }); });
+        this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'important'); this.handlePeerError(new Error("Peer closed.")); });
     }
 
     private handlePeerError(err: any) {
@@ -1341,7 +1345,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             this.log(`Peer disconnected: ${peerId}`);
             if (peerId === this.settings.companionPeerId) {
-                this.showNotice(`Paired Device disconnected. Will try to reconnect automatically.`, 'info');
+                this.showNotice(`Paired Device disconnected. Will try to reconnect automatically.`, 'important');
             }
             this.log("Connection closed, ensuring connection attempts continue.");
             this.tryToConnectToClusterPeers();
@@ -1478,7 +1482,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const start = this.manualPingStart.get(conn!.peer)!;
                     const rtt = Date.now() - start;
                     this.manualPingStart.delete(conn!.peer);
-                    this.showNotice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`);
+                    this.showNotice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`, 'important');
                 }
                 break;
             case 'cluster-forget': this.handleClusterForget(data); break;
@@ -1496,7 +1500,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.joinPin && !this.settings.requirePinForAllConnections) { 
             this.joinPin = null; 
         } 
-        this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'info', 4000);
+        this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'important', 4000);
         this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
         this.saveKnownPeers();
@@ -1524,7 +1528,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleCompanionPair(data: CompanionPairPayload) {
         this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
-        this.showNotice(`Paired with ${data.peerInfo.friendlyName} as a primary sync partner.`, 'info', 4000);
+        this.showNotice(`Paired with ${data.peerInfo.friendlyName} as a primary sync partner.`, 'important', 4000);
         this.tryToConnectToClusterPeers();
     }
 
@@ -1611,7 +1615,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.pendingConnections.delete(companionId);
         }
         this.settings.companionPeerId = undefined; await this.saveSettings(); 
-        this.showNotice('Paired Device link forgotten.', 'info', 3000);
+        this.showNotice('Paired Device link forgotten.', 'important', 3000);
     }
 
     private async getHash(buffer: ArrayBuffer | string): Promise<string> {
@@ -2072,7 +2076,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     private async resolveConflict(data: FileUpdatePayload, existingFile: TFile, localContent: string | ArrayBuffer) {
-        this.showNotice(`Conflict detected for: ${data.path}`, 'info', 10000);
+        this.showNotice(`Conflict detected for: ${data.path}`, 'important', 10000);
         const strategy = this.getConflictStrategy();
         this.log(`Conflict detected for: ${data.path}. Strategy: ${strategy}`);
 
@@ -2194,7 +2198,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }, this.settings.fullSyncTimeoutMs || 900000); 
     }
     
-    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.syncedHashes.clear(); this.updateStatus(); this.showNotice("Full sync complete.", 'info'); }
+    handleFullSyncComplete() { if (!this.isSyncing) return; if (this.fullSyncTimeout) { clearTimeout(this.fullSyncTimeout); this.fullSyncTimeout = null; } this.isSyncing = false; this.processQueue(); this.syncedHashes.clear(); this.updateStatus(); this.showNotice("Full sync complete.", 'important'); }
     
     private async buildVaultManifest(): Promise<VaultManifest> { 
         const manifest: VaultManifest = []; 
@@ -2686,7 +2690,7 @@ class ConnectionModal extends Modal {
                     this.discoveredPeers.forEach((peer) => {
                         const card = lanList.createDiv({ cls: 'od-lan-card mod-clickable' });
                         card.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
-                        card.createDiv({ text: 'Tap to connect', cls: 'od-text-muted' });
+                        card.createDiv({ text: Platform.isMobile ? 'Tap to connect' : 'Click to connect', cls: 'od-text-muted' });
                         card.onclick = () => this.attemptConnection(peer.deviceId);
                     });
                 }
@@ -2716,45 +2720,6 @@ class ConnectionModal extends Modal {
 
         contentEl.createEl('h2', { text: 'Advanced Configuration', cls: 'od-dashboard-header' });
         contentEl.createDiv({ text: 'Manual connection options and settings', cls: 'od-dashboard-subtitle' });
-
-        // Paired Device
-        const companionId = this.plugin.settings.companionPeerId;
-        const pairedTitleContainer = contentEl.createDiv({ attr: { style: 'display: flex; align-items: center; gap: 8px;' } });
-        pairedTitleContainer.createDiv({ cls: 'od-section-title', text: 'Primary Sync Partner', attr: { style: 'margin-top: 0;' } });
-        const helpIcon = pairedTitleContainer.createSpan({ cls: 'od-icon-button', attr: { 'aria-label': 'This device will be prioritized for automatic reconnections.' } });
-        setIcon(helpIcon, 'help-circle');
-
-        if (companionId) {
-            const item = contentEl.createDiv({ cls: 'od-peer-item' });
-            const info = item.createDiv({ cls: 'info' });
-            const peerInfo = this.plugin.clusterPeers.get(companionId);
-            info.createDiv({ text: peerInfo?.friendlyName || 'Paired Device', cls: 'od-peer-name' });
-            info.createDiv({ text: companionId, cls: 'sub-text' });
-            
-            if (this.plugin.connections.has(companionId)) {
-                item.createDiv({ text: 'Connected', cls: 'mod-success' });
-            } else {
-                const btn = item.createEl('button', { text: 'Connect' });
-                btn.onclick = () => { this.plugin.tryToConnectToClusterPeers(); this.close(); };
-            }
-        } else {
-            const partnerInputRow = contentEl.createDiv({ cls: 'od-input-row' });
-            const partnerInput = partnerInputRow.createEl('input', { type: 'text', placeholder: 'Enter Pairing Code' });
-            const pairBtn = partnerInputRow.createEl('button', { text: 'Set as Partner', cls: 'mod-cta' });
-            pairBtn.onclick = async () => {
-                const normalized = this.normalizePairingCodeInput(partnerInput.value);
-                if (normalized) {
-                    this.plugin.settings.companionPeerId = normalized;
-                    await this.plugin.saveSettings();
-                    this.plugin.tryToConnectToClusterPeers();
-                    this.render();
-                } else {
-                    new Notice("Enter a valid Pairing Code first.");
-                }
-            };
-        }
-
-        contentEl.createDiv({ cls: 'od-section-divider' });
 
         // Offline Mode Switch
         contentEl.createDiv({ cls: 'od-section-title', text: 'Offline Mode (Direct IP)' });
@@ -3044,7 +3009,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         } else {
              new Setting(containerEl)
                 .setName('Show Sync Notifications')
-                .setDesc('Enable to see pop-up notifications for sync events like connections and conflicts.')
+                .setDesc('Show notifications for sync events. Important events like connections and conflicts always appear. This toggle controls additional progress notifications.')
                 .addToggle(toggle => toggle
                     .setValue(this.plugin.settings.showToasts)
                     .onChange(async (value) => {
@@ -3066,7 +3031,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Show Sync Notifications')
-            .setDesc('Enable to see pop-up notifications for sync events. If verbose logging is on, more notifications will be shown.')
+            .setDesc('Show notifications for sync events. Important events like connections and conflicts always appear. This toggle controls additional progress notifications.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.showToasts)
                 .onChange(async (value) => {
@@ -3363,12 +3328,24 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     this.updateStatus();
                 }));
             }
+            if (type === 'peer' || type === 'disconnected') {
+                settingItem.addExtraButton(btn => btn
+                    .setIcon('star')
+                    .setTooltip('Set as Primary Sync Partner')
+                    .onClick(async () => {
+                        this.plugin.settings.companionPeerId = peer.deviceId;
+                        await this.plugin.saveSettings();
+                        this.plugin.tryToConnectToClusterPeers();
+                        this.updateStatus();
+                    })
+                );
+            }
             if (type === 'peer' || type === 'companion' || type === 'disconnected') {
                 const conn = this.plugin.connections.get(peer.deviceId);
                 if (conn && conn.open) {
                     settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => {
                         conn.close();
-                        this.plugin.showNotice(`Disconnecting from ${peer.friendlyName}`, 'info');
+                        this.plugin.showNotice(`Disconnecting from ${peer.friendlyName}`, 'important');
                         setTimeout(() => this.updateStatus(), 100);
                     }));
                     settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Kick Device').onClick(() => {
@@ -3385,7 +3362,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     
                     settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
                         if (this.plugin.peer && !this.plugin.peer.disconnected) {
-                            this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`);
+                            this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`, 'important');
                             const newConn = this.plugin.peer.connect(peer.deviceId);
                             this.plugin.setupConnection(newConn);
                         } else {
