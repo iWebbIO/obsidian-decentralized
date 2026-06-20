@@ -1442,9 +1442,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (success) {
                     const path = item.data.path;
                     if (path) {
-                        const failIndex = this.failedSyncs.findIndex(f => f.path === path && f.peerId === item.peerId && f.type === item.data.type);
-                        if (failIndex !== -1) {
-                            this.failedSyncs.splice(failIndex, 1);
+                        for (let i = this.failedSyncs.length - 1; i >= 0; i--) {
+                            const f = this.failedSyncs[i];
+                            if (f.path === path && f.peerId === item.peerId) {
+                                // Clear error if it's the exact same type, OR if a full update resolved a delta (and vice versa)
+                                if ((item.data.type === 'file-update' || item.data.type === 'file-delta') && 
+                                    (f.type === 'file-update' || f.type === 'file-delta')) {
+                                    this.failedSyncs.splice(i, 1);
+                                } else if (item.data.type === f.type) {
+                                    this.failedSyncs.splice(i, 1);
+                                }
+                            }
                         }
                     }
                 }
@@ -1488,7 +1496,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (fail.type === 'file-update' || fail.type === 'file-delta') {
                     const file = this.app.vault.getAbstractFileByPath(fail.path);
                     if (file instanceof TFile) {
-                        this.sendFileUpdate(file, fail.peerId || undefined, fail.type === 'file-update');
+                        // Always force a full sync on retry to guarantee the mismatch is resolved
+                        this.sendFileUpdate(file, fail.peerId || undefined, true);
                     } else {
                         this.failedSyncs.splice(i, 1);
                     }
