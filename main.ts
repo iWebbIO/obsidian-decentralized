@@ -673,7 +673,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private conflictCenter: ConflictCenter;
     public activeTransfers: Map<string, TransferStatus> = new Map();
     public joinPin: string | null = null;
-    private companionConnectionInterval: number | null = null;
+    private clusterConnectionInterval: number | null = null;
+    public pendingConnections: Set<string> = new Set();
     private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, receivedCount: number, lastUpdated: number, fileHash: string, compressed?: boolean }> = new Map();
     private fullSyncTimeout: number | null = null;
 
@@ -1260,7 +1261,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`PeerJS connection open. ID: ${id}`);
             this.showNotice(`Decentralized Sync network is online.`, 'verbose', 3000);
             this.updateStatus();
-            this.tryToConnectToCompanion();
+            this.tryToConnectToClusterPeers();
             if (!Platform.isMobile) {
                 this.lanDiscovery.startBroadcasting(this.getMyPeerInfo());
             }
@@ -1307,18 +1308,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     setupConnection(conn: DataConnection, pin?: string) {
+        this.pendingConnections.add(conn.peer);
         conn.on('open', () => {
+            this.pendingConnections.delete(conn.peer);
             this.log("DataConnection open with:", conn.peer);
-            if (conn.peer === this.settings.companionPeerId && this.companionConnectionInterval) {
-                clearInterval(this.companionConnectionInterval);
-                this.companionConnectionInterval = null;
-                this.log("Companion connected, stopping reconnect attempts.");
-            }
             conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin });
             this.resumeTransfers(conn.peer);
         });
         conn.on('data', (data: any) => this.processIncomingData(data, conn));
         conn.on('close', () => {
+            this.pendingConnections.delete(conn.peer);
             const peerId = conn.peer;
             this.log("DataConnection closed with:", peerId);
             this.connections.delete(peerId);
@@ -1343,11 +1342,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`Peer disconnected: ${peerId}`);
             if (peerId === this.settings.companionPeerId) {
                 this.showNotice(`Companion disconnected. Will try to reconnect automatically.`, 'info');
-                this.log("Companion connection closed, restarting connection attempts.");
-                this.tryToConnectToCompanion();
             }
+            this.log("Connection closed, ensuring connection attempts continue.");
+            this.tryToConnectToClusterPeers();
         });
-        conn.on('error', (err) => { console.error(`Connection error with ${conn.peer}:`, err); this.showNotice(`Connection error with a peer.`, 'error'); });
+        conn.on('error', (err) => { 
+            this.pendingConnections.delete(conn.peer);
+            console.error(`Connection error with ${conn.peer}:`, err); 
+            this.showNotice(`Connection error with a peer.`, 'error'); 
+        });
     }
     
     async resumeTransfers(peerId: string) {
@@ -1504,38 +1507,71 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     handleClusterGossip(data: ClusterGossipPayload) {
         if (this.getConnectionMode() !== 'peerjs') return;
+        let hasNew = false;
         data.peers.forEach(peerInfo => {
             if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) return;
             if (!this.clusterPeers.has(peerInfo.deviceId)) {
                 this.clusterPeers.set(peerInfo.deviceId, peerInfo);
-                this.saveKnownPeers();
-                this.updateStatus();
+                hasNew = true;
             }
-            if (this.peer && !this.peer.disconnected) { this.log("Gossip: attempting to connect to new peer", peerInfo.friendlyName); const conn = this.peer.connect(peerInfo.deviceId); this.setupConnection(conn); }
         });
+        if (hasNew) {
+            this.saveKnownPeers();
+            this.updateStatus();
+            this.tryToConnectToClusterPeers();
+        }
     }
 
     async handleCompanionPair(data: CompanionPairPayload) {
         this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
         this.showNotice(`Paired with ${data.peerInfo.friendlyName} as a companion device.`, 'info', 4000);
-        this.tryToConnectToCompanion();
+        this.tryToConnectToClusterPeers();
     }
 
-    tryToConnectToCompanion() {
+    tryToConnectToClusterPeers() {
         if (this.getConnectionMode() !== 'peerjs') return;
-        if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval); this.companionConnectionInterval = null;
-        const companionId = this.settings.companionPeerId; if (!companionId) return;
+        
         const attemptConnection = () => {
-            if (!this.settings.companionPeerId) { if (this.companionConnectionInterval) clearInterval(this.companionConnectionInterval); this.companionConnectionInterval = null; return; }
-            if (!this.peer || this.peer.disconnected || this.connections.has(companionId)) { return; }
-            this.log(`Attempting to connect to companion ${companionId}`); const conn = this.peer.connect(companionId, { reliable: true }); this.setupConnection(conn);
+            if (!this.peer || this.peer.disconnected) return;
+            
+            const connectToPeer = (peerId: string) => {
+                if (peerId === this.settings.deviceId) return;
+                if (this.connections.has(peerId) || this.pendingConnections.has(peerId)) return;
+                
+                this.log(`Attempting to connect to cluster peer ${peerId}`); 
+                this.pendingConnections.add(peerId);
+                const conn = this.peer!.connect(peerId, { reliable: true }); 
+                if (conn) {
+                    this.setupConnection(conn);
+                    setTimeout(() => {
+                        if (this.pendingConnections.has(peerId)) {
+                            this.pendingConnections.delete(peerId);
+                            this.log(`Pending connection to ${peerId} timed out. Removing from pending set.`);
+                        }
+                    }, 15000);
+                } else {
+                    this.pendingConnections.delete(peerId);
+                }
+            };
+
+            const companionId = this.settings.companionPeerId;
+            if (companionId) connectToPeer(companionId);
+
+            for (const peerId of this.clusterPeers.keys()) {
+                if (peerId !== companionId) connectToPeer(peerId);
+            }
         };
+        
         attemptConnection();
-        this.companionConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS); this.registerInterval(this.companionConnectionInterval);
+        if (!this.clusterConnectionInterval) {
+            this.clusterConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS); 
+            this.registerInterval(this.clusterConnectionInterval);
+        }
     }
 
     handleClusterForget(data: ClusterForgetPayload) {
         this.log(`Received instruction to forget device: ${data.targetDeviceId}`);
+        this.pendingConnections.delete(data.targetDeviceId);
         if (this.connections.has(data.targetDeviceId)) {
             this.connections.get(data.targetDeviceId)?.close();
         }
@@ -1568,9 +1604,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public async forgetCompanion() {
-        if (this.companionConnectionInterval) { clearInterval(this.companionConnectionInterval); this.companionConnectionInterval = null; }
         const companionId = this.settings.companionPeerId;
-        if (companionId) { const conn = this.connections.get(companionId); conn?.close(); }
+        if (companionId) { 
+            const conn = this.connections.get(companionId); 
+            conn?.close(); 
+            this.pendingConnections.delete(companionId);
+        }
         this.settings.companionPeerId = undefined; await this.saveSettings(); 
         this.showNotice('Companion link forgotten.', 'info', 3000);
     }
@@ -2567,7 +2606,7 @@ class ConnectionModal extends Modal {
                 item.createDiv({ text: 'Connected', cls: 'mod-success' });
             } else {
                 const btn = item.createEl('button', { text: 'Connect' });
-                btn.onclick = () => { this.plugin.tryToConnectToCompanion(); this.close(); };
+                btn.onclick = () => { this.plugin.tryToConnectToClusterPeers(); this.close(); };
             }
         } else {
             const btnContainer = contentEl.createDiv({ cls: 'od-right-align' });
@@ -2576,7 +2615,7 @@ class ConnectionModal extends Modal {
                 if (input.value.trim()) {
                     this.plugin.settings.companionPeerId = input.value.trim();
                     await this.plugin.saveSettings();
-                    this.plugin.tryToConnectToCompanion();
+                    this.plugin.tryToConnectToClusterPeers();
                     this.renderDashboard();
                 } else {
                     new Notice("Enter an ID first.");
@@ -3231,6 +3270,7 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     }));
                     if (type !== 'companion') {
                         settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(() => {
+                            this.plugin.pendingConnections.delete(peer.deviceId);
                             this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
                             this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
                             this.plugin.saveKnownPeers();
