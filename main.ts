@@ -356,7 +356,7 @@ class DirectIpServer {
 
     constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
         if (Platform.isMobile) {
-            this.plugin.showNotice("Direct IP Host mode is only available on Desktop.", 'info');
+            this.plugin.showNotice("Offline Host mode is only available on Desktop.", 'info');
             return;
         }
         this.pin = pin;
@@ -367,12 +367,12 @@ class DirectIpServer {
         const http = require('http');
         this.server = http.createServer(this.handleRequest.bind(this));
         this.server.on('error', (err: Error) => {
-            this.plugin.showNotice(`Direct IP server error: ${err.message}`, 'error');
-            this.plugin.log("Direct IP Server Error:", err);
+            this.plugin.showNotice(`Offline server error: ${err.message}`, 'error');
+            this.plugin.log("Offline Server Error:", err);
             this.server = null;
         });
         this.server.listen(port, () => {
-            this.plugin.log(`Direct IP server listening on port ${port}`);
+            this.plugin.log(`Offline server listening on port ${port}`);
         });
     }
 
@@ -528,7 +528,7 @@ class DirectIpServer {
     stop() {
         this.server?.close();
         this.server = null;
-        this.plugin.log("Direct IP Server stopped.");
+        this.plugin.log("Offline Server stopped.");
     }
 }
 
@@ -549,7 +549,7 @@ class DirectIpClient {
             'X-Pin': config.pin,
         };
         this.startPolling();
-        this.plugin.showNotice(`Connected to Direct IP Host at ${config.host}`, 'info', 3000);
+        this.plugin.showNotice(`Connected to Offline Host at ${config.host}`, 'info', 3000);
     }
     
     getBufferedAmount(): number {
@@ -591,7 +591,7 @@ class DirectIpClient {
             }
         } catch (e) {
             this.isOpen = false;
-            this.plugin.log('Direct IP Poll Error:', e);
+            this.plugin.log('Offline Poll Error:', e);
             this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
         }
         
@@ -638,7 +638,7 @@ class DirectIpClient {
             });
         } catch (e) {
             this.plugin.showNotice('Failed to send data to host.', 'error');
-            this.plugin.log('Direct IP Push Error:', e);
+            this.plugin.log('Offline Push Error:', e);
             this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
         } finally {
             this.pendingBytes = Math.max(0, this.pendingBytes - bodyStr.length);
@@ -654,7 +654,7 @@ class DirectIpClient {
         this.isOpen = false;
         if (this.pollTimeout) clearTimeout(this.pollTimeout);
         this.pollTimeout = null;
-        this.plugin.showNotice("Disconnected from Direct IP Host.", 'info', 3000);
+        this.plugin.showNotice("Disconnected from Offline Host.", 'info', 3000);
     }
 }
 
@@ -723,7 +723,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.addRibbonIcon('users', 'Connect to a Peer', () => new ConnectionModal(this.app, this).open());
         this.addRibbonIcon('refresh-cw', 'Force Full Sync with Peer', () => {
             if (this.getConnectionMode() === 'direct-ip') {
-                this.showNotice("Full Sync is not yet supported in Direct IP mode.", 'info');
+                this.showNotice("Full Sync is not yet supported in Offline mode.", 'info');
                 return;
             }
             if (this.connections.size === 0) { this.showNotice("No peers connected.", 'info'); return; }
@@ -1341,7 +1341,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             this.log(`Peer disconnected: ${peerId}`);
             if (peerId === this.settings.companionPeerId) {
-                this.showNotice(`Companion disconnected. Will try to reconnect automatically.`, 'info');
+                this.showNotice(`Paired Device disconnected. Will try to reconnect automatically.`, 'info');
             }
             this.log("Connection closed, ensuring connection attempts continue.");
             this.tryToConnectToClusterPeers();
@@ -1524,7 +1524,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleCompanionPair(data: CompanionPairPayload) {
         this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
-        this.showNotice(`Paired with ${data.peerInfo.friendlyName} as a companion device.`, 'info', 4000);
+        this.showNotice(`Paired with ${data.peerInfo.friendlyName} as a primary sync partner.`, 'info', 4000);
         this.tryToConnectToClusterPeers();
     }
 
@@ -1611,7 +1611,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.pendingConnections.delete(companionId);
         }
         this.settings.companionPeerId = undefined; await this.saveSettings(); 
-        this.showNotice('Companion link forgotten.', 'info', 3000);
+        this.showNotice('Paired Device link forgotten.', 'info', 3000);
     }
 
     private async getHash(buffer: ArrayBuffer | string): Promise<string> {
@@ -2376,7 +2376,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const isAuto = this.settings.syncMode === 'auto';
             if (this.directIpServer) return { text: isAuto ? "Hosting Offline" : "Host Mode", icon: "server", state: 'success' };
             if (this.directIpClient) return { text: isAuto ? "Connected Offline" : "Client Mode", icon: "smartphone", state: 'success' };
-            return { text: isAuto ? "Offline Mode" : "Direct-IP mode", icon: "network", state: 'neutral' };
+            return { text: isAuto ? "Offline Mode" : "Offline Mode", icon: "network", state: 'neutral' };
         }
         if (!this.peer || this.peer.disconnected) return { text: "Sync Offline", icon: "wifi-off", state: 'error' };
         if (!this.peer.id) return { text: "Connecting...", icon: "plug", spin: true, state: 'loading' };
@@ -2419,13 +2419,23 @@ class ConnectionModal extends Modal {
     private discoveredPeers: Map<string, PeerInfo> = new Map();
     private discoverListener: ((p: PeerInfo) => void) | null = null;
     private loseListener: ((p: PeerInfo) => void) | null = null;
+    
+    private activeTab: 'quick-pair' | 'advanced' = 'quick-pair';
+    private statusState: 'idle' | 'connecting' | 'connected' | 'error' = 'idle';
+    private statusMessage: string = 'Not connected';
 
     constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
 
     onOpen() {
         this.injectStyles();
         this.contentEl.addClass(Platform.isMobile ? 'od-mobile' : 'od-desktop');
-        this.renderDashboard();
+        
+        if (this.plugin.connections.size > 0) {
+            this.statusState = 'connected';
+            this.statusMessage = `Connected to ${this.plugin.connections.size} device(s)`;
+        }
+        
+        this.render();
     }
 
     onClose() {
@@ -2441,10 +2451,12 @@ class ConnectionModal extends Modal {
         const style = document.createElement('style');
         style.id = styleId;
         style.innerHTML = `
-            .od-dashboard-header { text-align: center; margin-bottom: 20px; font-weight: 600; color: var(--text-normal); }
+            .od-dashboard-header { text-align: center; margin-bottom: 5px; font-weight: 600; color: var(--text-normal); }
+            .od-dashboard-subtitle { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 20px; }
             .od-id-container { background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); user-select: all; font-family: var(--font-monospace); cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--background-modifier-border); transition: all 0.2s ease; }
             .od-id-container:hover { border-color: var(--interactive-accent); box-shadow: 0 0 0 1px var(--interactive-accent); }
-            .od-section-title { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; color: var(--text-muted); margin-top: 25px; margin-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 5px; }
+            .od-section-title { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; color: var(--text-muted); margin-top: 15px; margin-bottom: 10px; }
+            .od-section-divider { height: 1px; background: var(--background-modifier-border); margin: 25px 0; }
             .od-peer-list { display: flex; flex-direction: column; gap: 8px; }
             .od-peer-item { padding: 12px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); display: flex; align-items: center; justify-content: space-between; transition: background 0.1s; }
             .od-peer-item:hover { background: var(--background-modifier-hover); }
@@ -2458,18 +2470,36 @@ class ConnectionModal extends Modal {
 
             .od-id-name { font-weight: bold; margin-bottom: 4px; }
             .od-id-value { font-size: 0.9em; color: var(--text-muted); }
-            .od-scanning { color: var(--text-muted); font-style: italic; }
+            .od-scanning { color: var(--text-muted); font-style: italic; display: flex; align-items: center; justify-content: center; padding: 20px; }
             .od-peer-name { font-weight: bold; }
             .od-full-width { width: 100%; }
-            .od-top-margin { margin-top: 10px; }
             .od-ip-display { font-size: 1.2em; text-align: center; margin: 10px; }
             .od-pin-display { font-size: 2em; font-weight: bold; text-align: center; margin: 20px; }
             .od-text-muted { color: var(--text-muted); }
 
-            /* Responsive & Platform Specifics */
-            .od-full-width { width: 100%; }
+            /* Tabs & Banner */
+            .od-connection-tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 10px; }
+            .od-tab-btn { background: transparent; border: none; box-shadow: none; color: var(--text-muted); font-weight: 600; cursor: pointer; padding: 6px 16px; border-radius: var(--radius-s); transition: all 0.2s; }
+            .od-tab-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+            .od-tab-btn.active { color: var(--text-normal); background: var(--background-modifier-active-hover); }
+            
+            .od-status-banner { padding: 12px; border-radius: var(--radius-m); margin-bottom: 20px; text-align: center; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 8px; }
+            .od-status-banner.idle { background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); color: var(--text-muted); }
+            .od-status-banner.connecting { background: var(--background-modifier-hover); color: var(--text-normal); }
+            .od-status-banner.connected { background: var(--background-modifier-success); color: var(--text-success); border: 1px solid var(--background-modifier-success-hover); }
+            .od-status-banner.error { background: var(--background-modifier-error); color: var(--text-error); border: 1px solid var(--background-modifier-error-hover); }
 
-            /* Desktop */
+            /* Quick Pair specifics */
+            .od-inline-qr-container { text-align: center; margin: 15px 0; padding: 20px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); }
+            .od-inline-qr-container img { border-radius: var(--radius-s); width: 200px; height: 200px; display: inline-block; margin-bottom: 15px; }
+            .od-qr-label { font-weight: 600; margin-bottom: 15px; color: var(--text-normal); }
+            
+            .od-lan-card { padding: 15px; background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); cursor: pointer; transition: all 0.2s; text-align: center; display: flex; flex-direction: column; gap: 4px; }
+            .od-lan-card:hover { border-color: var(--interactive-accent); background: var(--background-modifier-hover); transform: translateY(-1px); }
+            .od-pulsing-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--interactive-accent); animation: pulse 1.5s infinite; margin-right: 8px; }
+            @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.5); } 100% { opacity: 1; transform: scale(1); } }
+
+            /* Responsive & Platform Specifics */
             .od-desktop .od-full-width { width: auto; min-width: 200px; display: block; margin: 10px auto; }
             .od-desktop .od-direct-ip-wrapper { max-width: 400px; margin: 0 auto; }
             .od-desktop .od-direct-ip-wrapper input { margin-bottom: 10px; width: 100%; }
@@ -2478,81 +2508,141 @@ class ConnectionModal extends Modal {
             .od-desktop .od-section-title { text-align: center; max-width: 600px; margin-left: auto; margin-right: auto; }
             .od-desktop .od-input-row { max-width: 500px; margin: 0 auto 10px auto; }
             
-            /* Mobile */
-            .od-mobile .od-full-width { width: 100%; }
+            .od-mobile .od-full-width { width: 100%; margin-top: 10px; }
             .od-mobile .od-input-row { flex-direction: column; }
             .od-mobile .od-input-row button { width: 100%; margin-top: 5px; }
 
             .od-id-icons { display: flex; gap: 8px; }
             .od-icon-button { padding: 4px; border-radius: 4px; color: var(--text-muted); display: flex; align-items: center; transition: color 0.2s; }
             .od-icon-button:hover { color: var(--text-normal); background-color: var(--background-modifier-hover); }
-            
-            .od-qr-container { text-align: center; padding: 20px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); margin: 0 auto; max-width: 320px; box-shadow: var(--shadow-s); }
-            .od-qr-text { word-break: break-all; font-family: var(--font-monospace); margin-top: 15px; color: var(--text-normal); }
-            .od-qr-image { border-radius: var(--radius-s); width: 100%; height: auto; }
-            #od-qr-reader { width: 100%; border-radius: var(--radius-m); overflow: hidden; border: 1px solid var(--background-modifier-border); }
         `;
         document.head.appendChild(style);
     }
 
-    renderDashboard() {
-        const { contentEl } = this;
-        contentEl.empty();
-        const isAuto = this.plugin.settings.syncMode === 'auto';
+    render() {
+        this.contentEl.empty();
+        this.renderStatusBanner();
+        this.renderTabNavigation();
+        
+        if (this.activeTab === 'quick-pair') {
+            this.renderQuickPairTab();
+        } else {
+            this.renderAdvancedTab();
+        }
+    }
 
-        if (this.plugin.settings.connectionMode === 'direct-ip') {
-            this.renderDirectIpDashboard();
+    renderStatusBanner() {
+        const banner = this.contentEl.createDiv({ cls: `od-status-banner ${this.statusState}` });
+        
+        if (this.statusState === 'connecting') {
+            const spinner = banner.createSpan();
+            setIcon(spinner, 'loader');
+            spinner.addClass('lucide-spin');
+        } else if (this.statusState === 'connected') {
+            const check = banner.createSpan();
+            setIcon(check, 'check-circle');
+        } else if (this.statusState === 'error') {
+            const alert = banner.createSpan();
+            setIcon(alert, 'alert-triangle');
+        }
+        
+        banner.createSpan({ text: this.statusMessage });
+    }
+
+    renderTabNavigation() {
+        const tabsContainer = this.contentEl.createDiv({ cls: 'od-connection-tabs' });
+        
+        const quickPairBtn = tabsContainer.createEl('button', { text: 'Quick Pair', cls: `od-tab-btn ${this.activeTab === 'quick-pair' ? 'active' : ''}` });
+        quickPairBtn.onclick = () => { this.activeTab = 'quick-pair'; this.render(); };
+        
+        const advancedBtn = tabsContainer.createEl('button', { text: 'Advanced', cls: `od-tab-btn ${this.activeTab === 'advanced' ? 'active' : ''}` });
+        advancedBtn.onclick = () => { this.activeTab = 'advanced'; this.render(); };
+    }
+
+    attemptConnection(peerId: string) {
+        if (!peerId.trim()) return;
+        
+        this.statusState = 'connecting';
+        this.statusMessage = `Connecting to ${peerId}...`;
+        this.render();
+
+        const conn = this.plugin.peer?.connect(peerId.trim());
+        if (!conn) {
+            this.statusState = 'error';
+            this.statusMessage = 'Failed to initiate connection. Are you online?';
+            this.render();
             return;
         }
 
-        contentEl.createEl('h2', { text: isAuto ? 'Connect Devices' : 'Connection Manager', cls: 'od-dashboard-header' });
+        conn.on('open', () => {
+            this.statusState = 'connected';
+            this.statusMessage = `Connected to ${conn.peer}`;
+            this.plugin.setupConnection(conn);
+            this.render();
+            setTimeout(() => this.close(), 1500);
+        });
 
-        // 1. My Identity
+        conn.on('error', (err) => {
+            this.statusState = 'error';
+            this.statusMessage = `Connection failed. Try again.`;
+            this.render();
+        });
+    }
+
+    renderQuickPairTab() {
+        const { contentEl } = this;
+        contentEl.createEl('h2', { text: 'Quick Pair', cls: 'od-dashboard-header' });
+        contentEl.createDiv({ text: 'Connect devices by scanning a QR code', cls: 'od-dashboard-subtitle' });
+
         const myInfo = this.plugin.getMyPeerInfo();
-        const idContainer = contentEl.createDiv({ cls: 'od-id-container', attr: { 'aria-label': 'Click to copy ID' } });
-        const idText = idContainer.createDiv();
-        idText.createDiv({ text: myInfo.friendlyName, cls: 'od-id-name' });
-        idText.createDiv({ text: myInfo.deviceId, cls: 'od-id-value' });
-        
-        const iconsDiv = idContainer.createDiv({ cls: 'od-id-icons' });
-        
-        const qrIcon = iconsDiv.createDiv({ cls: 'od-icon-button', attr: { 'aria-label': 'Show QR Code' } });
-        setIcon(qrIcon, 'qr-code');
-        qrIcon.onclick = (e) => {
-            e.stopPropagation();
-            new QRCodeModal(this.app, myInfo.deviceId).open();
-        };
 
-        const copyIcon = iconsDiv.createDiv({ cls: 'od-icon-button', attr: { 'aria-label': 'Copy ID' } });
-        setIcon(copyIcon, 'copy');
-        idContainer.onclick = () => {
+        // QR Code & My Identity
+        const qrContainer = contentEl.createDiv({ cls: 'od-inline-qr-container' });
+        qrContainer.createDiv({ text: `Scan to connect to ${myInfo.friendlyName}`, cls: 'od-qr-label' });
+        
+        const imgEl = qrContainer.createEl('img');
+        QRCode.toDataURL(myInfo.deviceId, { width: 200, margin: 2 }).then(url => {
+            imgEl.src = url;
+        }).catch(err => {
+            qrContainer.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
+        });
+
+        const copyBtn = qrContainer.createEl('button', { text: 'Copy Pairing Code' });
+        copyBtn.onclick = () => {
             navigator.clipboard.writeText(myInfo.deviceId);
-            setIcon(copyIcon, 'check');
-            new Notice("ID Copied!");
-            setTimeout(() => setIcon(copyIcon, 'copy'), 2000);
+            copyBtn.setText('Copied!');
+            setTimeout(() => copyBtn.setText('Copy Pairing Code'), 2000);
         };
 
-        // 2. LAN Discovery
+        contentEl.createDiv({ cls: 'od-section-divider' });
+
+        // Scan Action
+        const scanBtn = contentEl.createEl('button', { text: 'Scan QR Code', cls: 'mod-cta od-full-width' });
+        scanBtn.onclick = () => {
+            new QRScannerModal(this.app, (scannedId) => {
+                this.attemptConnection(scannedId);
+            }).open();
+        };
+
+        // LAN Discovery
         if (!Platform.isMobile) {
-            contentEl.createDiv({ cls: 'od-section-title', text: isAuto ? 'Discovered on Local Network' : 'Nearby Devices (LAN)' });
+            contentEl.createDiv({ cls: 'od-section-divider' });
+            contentEl.createDiv({ cls: 'od-section-title', text: 'Nearby Devices (LAN)' });
+            
             const lanList = contentEl.createDiv({ cls: 'od-peer-list' });
+            
             const renderLanList = () => {
                 lanList.empty();
                 if (this.discoveredPeers.size === 0) {
-                    lanList.createDiv({ text: 'Scanning for devices...', cls: 'od-scanning' });
+                    const emptyState = lanList.createDiv({ cls: 'od-scanning' });
+                    emptyState.createSpan({ cls: 'od-pulsing-indicator' });
+                    emptyState.createSpan({ text: 'Scanning for devices...' });
                 } else {
                     this.discoveredPeers.forEach((peer) => {
-                        const item = lanList.createDiv({ cls: 'od-peer-item' });
-                        const info = item.createDiv({ cls: 'info' });
-                        info.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
-                        info.createDiv({ text: peer.ip || 'Unknown IP', cls: 'sub-text' });
-                        info.createDiv({ text: `ID: ${peer.deviceId}`, cls: 'sub-text' });
-                        const btn = item.createEl('button', { text: 'Connect' });
-                        btn.onclick = () => {
-                            const conn = this.plugin.peer?.connect(peer.deviceId);
-                            if (conn) this.plugin.setupConnection(conn);
-                            this.close();
-                        };
+                        const card = lanList.createDiv({ cls: 'od-lan-card mod-clickable' });
+                        card.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
+                        card.createDiv({ text: 'Tap to connect', cls: 'od-text-muted' });
+                        card.onclick = () => this.attemptConnection(peer.deviceId);
                     });
                 }
             };
@@ -2569,37 +2659,41 @@ class ConnectionModal extends Modal {
             this.plugin.lanDiscovery.startListening();
             renderLanList();
         }
+    }
 
-        // 3. Manual Connection
-        contentEl.createDiv({ cls: 'od-section-title', text: isAuto ? 'Connect using Device ID' : 'Manual Connection' });
+    renderAdvancedTab() {
+        const { contentEl } = this;
+
+        if (this.plugin.settings.connectionMode === 'direct-ip') {
+            this.renderDirectIpDashboard();
+            return;
+        }
+
+        contentEl.createEl('h2', { text: 'Advanced Configuration', cls: 'od-dashboard-header' });
+        contentEl.createDiv({ text: 'Manual connection options and settings', cls: 'od-dashboard-subtitle' });
+
+        // Manual Connection
+        contentEl.createDiv({ cls: 'od-section-title', text: 'Manual Connection' });
         const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
-        const input = inputRow.createEl('input', { type: 'text', placeholder: isAuto ? 'Enter Device ID' : 'Enter Peer ID' });
+        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter Pairing Code' });
         
-        const scanBtn = inputRow.createEl('button', { cls: 'clickable-icon', attr: { 'aria-label': 'Scan QR Code' } });
-        setIcon(scanBtn, 'qr-code');
-        scanBtn.onclick = () => {
-            new QRScannerModal(this.app, (scannedId) => {
-                input.value = scannedId;
-            }).open();
-        };
-
         const connectBtn = inputRow.createEl('button', { text: 'Connect', cls: 'mod-cta' });
-        connectBtn.onclick = () => {
-            if (input.value.trim()) {
-                const conn = this.plugin.peer?.connect(input.value.trim());
-                if (conn) this.plugin.setupConnection(conn);
-                this.close();
-            }
-        };
+        connectBtn.onclick = () => this.attemptConnection(input.value);
 
-        // 4. Companion
+        contentEl.createDiv({ cls: 'od-section-divider' });
+
+        // Paired Device
         const companionId = this.plugin.settings.companionPeerId;
+        const pairedTitleContainer = contentEl.createDiv({ attr: { style: 'display: flex; align-items: center; gap: 8px;' } });
+        pairedTitleContainer.createDiv({ cls: 'od-section-title', text: 'Primary Sync Partner', attr: { style: 'margin-top: 0;' } });
+        const helpIcon = pairedTitleContainer.createSpan({ cls: 'od-icon-button', attr: { 'aria-label': 'This device will be prioritized for automatic reconnections.' } });
+        setIcon(helpIcon, 'help-circle');
+
         if (companionId) {
-            contentEl.createDiv({ cls: 'od-section-title', text: isAuto ? 'Companion Device (Auto-Connect)' : 'Saved Companion' });
             const item = contentEl.createDiv({ cls: 'od-peer-item' });
             const info = item.createDiv({ cls: 'info' });
             const peerInfo = this.plugin.clusterPeers.get(companionId);
-            info.createDiv({ text: peerInfo?.friendlyName || 'Companion Device', cls: 'od-peer-name' });
+            info.createDiv({ text: peerInfo?.friendlyName || 'Paired Device', cls: 'od-peer-name' });
             info.createDiv({ text: companionId, cls: 'sub-text' });
             
             if (this.plugin.connections.has(companionId)) {
@@ -2610,40 +2704,45 @@ class ConnectionModal extends Modal {
             }
         } else {
             const btnContainer = contentEl.createDiv({ cls: 'od-right-align' });
-            const pairBtn = btnContainer.createEl('button', { text: 'Set ID as Companion', cls: 'mod-cta' });
+            const pairBtn = btnContainer.createEl('button', { text: 'Set Code as Partner', cls: 'mod-cta' });
             pairBtn.onclick = async () => {
                 if (input.value.trim()) {
                     this.plugin.settings.companionPeerId = input.value.trim();
                     await this.plugin.saveSettings();
                     this.plugin.tryToConnectToClusterPeers();
-                    this.renderDashboard();
+                    this.render();
                 } else {
-                    new Notice("Enter an ID first.");
+                    new Notice("Enter a Pairing Code in the manual entry first.");
                 }
             };
         }
 
-        // Footer
-        const footer = contentEl.createDiv({ cls: 'od-mode-switch' });
-        footer.setText(isAuto ? "Advanced: Completely Offline Mode (Direct IP)" : "Switch to Direct IP Mode (Offline)");
+        contentEl.createDiv({ cls: 'od-section-divider' });
+
+        // Offline Mode Switch
+        contentEl.createDiv({ cls: 'od-section-title', text: 'Offline Mode (Direct IP)' });
+        contentEl.createEl('p', { text: 'Use Offline Mode when you have no internet access but are on the same local network.', cls: 'od-text-muted', attr: { style: 'font-size: 0.85em;' } });
+        
+        const footer = contentEl.createDiv({ cls: 'od-mode-switch', attr: { style: 'margin-top: 10px;' } });
+        footer.setText("Switch to Offline Mode");
         footer.onclick = async () => {
             this.plugin.settings.connectionMode = 'direct-ip';
             await this.plugin.saveSettings();
             this.plugin.reinitializeConnectionManager();
-            this.renderDashboard();
+            this.render();
         };
     }
 
     renderDirectIpDashboard() {
         const { contentEl } = this;
-        const isAuto = this.plugin.settings.syncMode === 'auto';
-        contentEl.createEl('h2', { text: isAuto ? 'Completely Offline Mode' : 'Direct IP (Offline)', cls: 'od-dashboard-header' });
+        contentEl.createEl('h2', { text: 'Offline Mode', cls: 'od-dashboard-header' });
+        contentEl.createDiv({ text: 'Connect directly over your local network', cls: 'od-dashboard-subtitle' });
         
         const container = contentEl.createDiv({ cls: 'od-direct-ip-wrapper' });
 
-        container.createDiv({ cls: 'od-section-title', text: isAuto ? 'Step 1: Host a Network (On your main device)' : 'Host Mode' });
+        container.createDiv({ cls: 'od-section-title', text: 'Step 1: Host a Network (Main device)' });
         if (!Platform.isMobile) {
-            const hostBtn = container.createEl('button', { text: isAuto ? 'Start Offline Network' : 'Start Hosting', cls: 'mod-cta od-full-width' });
+            const hostBtn = container.createEl('button', { text: 'Start Hosting', cls: 'mod-cta od-full-width' });
             hostBtn.onclick = () => {
                 const pin = this.plugin.startDirectIpHost();
                 if (pin) {
@@ -2659,12 +2758,14 @@ class ConnectionModal extends Modal {
         }
 
         if (!Platform.isMobile) {
-            container.createDiv({ cls: 'od-section-title', text: isAuto ? 'Discovered Networks' : 'Discovered Hosts' });
+            container.createDiv({ cls: 'od-section-title', text: 'Discovered Hosts' });
             const lanList = container.createDiv({ cls: 'od-peer-list' });
             const renderLanList = () => {
                 lanList.empty();
                 if (this.discoveredPeers.size === 0) {
-                    lanList.createDiv({ text: 'Scanning for hosts...', cls: 'od-scanning' });
+                    const emptyState = lanList.createDiv({ cls: 'od-scanning' });
+                    emptyState.createSpan({ cls: 'od-pulsing-indicator' });
+                    emptyState.createSpan({ text: 'Scanning for hosts...' });
                 } else {
                     this.discoveredPeers.forEach((peer) => {
                         const item = lanList.createDiv({ cls: 'od-peer-item' });
@@ -2694,8 +2795,10 @@ class ConnectionModal extends Modal {
             renderLanList();
         }
 
-        container.createDiv({ cls: 'od-section-title', text: isAuto ? 'Step 2: Join a Network (On your other devices)' : 'Client Mode' });
-        const ipInput = container.createEl('input', { type: 'text', placeholder: isAuto ? 'Network IP Address' : 'Host IP' });
+        container.createDiv({ cls: 'od-section-divider' });
+
+        container.createDiv({ cls: 'od-section-title', text: 'Step 2: Join a Network (Other devices)' });
+        const ipInput = container.createEl('input', { type: 'text', placeholder: 'Host IP Address' });
         ipInput.value = this.plugin.settings.directIpHostAddress;
         if (Platform.isMobile) { ipInput.style.width = '100%'; ipInput.style.marginBottom = '10px'; }
         
@@ -2713,29 +2816,13 @@ class ConnectionModal extends Modal {
         };
 
         const footer = contentEl.createDiv({ cls: 'od-mode-switch' });
-        footer.setText(isAuto ? "Return to Standard Mode (Internet / Wi-Fi)" : "Switch to Standard Mode (PeerJS)");
+        footer.setText("Switch to Standard Mode");
         footer.onclick = async () => {
             this.plugin.settings.connectionMode = 'peerjs';
             await this.plugin.saveSettings();
             this.plugin.reinitializeConnectionManager();
-            this.renderDashboard();
+            this.render();
         };
-    }
-}
-
-class QRCodeModal extends Modal {
-    constructor(app: App, private text: string) { super(app); }
-    async onOpen() {
-        const { contentEl } = this;
-        contentEl.createEl('h2', { text: 'Device QR Code' });
-        const container = contentEl.createDiv({ cls: 'od-qr-container' });
-        try {
-            const url = await QRCode.toDataURL(this.text, { width: 300, margin: 2 });
-            container.createEl('img', { attr: { src: url }, cls: 'od-qr-image' });
-            container.createDiv({ text: this.text, cls: 'od-qr-text' });
-        } catch (e) {
-            container.createEl('p', { text: 'Error generating QR code.' });
-        }
     }
 }
 
@@ -3289,12 +3376,12 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         if (this.plugin.getConnectionMode() === 'direct-ip') {
             const list = this.clusterStatusEl;
             if (this.plugin.directIpServer) {
-                list.createEl('p', { text: 'Hosting on Direct IP. Other devices can connect to you.' });
+                list.createEl('p', { text: 'Hosting on Offline Mode. Other devices can connect to you.' });
             } else if (this.plugin.directIpClient) {
                 const hostInfo = this.plugin.clusterPeers.values().next().value;
                 if (hostInfo) createEntry(hostInfo, 'host');
             } else {
-                list.createEl('p', { text: 'Direct IP mode is idle. Use the "Connect" button to start.' });
+                list.createEl('p', { text: 'Offline Mode is idle. Use the "Connect" button to start.' });
             }
             return;
         }
