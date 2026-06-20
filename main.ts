@@ -1,4 +1,4 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile, Modal, Platform, requestUrl, debounce, setIcon } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile, Modal, Platform, requestUrl, debounce, setIcon, MarkdownView } from 'obsidian';
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
 import * as QRCode from 'qrcode';
@@ -15,22 +15,27 @@ const MIN_CHUNK_SIZE = 64 * 1024;
 const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
 const MAX_BANDWIDTH_SAMPLES = 10;
 const MAX_QUEUE_DEPTH = 50;
+const LOCK_EXPIRATION_MS = 30000;
 
 // --- Type Definitions ---
 type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; port?: number; mode?: 'peerjs' | 'direct-ip'; };
 type DiscoveryBeacon = { type: 'obsidian-decentralized-beacon'; peerInfo: PeerInfo; };
-type FileManifestEntry = { path: string; mtime: number; size: number; type: 'file'; hash?: string };
+type FileManifestEntry = { path: string; mtime: number; size: number; type: 'file'; hash?: string; versionVector?: VersionVector };
 type FolderManifestEntry = { path: string; type: 'folder' };
 type VaultManifest = (FileManifestEntry | FolderManifestEntry)[];
 
+type DeviceRole = 'primary' | 'secondary';
+type VersionVector = { [deviceId: string]: number };
+
 type BasePayload = { transferId: string; };
 type HandshakePayload = { type: 'handshake'; peerInfo: PeerInfo; pin?: string; };
+type RoleAnnouncementPayload = { type: 'role-announcement'; role: DeviceRole; deviceId: string; };
 type ClusterGossipPayload = { type: 'cluster-gossip'; peers: PeerInfo[]; };
 type CompanionPairPayload = { type: 'companion-pair'; peerInfo: PeerInfo; };
 type AckPayload = { type: 'ack', transferId: string };
 type NackPayload = { type: 'nack', transferId: string, reason: 'integrity-failure' | 'write-error' };
-type FileUpdatePayload = BasePayload & { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary' | 'base64'; fileHash?: string; compressed?: boolean; };
-type FileDeltaPayload = BasePayload & { type: 'file-delta'; path: string; mtime: number; patches: any[]; baseHash: string; };
+type FileUpdatePayload = BasePayload & { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary' | 'base64'; fileHash?: string; compressed?: boolean; versionVector?: VersionVector; };
+type FileDeltaPayload = BasePayload & { type: 'file-delta'; path: string; mtime: number; patches: any[]; baseHash: string; versionVector?: VersionVector; };
 type FileDeletePayload = BasePayload & { type: 'file-delete'; path: string; };
 type FileRenamePayload = BasePayload & { type: 'file-rename'; oldPath: string; newPath: string; };
 type FolderCreatePayload = BasePayload & { type: 'folder-create', path: string; };
@@ -39,13 +44,31 @@ type FolderRenamePayload = BasePayload & { type: 'folder-rename', oldPath: strin
 type FullSyncRequestPayload = { type: 'request-full-sync', manifest: VaultManifest };
 type FullSyncResponsePayload = { type: 'response-full-sync'; filesReceiverWillSend: string[]; filesInitiatorMustSend: string[]; };
 type FullSyncCompletePayload = { type: 'full-sync-complete' };
-type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: number, totalChunks: number, transferId: string, fileHash: string, compressed?: boolean };
+type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: number, totalChunks: number, transferId: string, fileHash: string, compressed?: boolean, versionVector?: VersionVector };
 type FileChunkDataPayload = { type: 'file-chunk-data', transferId: string, index: number, data: ArrayBuffer };
 type PingPayload = { type: 'ping' };
 type PongPayload = { type: 'pong' };
 type ClusterForgetPayload = { type: 'cluster-forget'; targetDeviceId: string; };
 type ClusterKickPayload = { type: 'cluster-kick'; targetDeviceId: string; };
 type ClusterRenamePayload = { type: 'cluster-rename'; targetDeviceId: string; newName: string; };
+
+// Locking & Realtime Payloads
+type LockRequestPayload = { type: 'lock-request', path: string, requestId: string };
+type LockGrantPayload = { type: 'lock-grant', path: string, requestId: string, grantedUntil: number };
+type LockDenyPayload = { type: 'lock-deny', path: string, requestId: string, reason: string };
+type LockReleasePayload = { type: 'lock-release', path: string };
+type EditorActivatePayload = { type: 'editor-active', path: string };
+type EditorDeltaPayload = { type: 'editor-delta', path: string, patches: any[] };
+
+// Merkle Tree Payloads
+type MerkleRootPayload = { type: 'merkle-root', rootHash: string };
+type MerkleNodeRequestPayload = { type: 'merkle-node-request', path: string };
+type MerkleNodeResponsePayload = { type: 'merkle-node-response', path: string, children: Record<string, string> };
+
+interface MerkleNode {
+    hash: string;
+    children?: Record<string, MerkleNode>;
+}
 
 interface TransferStatus {
     id: string;
@@ -78,12 +101,15 @@ export interface SyncStatusState {
 }
 
 type SyncData =
-    | HandshakePayload | ClusterGossipPayload | CompanionPairPayload | AckPayload | NackPayload
+    | HandshakePayload | RoleAnnouncementPayload | ClusterGossipPayload | CompanionPairPayload | AckPayload | NackPayload
     | FileUpdatePayload | FileDeltaPayload | FileDeletePayload | FileRenamePayload
     | FolderCreatePayload | FolderDeletePayload | FolderRenamePayload
     | FullSyncRequestPayload | FullSyncResponsePayload | FullSyncCompletePayload
     | FileChunkStartPayload | FileChunkDataPayload | PingPayload | PongPayload
-    | ClusterForgetPayload | ClusterKickPayload | ClusterRenamePayload;
+    | ClusterForgetPayload | ClusterKickPayload | ClusterRenamePayload
+    | LockRequestPayload | LockGrantPayload | LockDenyPayload | LockReleasePayload
+    | EditorActivatePayload | EditorDeltaPayload
+    | MerkleRootPayload | MerkleNodeRequestPayload | MerkleNodeResponsePayload;
 
 // Interfaces
 interface PeerServerConfig { host: string; port: number; path: string; secure: boolean; }
@@ -102,7 +128,7 @@ interface ObsidianDecentralizedSettings {
     directIpHostPort: number;
     syncAllFileTypes: boolean;
     syncObsidianConfig: boolean;
-    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins';
+    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins' | 'role-based';
     includedFolders: string;
     excludedFolders: string;
     hideNativeSyncStatus: boolean;
@@ -117,7 +143,19 @@ interface ObsidianDecentralizedSettings {
     enableDeltaSync: boolean;
     deltaSyncThreshold: number;
     computeManifestHashes?: boolean;
+    
+    // Two-Device Mode Settings
+    enableTwoDeviceOptimizations: boolean;
+    enableEncryption: boolean;
+    enableRealtimeSync: boolean;
+    peerKeys: Record<string, string>; // peerId -> base64 PSK
 }
+
+export interface TwoDeviceState {
+    fileVersions: Record<string, VersionVector>; // path -> { deviceId: version }
+    merkleTreeRoot: MerkleNode | null;
+}
+
 const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     syncMode: 'auto',
     showToasts: false,
@@ -145,7 +183,12 @@ const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     fullSyncTimeoutMs: 900000,
     enableCompression: true,
     enableDeltaSync: true,
-    deltaSyncThreshold: 50
+    deltaSyncThreshold: 50,
+    
+    enableTwoDeviceOptimizations: true,
+    enableEncryption: true,
+    enableRealtimeSync: true,
+    peerKeys: {}
 };
 
 interface ILANDiscovery {
@@ -350,7 +393,7 @@ class DesktopLANDiscovery implements ILANDiscovery {
 
 class DirectIpServer {
     private server: any | null = null;
-    private clients: Map<string, { lastSeen: number, queue: SyncData[], bufferedAmount: number }> = new Map();
+    private clients: Map<string, { lastSeen: number, queue: any[], bufferedAmount: number }> = new Map();
     private pin: string;
     private readonly MAX_QUEUE_SIZE = 2000;
 
@@ -386,7 +429,7 @@ class DirectIpServer {
         return Array.from(this.clients.keys());
     }
 
-    sendTo(peerId: string, data: SyncData) {
+    sendTo(peerId: string, data: any) {
         const client = this.clients.get(peerId);
         if (client) {
             if (client.queue.length >= this.MAX_QUEUE_SIZE) {
@@ -437,7 +480,7 @@ class DirectIpServer {
 
         if (req.url === '/poll' && req.method === 'GET') {
             res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            let messagesToSend: SyncData[] = [];
+            let messagesToSend: any[] = [];
             
             if (deviceId !== 'unknown' && this.clients.has(deviceId)) {
                 const client = this.clients.get(deviceId)!;
@@ -447,17 +490,10 @@ class DirectIpServer {
 
             const messages = messagesToSend.map(msg => {
                 if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
-                    return {
-                        ...msg,
-                        content: arrayBufferToBase64(msg.content),
-                        encoding: 'base64'
-                    };
+                    return { ...msg, content: arrayBufferToBase64(msg.content), encoding: 'base64' };
                 }
                 if (msg.type === 'file-chunk-data' && msg.data instanceof ArrayBuffer) {
-                    return {
-                        ...msg,
-                        data: arrayBufferToBase64(msg.data)
-                    };
+                    return { ...msg, data: arrayBufferToBase64(msg.data) };
                 }
                 return msg;
             });
@@ -465,7 +501,7 @@ class DirectIpServer {
         } else if (req.url === '/push' && req.method === 'POST') {
             let body = '';
             let totalSize = 0;
-            const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50MB Limit
+            const MAX_BODY_SIZE = 50 * 1024 * 1024;
             let destroyed = false;
 
             req.on('data', (chunk: any) => {
@@ -483,25 +519,21 @@ class DirectIpServer {
             req.on('end', () => {
                 if (destroyed) return;
                 try {
-                    let data: SyncData = JSON.parse(body);
+                    let data: any = JSON.parse(body);
                     if (data.type === 'file-update' && data.encoding === 'base64' && typeof data.content === 'string') {
-                         data = {
-                            ...data,
-                            content: base64ToArrayBuffer(data.content),
-                            encoding: 'binary'
-                        };
+                         data = { ...data, content: base64ToArrayBuffer(data.content), encoding: 'binary' };
                     }
                     if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
                         (data as any).data = base64ToArrayBuffer((data as any).data);
                     }
 
                     const mockConn = {
-                        send: (msg: SyncData) => this.sendTo(deviceId, msg),
+                        send: (msg: any) => this.sendTo(deviceId, msg),
                         peer: deviceId !== 'unknown' ? deviceId : 'direct-ip-client',
                         open: true,
                     } as any;
 
-                    this.plugin.processIncomingData(data, mockConn);
+                    this.plugin.handleRawIncomingData(data, mockConn);
                     res.writeHead(200, CORS_HEADERS);
                     res.end(JSON.stringify({ status: 'ok' }));
                 } catch (e) {
@@ -515,7 +547,7 @@ class DirectIpServer {
         }
     }
 
-    send(data: SyncData) {
+    send(data: any) {
         for (const client of this.clients.values()) {
             if (client.queue.length >= this.MAX_QUEUE_SIZE) {
                 client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
@@ -566,27 +598,23 @@ class DirectIpClient {
             });
             if (response.status === 200) {
                 this.isOpen = true;
-                const messages: SyncData[] = response.json;
+                const messages: any[] = response.json;
                 if (messages && messages.length > 0) hasMessages = true;
                 for (let msg of messages) {
                     if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
-                        msg = {
-                            ...msg,
-                            content: base64ToArrayBuffer(msg.content),
-                            encoding: 'binary'
-                        } as FileUpdatePayload;
+                        msg = { ...msg, content: base64ToArrayBuffer(msg.content), encoding: 'binary' } as FileUpdatePayload;
                     }
                     if (msg.type === 'file-chunk-data' && typeof (msg as any).data === 'string') {
                         (msg as any).data = base64ToArrayBuffer((msg as any).data);
                     }
 
                     const mockConn = {
-                        send: (data: SyncData) => this.send(data),
+                        send: (data: any) => this.send(data),
                         peer: 'direct-ip-host',
                         open: true
                     } as any;
 
-                    this.plugin.processIncomingData(msg, mockConn);
+                    this.plugin.handleRawIncomingData(msg, mockConn);
                 }
             }
         } catch (e) {
@@ -608,22 +636,14 @@ class DirectIpClient {
         this.pollTimeout = window.setTimeout(() => this.poll(), Math.max(100, this.pollInterval));
     }
 
-    async send(data: SyncData) {
+    async send(data: any) {
         let payloadToSend = data;
         
         if (data.type === 'file-update' && data.encoding === 'binary' && data.content instanceof ArrayBuffer) {
-            payloadToSend = {
-                ...data,
-                content: arrayBufferToBase64(data.content),
-                encoding: 'base64'
-            };
+            payloadToSend = { ...data, content: arrayBufferToBase64(data.content), encoding: 'base64' };
         }
-        
         if (data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer) {
-            payloadToSend = {
-                ...data,
-                data: arrayBufferToBase64(data.data)
-            } as any;
+            payloadToSend = { ...data, data: arrayBufferToBase64(data.data) } as any;
         }
 
         const bodyStr = JSON.stringify(payloadToSend);
@@ -675,10 +695,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public joinPin: string | null = null;
     private clusterConnectionInterval: number | null = null;
     public pendingConnections: Set<string> = new Set();
-    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, receivedCount: number, lastUpdated: number, fileHash: string, compressed?: boolean }> = new Map();
+    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, receivedCount: number, lastUpdated: number, fileHash: string, compressed?: boolean, versionVector?: VersionVector }> = new Map();
     private fullSyncTimeout: number | null = null;
 
-    private syncQueue: { peerId: string | null, data: SyncData, retries: number, priority: number }[] = [];
+    private syncQueue: { peerId: string | null, data: any, retries: number, priority: number }[] = [];
     private activeQueueTransfers: number = 0;
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
@@ -703,6 +723,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private currentBandwidthEstimate: number = 0;
     private lastSentContent: Map<string, { content: string, timestamp: number }> = new Map();
 
+    // Two-Device Mode State
+    public currentRole: DeviceRole | null = null;
+    public twoDeviceState: TwoDeviceState = { fileVersions: {}, merkleTreeRoot: null };
+    
+    // File Locking State
+    public heldLocks: Map<string, { peerId: string, expiresAt: number }> = new Map();
+    public remoteLocks: Map<string, { peerId: string, expiresAt: number }> = new Map();
+    private pendingLockRequests: Map<string, { resolve: (granted: boolean) => void, timeout: number }> = new Map();
+    
+    // Real-time Editor Sync State
+    public activeEditorLocks: Map<string, string> = new Map();
+    private isApplyingRemoteEdit: boolean = false;
+    private debouncedEditorChange: (editor: any, info: any) => void;
+
     async onload() {
         if (Platform.isMobile) {
             this.lanDiscovery = new DummyLANDiscovery();
@@ -712,6 +746,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         this.statePath = `${this.manifest.dir}/state.json`;
         this.debouncedSaveState = debounce(this.saveState.bind(this), 1000);
+        this.debouncedEditorChange = debounce(this.handleEditorChangeDebounced.bind(this), 200);
 
         await this.loadSettings();
         this.applyHideNativeSync();
@@ -735,11 +770,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.registerEvent(this.app.vault.on('modify', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('delete', (file) => this.handleEvent(file)));
         this.registerEvent(this.app.vault.on('rename', (file, oldPath) => this.handleRenameEvent(file, oldPath)));
+        this.registerEvent(this.app.workspace.on('editor-change', (editor, info) => this.handleEditorChange(editor, info)));
 
         this.initializeConnectionManager();
         this.startHeartbeat();
         this.registerInterval(window.setInterval(() => this.cleanupPendingChunks(), 60000));
         this.registerInterval(window.setInterval(() => this.retryFailedSyncs(), 60000));
+        this.registerInterval(window.setInterval(() => this.cleanupLocks(), 5000));
         await this.loadState();
     }
 
@@ -751,8 +788,96 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.fullSyncTimeout) clearTimeout(this.fullSyncTimeout);
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.activeTransfers.clear();
+        this.debouncedSaveState();
     }
 
+    // --- Core Two-Device Infrastructure ---
+    isTwoDeviceMode(): boolean {
+        return this.settings.enableTwoDeviceOptimizations && this.connections.size === 1;
+    }
+
+    get twoDevicePeerId(): string | null {
+        return this.isTwoDeviceMode() ? Array.from(this.connections.keys())[0] : null;
+    }
+
+    getMyRole(peerId: string): DeviceRole {
+        return this.settings.deviceId < peerId ? 'primary' : 'secondary';
+    }
+
+    // --- Version Vectors ---
+    incrementVersion(path: string) {
+        if (!this.twoDeviceState.fileVersions[path]) this.twoDeviceState.fileVersions[path] = {};
+        this.twoDeviceState.fileVersions[path][this.settings.deviceId] = (this.twoDeviceState.fileVersions[path][this.settings.deviceId] || 0) + 1;
+        this.debouncedSaveState();
+    }
+
+    mergeVersions(local: VersionVector, remote: VersionVector): VersionVector {
+        const merged: VersionVector = {};
+        const keys = new Set([...Object.keys(local), ...Object.keys(remote)]);
+        for (const k of keys) {
+            merged[k] = Math.max(local[k] || 0, remote[k] || 0);
+        }
+        return merged;
+    }
+
+    isNewerThan(v1: VersionVector, v2: VersionVector): boolean {
+        let hasGreater = false;
+        const keys = new Set([...Object.keys(v1), ...Object.keys(v2)]);
+        for (const k of keys) {
+            const val1 = v1[k] || 0;
+            const val2 = v2[k] || 0;
+            if (val1 < val2) return false;
+            if (val1 > val2) hasGreater = true;
+        }
+        return hasGreater;
+    }
+
+    // --- Merkle Tree Vault Diffing ---
+    async buildMerkleTree(): Promise<MerkleNode> {
+        const tree: MerkleNode = { hash: '', children: {} };
+        const allFiles = this.app.vault.getAllLoadedFiles();
+        
+        for (const file of allFiles) {
+            if (file instanceof TFile && this.isPathSyncable(file.path)) {
+                let hash = this.syncedHashes.get(file.path)?.hash;
+                if (!hash) {
+                    const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
+                    hash = await this.getHash(content);
+                    this.syncedHashes.set(file.path, { hash, timestamp: Date.now() });
+                }
+                
+                const parts = file.path.split('/');
+                let current = tree;
+                for (let i = 0; i < parts.length; i++) {
+                    const part = parts[i];
+                    if (!current.children) current.children = {};
+                    if (!current.children[part]) current.children[part] = { hash: '' };
+                    current = current.children[part];
+                    if (i === parts.length - 1) {
+                        current.hash = hash;
+                    }
+                }
+            }
+        }
+
+        const computeHashes = async (node: MerkleNode): Promise<string> => {
+            if (!node.children || Object.keys(node.children).length === 0) return node.hash;
+            const childKeys = Object.keys(node.children).sort();
+            let combined = '';
+            for (const k of childKeys) {
+                combined += await computeHashes(node.children[k]);
+            }
+            node.hash = await this.getHash(combined);
+            return node.hash;
+        };
+
+        await computeHashes(tree);
+        this.twoDeviceState.merkleTreeRoot = tree;
+        this.debouncedSaveState();
+        return tree;
+    }
+
+    // --- State Management ---
     async loadState() {
         if (await this.app.vault.adapter.exists(this.statePath)) {
             try {
@@ -767,6 +892,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (state.failedSyncs) {
                     this.failedSyncs = state.failedSyncs;
                 }
+                if (state.twoDeviceState) {
+                    this.twoDeviceState = state.twoDeviceState;
+                    if (!this.twoDeviceState.fileVersions) this.twoDeviceState.fileVersions = {};
+                }
             } catch (e) {
                 console.error("Failed to load state", e);
             }
@@ -776,16 +905,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async saveState() {
         const state = {
             activeTransfers: Array.from(this.activeTransfers.values()),
-            failedSyncs: this.failedSyncs
+            failedSyncs: this.failedSyncs,
+            twoDeviceState: this.twoDeviceState
         };
         await this.app.vault.adapter.write(this.statePath, JSON.stringify(state, null, 2));
     }
+
     async loadSettings() { 
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); 
         if (!this.settings.deviceId) {
             this.settings.deviceId = `device-${Array.from(window.crypto.getRandomValues(new Uint8Array(4))).map(b => b.toString(16).padStart(2, '0')).join('')}`;
             await this.saveData(this.settings);
         }
+        if (!this.settings.peerKeys) this.settings.peerKeys = {};
         this.applyHideNativeSync(); 
         if (this.settings.knownPeers) {
             this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, p));
@@ -819,9 +951,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return newLock;
     }
 
-    public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' = 'info', timeout?: number) {
+    public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' | 'warning' = 'info', timeout?: number) {
         if (level === 'error') {
-            new Notice(message, timeout || 10000);
+            new Notice(`[Error] ${message}`, timeout || 10000);
+            return;
+        }
+        if (level === 'warning') {
+            new Notice(`[Warning] ${message}`, timeout || 8000);
             return;
         }
         if (level === 'important') {
@@ -837,7 +973,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         new Notice(message, timeout);
     }
 
-    public getConflictStrategy() { return this.settings.syncMode === 'auto' ? 'create-conflict-file' : this.settings.conflictResolutionStrategy; }
+    public getConflictStrategy() { 
+        if (this.isTwoDeviceMode() && this.settings.enableTwoDeviceOptimizations) return 'role-based';
+        return this.settings.syncMode === 'auto' ? 'create-conflict-file' : this.settings.conflictResolutionStrategy; 
+    }
     public shouldSyncAllFileTypes() { return this.settings.syncMode === 'auto' ? true : this.settings.syncAllFileTypes; }
     public shouldSyncObsidianConfig() { return this.settings.syncMode === 'auto' ? true : this.settings.syncObsidianConfig; }
     public getConnectionMode() { return this.settings.syncMode === 'auto' ? 'peerjs' : this.settings.connectionMode; }
@@ -849,15 +988,132 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     private generateTransferId(path: string): string { return `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
-    private handleEvent(file: TAbstractFile) { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; if (!this.hasPeers()) return; if (!this.app.vault.getAbstractFileByPath(file.path)) { this.handleFileDelete(file); return; } this.debouncedHandleFileChange(file); }
-    private async handleFileChange(file: TAbstractFile) { await this.runLocked(file.path, async () => { this.log(`Processing debounced change for: ${file.path}`); if (file instanceof TFile) { await this.sendFileUpdate(file); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-create', path: file.path, transferId: this.generateTransferId(file.path) }); } }); }
-    private async handleFileDelete(file: TAbstractFile) { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; this.log(`Processing delete: ${file.path}`); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-delete', path: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-delete', path: file.path, transferId }); } }); }
-    private async handleRenameEvent(file: TAbstractFile, oldPath: string) { await this.runLocked(oldPath, async () => { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; if (!this.hasPeers()) return; this.log(`Processing rename: ${oldPath} -> ${file.path}`); this.ignoreNextEventForPath(file.path); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId }); } }); }); }
     
+    // --- File System Events ---
+    private handleEvent(file: TAbstractFile) { 
+        if (this.shouldIgnoreEvent(file.path)) return; 
+        if (!this.isPathSyncable(file.path)) return; 
+        if (!this.hasPeers()) return; 
+        
+        if (this.isTwoDeviceMode() && this.remoteLocks.has(file.path)) {
+            if (Date.now() < this.remoteLocks.get(file.path)!.expiresAt) {
+                this.showNotice(`File ${file.name} is locked by peer. Sync delayed.`, 'warning');
+            } else {
+                this.remoteLocks.delete(file.path);
+            }
+        }
+        
+        if (!this.app.vault.getAbstractFileByPath(file.path)) { 
+            this.handleFileDelete(file); 
+            return; 
+        } 
+        this.debouncedHandleFileChange(file); 
+    }
+    
+    private async handleFileChange(file: TAbstractFile) { 
+        await this.runLocked(file.path, async () => { 
+            this.log(`Processing debounced change for: ${file.path}`); 
+            
+            if (this.isTwoDeviceMode() && !this.heldLocks.has(file.path) && file instanceof TFile && !this.isBinary(file.extension)) {
+                await this.requestLock(file.path);
+            }
+
+            if (file instanceof TFile) { 
+                if (this.isTwoDeviceMode()) this.incrementVersion(file.path);
+                await this.sendFileUpdate(file); 
+            } else if (file instanceof TFolder) { 
+                this.broadcastData({ type: 'folder-create', path: file.path, transferId: this.generateTransferId(file.path) }); 
+            } 
+        }); 
+    }
+    
+    private async handleFileDelete(file: TAbstractFile) { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path)) return; this.log(`Processing delete: ${file.path}`); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { if (this.isTwoDeviceMode()) this.incrementVersion(file.path); this.broadcastData({ type: 'file-delete', path: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-delete', path: file.path, transferId }); } }); }
+    private async handleRenameEvent(file: TAbstractFile, oldPath: string) { await this.runLocked(oldPath, async () => { await this.runLocked(file.path, async () => { if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; if (!this.hasPeers()) return; this.log(`Processing rename: ${oldPath} -> ${file.path}`); this.ignoreNextEventForPath(file.path); const transferId = this.generateTransferId(file.path); if (file instanceof TFile) { if (this.isTwoDeviceMode()) { this.incrementVersion(oldPath); this.incrementVersion(file.path); } this.broadcastData({ type: 'file-rename', oldPath, newPath: file.path, transferId }); } else if (file instanceof TFolder) { this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId }); } }); }); }
+
+    // --- Real-time Editor Sync ---
+    private handleEditorChange(editor: any, info: any) {
+        if (!this.isTwoDeviceMode() || !this.settings.enableRealtimeSync) return;
+        
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view || !view.file) return;
+        const path = view.file.path;
+
+        if (this.isApplyingRemoteEdit || this.shouldIgnoreEvent(path)) return;
+
+        if (!this.heldLocks.has(path)) {
+            this.requestLock(path);
+            this.sendData(this.twoDevicePeerId!, { type: 'editor-active', path });
+        }
+
+        this.debouncedEditorChange(editor, view.file);
+    }
+
+    private async handleEditorChangeDebounced(editor: any, file: TFile) {
+        if (!this.isTwoDeviceMode() || !this.settings.enableRealtimeSync) return;
+        const path = file.path;
+        
+        const currentText = editor.getValue();
+        const cached = this.lastSentContent.get(path);
+        
+        if (cached) {
+            const dmp = new DiffMatchPatch();
+            const patches = dmp.patch_make(cached.content, currentText);
+            if (patches.length > 0) {
+                const payload: EditorDeltaPayload = { type: 'editor-delta', path, patches };
+                this.sendData(this.twoDevicePeerId!, payload);
+            }
+        }
+        this.lastSentContent.set(path, { content: currentText, timestamp: Date.now() });
+    }
+
+    // --- PSK Encryption ---
+    async generatePSK(): Promise<string> {
+        const key = await window.crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+        const exported = await window.crypto.subtle.exportKey('raw', key);
+        return arrayBufferToBase64(exported);
+    }
+
+    async encryptPayload(data: any, pskBase64: string): Promise<any> {
+        try {
+            const keyData = base64ToArrayBuffer(pskBase64);
+            const key = await window.crypto.subtle.importKey('raw', keyData, { name: 'AES-GCM' }, false, ['encrypt']);
+            const iv = window.crypto.getRandomValues(new Uint8Array(12));
+            const encoded = new TextEncoder().encode(JSON.stringify(data));
+            const encrypted = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+            
+            return {
+                type: 'encrypted',
+                iv: arrayBufferToBase64(iv.buffer),
+                data: arrayBufferToBase64(encrypted)
+            };
+        } catch (e) {
+            this.log("Encryption failed, falling back to plaintext", e);
+            return data;
+        }
+    }
+
+    async decryptPayload(encryptedPayload: any, pskBase64: string): Promise<any> {
+        try {
+            const keyData = base64ToArrayBuffer(pskBase64);
+            const key = await window.crypto.subtle.importKey('raw', keyData, { name: 'AES-GCM' }, false, ['decrypt']);
+            const iv = base64ToArrayBuffer(encryptedPayload.iv);
+            const data = base64ToArrayBuffer(encryptedPayload.data);
+            
+            const decrypted = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, key, data);
+            const decoded = new TextDecoder().decode(decrypted);
+            return JSON.parse(decoded);
+        } catch (e) {
+            this.log("Decryption failed", e);
+            throw new Error("Decryption failed");
+        }
+    }
+
+    // --- Communication Layer ---
     broadcastData(data: SyncData) { this.addToQueue(null, data); }
     sendData(peerId: string, data: SyncData) { this.addToQueue(peerId, data); }
     
     private computePriority(data: SyncData): number {
+        if (data.type === 'editor-delta' || data.type === 'editor-active' || data.type.startsWith('lock-')) return -1; 
         if (data.type === 'folder-create' || data.type === 'folder-delete' || data.type === 'folder-rename') return 0;
         if (data.type === 'file-update') {
             const size = data.content instanceof ArrayBuffer ? data.content.byteLength : (typeof data.content === 'string' ? data.content.length : 0);
@@ -991,7 +1247,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
-    private async processQueueItem(item: { peerId: string | null, data: SyncData, retries: number, priority: number }) {
+    private async processQueueItem(item: { peerId: string | null, data: any, retries: number, priority: number }) {
         let transferId: string | undefined;
         let isPaused = false;
         let success = false;
@@ -999,7 +1255,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         try {
             let { peerId, data } = item;
-            transferId = (data as any).transferId;
+            transferId = data.transferId;
 
             if (!peerId && (data.type === 'file-update' || data.type === 'file-delta')) {
                 let connectedPeers: string[] = [];
@@ -1018,7 +1274,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 peerId = connectedPeers[0];
                 
                 for (let i = 1; i < connectedPeers.length; i++) {
-                    const newData = { ...data, transferId: this.generateTransferId((data as any).path) };
+                    const newData = { ...data, transferId: this.generateTransferId(data.path) };
                     this.addToQueue(connectedPeers[i], newData);
                 }
             }
@@ -1039,11 +1295,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         });
                     });
 
-                    await this.sendFileInChunks(peerId, fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!, 0, fileData.compressed);
+                    await this.sendFileInChunks(peerId, fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!, 0, fileData.compressed, fileData.versionVector);
                     await ackPromise;
                     this.log(`Chunked transfer ${transferId} for ${fileData.path} completed successfully.`);
                 }
             } else {
+                let finalPayload = data;
+                if (this.settings.enableEncryption && peerId && this.settings.peerKeys[peerId]) {
+                    finalPayload = await this.encryptPayload(data, this.settings.peerKeys[peerId]);
+                }
+
                 if ((data.type === 'file-update' || data.type === 'file-delta') && peerId) {
                     const ackPromise = new Promise<void>((resolve, reject) => {
                         const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 15000);
@@ -1055,23 +1316,27 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     });
 
                     if (this.getConnectionMode() === 'direct-ip') {
-                        if (this.directIpClient) this.directIpClient.send(data);
-                        else if (this.directIpServer) this.directIpServer.sendTo(peerId, data);
+                        if (this.directIpClient) this.directIpClient.send(finalPayload);
+                        else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
                     } else {
                         const conn = this.connections.get(peerId);
-                        if (conn?.open) conn.send(data);
+                        if (conn?.open) conn.send(finalPayload);
                         else throw new Error("Connection closed");
                     }
                     await ackPromise;
                 } else 
                 if (this.getConnectionMode() === 'direct-ip') {
-                    if (this.directIpClient) this.directIpClient.send(data);
-                    else if (this.directIpServer) this.directIpServer.send(data);
+                    if (this.directIpClient) this.directIpClient.send(finalPayload);
+                    else if (this.directIpServer) this.directIpServer.send(finalPayload);
                 } else {
                     const peersToSend = peerId ? [peerId] : Array.from(this.connections.keys());
-                    peersToSend.forEach(pId => {
+                    peersToSend.forEach(async pId => {
+                        let pPayload = data;
+                        if (this.settings.enableEncryption && this.settings.peerKeys[pId]) {
+                            pPayload = await this.encryptPayload(data, this.settings.peerKeys[pId]);
+                        }
                         const conn = this.connections.get(pId);
-                        if (conn?.open) { conn.send(data); }
+                        if (conn?.open) { conn.send(pPayload); }
                     });
                 }
             }
@@ -1096,7 +1361,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (e instanceof Error && e.message.includes('IntegrityError')) {
                 this.log(`Integrity failure for transfer ${transferId}.`);
                 if (item.data.type === 'file-delta') {
-                    const file = this.app.vault.getAbstractFileByPath((item.data as any).path);
+                    const file = this.app.vault.getAbstractFileByPath(item.data.path);
                     if (file instanceof TFile) {
                         this.sendFileUpdate(file, item.peerId || undefined, true);
                     }
@@ -1121,14 +1386,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.syncQueue.splice(low, 0, item);
                 await new Promise(resolve => setTimeout(resolve, 1000));
             } else if (item) {
-                this.showNotice(`File transfer failed permanently for ${(item.data as any).path || 'an item'}.`, 'error', 8000);
+                this.showNotice(`File transfer failed permanently for ${item.data.path || 'an item'}.`, 'error', 8000);
                 if (this.isSyncing) this.abortSync("Transfer failed permanently.");
                 
                 if (item.data.type === 'file-update' || item.data.type === 'file-delete' || item.data.type === 'file-delta') {
-                    const existing = this.failedSyncs.find(f => f.path === (item.data as any).path && f.peerId === item.peerId && f.type === item.data.type);
+                    const existing = this.failedSyncs.find(f => f.path === item.data.path && f.peerId === item.peerId && f.type === item.data.type);
                     if (!existing) {
                         this.failedSyncs.push({
-                            path: (item.data as any).path,
+                            path: item.data.path,
                             peerId: item.peerId,
                             timestamp: Date.now(),
                             type: item.data.type as any,
@@ -1147,7 +1412,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.reportTransferResult(success);
                 
                 if (success) {
-                    const path = (item.data as any).path;
+                    const path = item.data.path;
                     if (path) {
                         const failIndex = this.failedSyncs.findIndex(f => f.path === path && f.peerId === item.peerId && f.type === item.data.type);
                         if (failIndex !== -1) {
@@ -1317,9 +1582,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.pendingConnections.delete(conn.peer);
             this.log("DataConnection open with:", conn.peer);
             conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin });
+            
+            if (this.isTwoDeviceMode()) {
+                this.currentRole = this.getMyRole(conn.peer);
+                conn.send({ type: 'role-announcement', role: this.currentRole, deviceId: this.settings.deviceId });
+            }
+            
             this.resumeTransfers(conn.peer);
         });
-        conn.on('data', (data: any) => this.processIncomingData(data, conn));
+        conn.on('data', async (raw: any) => {
+            this.handleRawIncomingData(raw, conn);
+        });
         conn.on('close', () => {
             this.pendingConnections.delete(conn.peer);
             const peerId = conn.peer;
@@ -1327,6 +1600,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.connections.delete(peerId);
             this.lastHeard.delete(peerId);
             this.manualPingStart.delete(peerId);
+            
+            // Clear remote locks from this peer
+            for (const [path, lock] of this.remoteLocks.entries()) {
+                if (lock.peerId === peerId) this.remoteLocks.delete(path);
+            }
 
             for (const [id, transfer] of this.activeTransfers.entries()) {
                 if (transfer.peerId === peerId && transfer.direction === 'download') {
@@ -1355,6 +1633,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             console.error(`Connection error with ${conn.peer}:`, err); 
             this.showNotice(`Connection error with a peer.`, 'error'); 
         });
+    }
+
+    async handleRawIncomingData(raw: any, conn: DataConnection) {
+        let data = raw;
+        if (raw && raw.type === 'encrypted') {
+            if (this.settings.peerKeys[conn.peer]) {
+                try {
+                    data = await this.decryptPayload(raw, this.settings.peerKeys[conn.peer]);
+                } catch(e) {
+                    this.log("Decryption failed, ignoring message", e);
+                    return;
+                }
+            } else {
+                this.log("Received encrypted message but no PSK found for peer", conn.peer);
+                return;
+            }
+        }
+        this.processIncomingData(data, conn);
     }
     
     async resumeTransfers(peerId: string) {
@@ -1386,7 +1682,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 });
 
                 try {
-                    await this.sendFileInChunks(t.peerId, t.path, file.stat.mtime, content, t.id, t.processedChunks, t.compressed);
+                    const vv = this.twoDeviceState.fileVersions[t.path];
+                    await this.sendFileInChunks(t.peerId, t.path, file.stat.mtime, content, t.id, t.processedChunks, t.compressed, vv);
                     await ackPromise;
                     this.log(`Resumed transfer ${t.id} completed.`);
                     this.activeTransfers.delete(t.id);
@@ -1412,7 +1709,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const now = Date.now();
             this.connections.forEach((conn, peerId) => {
                 if (conn.open) {
-                    conn.send({ type: 'ping' });
+                    this.sendData(peerId, { type: 'ping' });
                     const last = this.lastHeard.get(peerId);
                     if (last && now - last > 6000) {
                         this.log(`Peer ${peerId} timed out (Heartbeat).`);
@@ -1428,6 +1725,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (conn?.peer) this.lastHeard.set(conn.peer, Date.now());
         switch (data.type) {
             case 'handshake': this.handleHandshake(data, conn!); break;
+            case 'role-announcement': 
+                if (this.isTwoDeviceMode()) {
+                    this.log(`Role announcement from ${data.deviceId}: ${data.role}`);
+                    // Validation: my role should be opposite
+                    if (data.role === this.currentRole) {
+                        this.log(`Role conflict detected! Re-evaluating.`);
+                        this.currentRole = this.getMyRole(data.deviceId);
+                    }
+                }
+                break;
             case 'cluster-gossip': this.handleClusterGossip(data); break;
             case 'companion-pair': this.handleCompanionPair(data); break;
             case 'ack':
@@ -1488,6 +1795,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             case 'cluster-forget': this.handleClusterForget(data); break;
             case 'cluster-kick': this.handleClusterKick(data); break;
             case 'cluster-rename': this.handleClusterRename(data); break;
+            
+            // Locking
+            case 'lock-request': this.handleLockRequest(data, conn!); break;
+            case 'lock-grant': this.handleLockGrant(data); break;
+            case 'lock-deny': this.handleLockDeny(data); break;
+            case 'lock-release': this.handleLockRelease(data, conn!); break;
+            
+            // Editor Sync
+            case 'editor-active': this.handleEditorActive(data, conn!); break;
+            case 'editor-delta': this.handleEditorDelta(data); break;
+            
+            // Merkle
+            case 'merkle-root': this.handleMerkleRoot(data, conn!); break;
+            case 'merkle-node-request': this.handleMerkleNodeRequest(data, conn!); break;
+            case 'merkle-node-response': this.handleMerkleNodeResponse(data, conn!); break;
         }
     }
 
@@ -1505,8 +1827,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
         this.saveKnownPeers();
         const existingPeers = Array.from(this.clusterPeers.values());
-        conn.send({ type: 'cluster-gossip', peers: existingPeers });
+        this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers });
         this.broadcastData({ type: 'cluster-gossip', peers: [this.getMyPeerInfo(), data.peerInfo] });
+        
+        if (this.isTwoDeviceMode()) {
+            this.currentRole = this.getMyRole(conn.peer);
+            this.sendData(conn.peer, { type: 'role-announcement', role: this.currentRole, deviceId: this.settings.deviceId });
+        }
     }
 
     handleClusterGossip(data: ClusterGossipPayload) {
@@ -1620,9 +1947,123 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private async getHash(buffer: ArrayBuffer | string): Promise<string> {
         const data = typeof buffer === 'string' ? new TextEncoder().encode(buffer) : buffer;
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // --- Locking Handlers ---
+    async requestLock(path: string): Promise<boolean> {
+        if (!this.isTwoDeviceMode() || !this.twoDevicePeerId) return true;
+        const requestId = this.generateTransferId(path);
+        
+        return new Promise((resolve) => {
+            const timeout = window.setTimeout(() => {
+                this.pendingLockRequests.delete(requestId);
+                resolve(false);
+            }, 5000);
+            
+            this.pendingLockRequests.set(requestId, { resolve, timeout });
+            this.sendData(this.twoDevicePeerId!, { type: 'lock-request', path, requestId });
+        });
+    }
+
+    handleLockRequest(data: LockRequestPayload, conn: DataConnection) {
+        const path = data.path;
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const isEditing = view && view.file && view.file.path === path;
+        
+        if (isEditing || this.heldLocks.has(path)) {
+            this.sendData(conn.peer, { type: 'lock-deny', path, requestId: data.requestId, reason: 'File is actively being edited' });
+        } else {
+            const expiresAt = Date.now() + LOCK_EXPIRATION_MS;
+            this.remoteLocks.set(path, { peerId: conn.peer, expiresAt });
+            this.sendData(conn.peer, { type: 'lock-grant', path, requestId: data.requestId, grantedUntil: expiresAt });
+        }
+    }
+
+    handleLockGrant(data: LockGrantPayload) {
+        if (this.pendingLockRequests.has(data.requestId)) {
+            const req = this.pendingLockRequests.get(data.requestId)!;
+            clearTimeout(req.timeout);
+            this.heldLocks.set(data.path, { peerId: this.twoDevicePeerId!, expiresAt: data.grantedUntil });
+            req.resolve(true);
+            this.pendingLockRequests.delete(data.requestId);
+        }
+    }
+
+    handleLockDeny(data: LockDenyPayload) {
+        if (this.pendingLockRequests.has(data.requestId)) {
+            const req = this.pendingLockRequests.get(data.requestId)!;
+            clearTimeout(req.timeout);
+            req.resolve(false);
+            this.pendingLockRequests.delete(data.requestId);
+            this.showNotice(`Lock denied for ${data.path}: ${data.reason}`, 'warning');
+        }
+    }
+
+    handleLockRelease(data: LockReleasePayload, conn: DataConnection) {
+        if (this.remoteLocks.has(data.path) && this.remoteLocks.get(data.path)!.peerId === conn.peer) {
+            this.remoteLocks.delete(data.path);
+        }
+    }
+    
+    cleanupLocks() {
+        const now = Date.now();
+        for (const [path, lock] of this.heldLocks.entries()) {
+            if (now > lock.expiresAt) {
+                this.heldLocks.delete(path);
+                if (this.twoDevicePeerId) this.sendData(this.twoDevicePeerId, { type: 'lock-release', path });
+            }
+        }
+        for (const [path, lock] of this.remoteLocks.entries()) {
+            if (now > lock.expiresAt) {
+                this.remoteLocks.delete(path);
+            }
+        }
+    }
+
+    // --- Editor Sync Handlers ---
+    handleEditorActive(data: EditorActivatePayload, conn: DataConnection) {
+        this.activeEditorLocks.set(data.path, conn.peer);
+        this.showNotice(`Peer is actively editing ${data.path}`, 'info', 3000);
+    }
+
+    handleEditorDelta(data: EditorDeltaPayload) {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view && view.file && view.file.path === data.path) {
+            const cm = (view as any).editor?.cm;
+            if (cm) {
+                this.isApplyingRemoteEdit = true;
+                this.ignoreNextEventForPath(data.path);
+                
+                const currentText = view.editor.getValue();
+                const dmp = new DiffMatchPatch();
+                const [newText, results] = dmp.patch_apply(data.patches, currentText);
+                
+                if (results.every(r => r === true)) {
+                    const diff = dmp.diff_main(currentText, newText);
+                            dmp.diff_cleanupSemantic(diff);
+                            let offset = 0;
+                            const changes: Array<{ from: number, to?: number, insert?: string }> = [];
+                            for (const [op, text] of diff) {
+                                if (op === 0) { offset += text.length; } 
+                                else if (op === -1) { changes.push({ from: offset, to: offset + text.length }); } 
+                                else if (op === 1) { changes.push({ from: offset, insert: text }); offset += text.length; }
+                            }
+                    
+                    const tx: any = { changes };
+                    const syncAnnotation = (window as any).CM_Annotation ? (window as any).CM_Annotation.define() : null;
+                    if (syncAnnotation) tx.annotations = syncAnnotation.of('remote-sync');
+                    
+                    cm.dispatch(tx);
+                    
+                    this.lastSentContent.set(data.path, { content: newText, timestamp: Date.now() });
+                }
+                
+                setTimeout(() => this.isApplyingRemoteEdit = false, 50);
+            }
+        }
     }
 
     async sendFileUpdate(file: TFile, peerId?: string, forceFull: boolean = false) {
@@ -1654,6 +2095,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             } catch(e) {}
 
             let isCompressedText = false;
+            let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[file.path] : undefined;
+
             if (!isBinaryFile) {
                 if (this.settings.enableDeltaSync && !forceFull) {
                     const cached = this.lastSentContent.get(file.path);
@@ -1670,6 +2113,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                 mtime: file.stat.mtime,
                                 patches,
                                 baseHash,
+                                versionVector: vv,
                                 transferId: this.generateTransferId(file.path)
                             };
                             this.lastSentContent.set(file.path, { content: newText, timestamp: Date.now() });
@@ -1692,12 +2136,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 encoding = 'binary';
             }
 
-            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding, transferId: this.generateTransferId(file.path), fileHash: hash, compressed: isCompressedText };
+            const payload: FileUpdatePayload = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding, transferId: this.generateTransferId(file.path), fileHash: hash, compressed: isCompressedText, versionVector: vv };
             if (peerId) { this.sendData(peerId, payload); } else { this.broadcastData(payload); }
         } catch (e) { console.error(`Error reading file ${file.path} for sync:`, e); }
     }
 
-    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string, startIndex = 0, compressed?: boolean) {
+    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string, startIndex = 0, compressed?: boolean, versionVector?: VersionVector) {
         const isDirectIp = this.getConnectionMode() === 'direct-ip';
         let conn: DataConnection | undefined;
 
@@ -1738,12 +2182,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let lastYieldTime = Date.now();
         
         if (startIndex === 0) {
-            const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed };
+            const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector };
             if (isDirectIp) {
-                if (this.directIpClient) this.directIpClient.send(startPayload);
-                else if (this.directIpServer) this.directIpServer.sendTo(peerId, startPayload);
+                let encPayload: any = startPayload;
+                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(startPayload, this.settings.peerKeys[peerId]);
+                if (this.directIpClient) this.directIpClient.send(encPayload);
+                else if (this.directIpServer) this.directIpServer.sendTo(peerId, encPayload);
             }
-            else conn!.send(startPayload);
+            else {
+                let encPayload: any = startPayload;
+                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(startPayload, this.settings.peerKeys[peerId]);
+                conn!.send(encPayload);
+            }
         }
         
         for (let i = startIndex; i < totalChunks; i++) {
@@ -1773,9 +2223,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const start = i * chunkSize; const end = start + chunkSize; const chunk = fileContent.slice(start, end);
                 const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk };
                 
+                let encPayload: any = chunkPayload;
+                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(chunkPayload, this.settings.peerKeys[peerId]);
+
                 if (isDirectIp) {
-                    if (this.directIpClient) this.directIpClient.send(chunkPayload);
-                    else if (this.directIpServer) this.directIpServer.sendTo(peerId, chunkPayload);
+                    if (this.directIpClient) this.directIpClient.send(encPayload);
+                    else if (this.directIpServer) this.directIpServer.sendTo(peerId, encPayload);
 
                     const getBuffer = () => this.directIpClient ? this.directIpClient.getBufferedAmount() : this.directIpServer!.getBufferedAmount(peerId);
                     if (getBuffer() > 1024 * 1024 * 16) {
@@ -1789,7 +2242,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                 }
                 else {
-                    conn!.send(chunkPayload);
+                    conn!.send(encPayload);
                     
                     if ((conn! as any).dataChannel && (conn! as any).dataChannel.bufferedAmount > 1024 * 1024 * 16) {
                         await new Promise<void>(resolve => {
@@ -1828,7 +2281,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     handleFileChunkStart(payload: FileChunkStartPayload, conn: DataConnection | null) { 
-        this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, receivedCount: 0, lastUpdated: Date.now(), fileHash: payload.fileHash || '', compressed: payload.compressed }); 
+        this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, receivedCount: 0, lastUpdated: Date.now(), fileHash: payload.fileHash || '', compressed: payload.compressed, versionVector: payload.versionVector }); 
         this.activeTransfers.set(payload.transferId, {
             id: payload.transferId,
             path: payload.path,
@@ -1881,7 +2334,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     return;
                 }
 
-                await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId, compressed: transfer.compressed });
+                await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId, compressed: transfer.compressed, versionVector: transfer.versionVector });
                 conn.send({ type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
             } catch (e) {
                 this.log(`Failed to apply chunked file update: ${transfer.path}`, e);
@@ -1928,7 +2381,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 throw new Error("IntegrityError: File not found for delta sync");
             }
             
-            if (data.mtime <= existingFile.stat.mtime + this.settings.mtimeTolerance && data.mtime >= existingFile.stat.mtime - this.settings.mtimeTolerance) {
+            if (this.isTwoDeviceMode() && data.versionVector) {
+                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+                if (this.isNewerThan(localVV, data.versionVector) && !this.isNewerThan(data.versionVector, localVV)) {
+                    return;
+                }
+            } else if (data.mtime <= existingFile.stat.mtime + this.settings.mtimeTolerance && data.mtime >= existingFile.stat.mtime - this.settings.mtimeTolerance) {
                 return;
             }
 
@@ -1949,6 +2407,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             this.ignoreNextEventForPath(data.path);
             await this.app.vault.modify(existingFile, newContent, { mtime: data.mtime });
+            
+            if (this.isTwoDeviceMode() && data.versionVector) {
+                this.twoDeviceState.fileVersions[data.path] = data.versionVector;
+            }
             
             const newHash = await this.getHash(newContent);
             this.syncedHashes.set(data.path, { hash: newHash, timestamp: Date.now() });
@@ -1980,6 +2442,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const existingFile = this.app.vault.getAbstractFileByPath(data.path);
             if (!existingFile) {
                 await this.handleNewFileCreation(data);
+                if (this.isTwoDeviceMode() && data.versionVector) {
+                    this.twoDeviceState.fileVersions[data.path] = data.versionVector;
+                }
             } else if (existingFile instanceof TFile) {
                 await this.handleFileModification(data, existingFile);
             } else {
@@ -2029,6 +2494,47 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private async handleFileModification(data: FileUpdatePayload, existingFile: TFile) {
         try {
+            const localContent = (data.encoding === 'binary' || data.encoding === 'base64')
+                ? await this.app.vault.readBinary(existingFile)
+                : await this.app.vault.cachedRead(existingFile);
+
+            const contentIsSame = (data.encoding === 'binary' || data.encoding === 'base64')
+                ? await this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
+                : localContent === data.content;
+
+            if (contentIsSame) {
+                this.log(`Ignoring update (content is identical): ${data.path}`);
+                if (this.isTwoDeviceMode() && data.versionVector) {
+                    this.twoDeviceState.fileVersions[data.path] = this.mergeVersions(this.twoDeviceState.fileVersions[data.path] || {}, data.versionVector);
+                }
+                return;
+            }
+
+            if (this.isTwoDeviceMode() && data.versionVector) {
+                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+                const remoteVV = data.versionVector;
+                const isRemoteNewer = this.isNewerThan(remoteVV, localVV);
+                const isLocalNewer = this.isNewerThan(localVV, remoteVV);
+
+                if (isRemoteNewer && !isLocalNewer) {
+                    this.log(`Applying update (remote vector dominates): ${data.path}`);
+                    this.ignoreNextEventForPath(data.path);
+                    if (data.encoding === 'binary' || data.encoding === 'base64') {
+                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
+                    } else {
+                        await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
+                    }
+                    this.twoDeviceState.fileVersions[data.path] = remoteVV;
+                    return;
+                } else if (isLocalNewer && !isRemoteNewer) {
+                    this.log(`Ignoring update (local vector dominates): ${data.path}`);
+                    return;
+                } else {
+                    await this.resolveConflict(data, existingFile, localContent);
+                    return;
+                }
+            }
+
             if (data.mtime > existingFile.stat.mtime + this.settings.mtimeTolerance) {
                 this.log(`Applying update (remote is newer): ${data.path}`);
                 this.ignoreNextEventForPath(data.path);
@@ -2050,19 +2556,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 return;
             }
 
-            const localContent = (data.encoding === 'binary' || data.encoding === 'base64')
-                ? await this.app.vault.readBinary(existingFile)
-                : await this.app.vault.cachedRead(existingFile);
-
-            const contentIsSame = (data.encoding === 'binary' || data.encoding === 'base64')
-                ? await this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
-                : localContent === data.content;
-
-            if (contentIsSame) {
-                this.log(`Ignoring update (content is identical): ${data.path}`);
-                return;
-            }
-
             await this.resolveConflict(data, existingFile, localContent);
         } catch (e) {
             if (e instanceof Error && (e.message.includes("File not found") || e.message.includes("no such file"))) {
@@ -2081,6 +2574,30 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.log(`Conflict detected for: ${data.path}. Strategy: ${strategy}`);
 
         switch (strategy) {
+            case 'role-based':
+                if (this.currentRole === 'primary') {
+                    this.log(`Conflict resolved by 'role-based' (Primary wins - keeping local): ${data.path}`);
+                    const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+                    const merged = this.mergeVersions(localVV, data.versionVector || {});
+                    merged[this.settings.deviceId] = (merged[this.settings.deviceId] || 0) + 1;
+                    this.twoDeviceState.fileVersions[data.path] = merged;
+                    this.debouncedSaveState();
+                    
+                    if (this.twoDevicePeerId) {
+                        this.sendFileUpdate(existingFile, this.twoDevicePeerId, true);
+                    }
+                } else {
+                    this.log(`Conflict resolved by 'role-based' (Secondary yields - adopting remote): ${data.path}`);
+                    this.ignoreNextEventForPath(data.path);
+                    if (data.encoding === 'binary' || data.encoding === 'base64') {
+                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
+                    } else {
+                        await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
+                    }
+                    this.twoDeviceState.fileVersions[data.path] = data.versionVector || {};
+                }
+                break;
+
             case 'last-write-wins':
                 if (data.mtime > existingFile.stat.mtime) {
                     this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`);
@@ -2110,8 +2627,100 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async applyFolderDelete(data: FolderDeletePayload) { if (!this.isPathSyncable(data.path)) return; const folder = this.app.vault.getAbstractFileByPath(data.path); if (folder instanceof TFolder) { this.log(`Deleting folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); try { await this.app.vault.delete(folder, true); } catch (e) { console.error(`Failed to delete folder ${data.path}`, e); } } }
     async applyFolderRename(data: FolderRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const folder = this.app.vault.getAbstractFileByPath(data.oldPath); if (folder instanceof TFolder) { this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.oldPath); this.ignoreNextEventForPath(data.newPath); try { await this.app.vault.rename(folder, data.newPath); } catch (e) { console.error(`Failed to rename folder ${data.oldPath}`, e); } } }
 
-    async requestFullSyncFromPeer(peerId: string) { if (this.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } const conn = this.connections.get(peerId); if (!conn) { this.showNotice("Peer not found.", 'error'); return; } this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); this.isSyncing = true; this.updateStatus(); const localManifest = await this.buildVaultManifest(); this.log(`Sending sync request with ${localManifest.length} items.`); this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest }); }
+    async requestFullSyncFromPeer(peerId: string) { 
+        if (this.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } 
+        const conn = this.connections.get(peerId); 
+        if (!conn) { this.showNotice("Peer not found.", 'error'); return; } 
+        this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); 
+        this.isSyncing = true; 
+        this.updateStatus(); 
+        
+        if (this.isTwoDeviceMode()) {
+            const tree = await this.buildMerkleTree();
+            this.sendData(peerId, { type: 'merkle-root', rootHash: tree.hash });
+        } else {
+            const localManifest = await this.buildVaultManifest(); 
+            this.log(`Sending sync request with ${localManifest.length} items.`); 
+            this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest }); 
+        }
+    }
     
+    // --- Merkle Handlers ---
+    async handleMerkleRoot(data: MerkleRootPayload, conn: DataConnection) {
+        if (!this.isSyncing) { this.isSyncing = true; this.updateStatus(); }
+        const tree = await this.buildMerkleTree();
+        if (tree.hash === data.rootHash) {
+            this.log("Merkle roots match! Skipping full sync.");
+            this.handleFullSyncComplete();
+        } else {
+            this.log(`Merkle roots differ. Initiating tree traversal.`);
+            this.sendData(conn.peer, { type: 'merkle-node-request', path: '' });
+        }
+    }
+    
+    async handleMerkleNodeRequest(data: MerkleNodeRequestPayload, conn: DataConnection) {
+        const tree = this.twoDeviceState.merkleTreeRoot;
+        if (!tree) return;
+        
+        let targetNode = tree;
+        if (data.path !== '') {
+            const parts = data.path.split('/');
+            for (const p of parts) {
+                if (targetNode.children && targetNode.children[p]) {
+                    targetNode = targetNode.children[p];
+                } else {
+                    return; // Node not found
+                }
+            }
+        }
+        
+        const childHashes: Record<string, string> = {};
+        if (targetNode.children) {
+            for (const [key, node] of Object.entries(targetNode.children)) {
+                childHashes[key] = node.hash;
+            }
+        }
+        this.sendData(conn.peer, { type: 'merkle-node-response', path: data.path, children: childHashes });
+    }
+    
+    async handleMerkleNodeResponse(data: MerkleNodeResponsePayload, conn: DataConnection) {
+        const tree = this.twoDeviceState.merkleTreeRoot;
+        if (!tree) return;
+        
+        let targetNode = tree;
+        if (data.path !== '') {
+            const parts = data.path.split('/');
+            for (const p of parts) {
+                if (targetNode.children && targetNode.children[p]) targetNode = targetNode.children[p];
+            }
+        }
+        
+        const myChildren = targetNode.children || {};
+        const remoteChildren = data.children;
+        
+        const allKeys = new Set([...Object.keys(myChildren), ...Object.keys(remoteChildren)]);
+        
+        for (const key of allKeys) {
+            const myHash = myChildren[key]?.hash;
+            const remoteHash = remoteChildren[key];
+            const fullPath = data.path ? `${data.path}/${key}` : key;
+            
+            if (myHash !== remoteHash) {
+                const file = this.app.vault.getAbstractFileByPath(fullPath);
+                if (file instanceof TFolder || (!file && !fullPath.includes('.'))) {
+                    this.sendData(conn.peer, { type: 'merkle-node-request', path: fullPath });
+                } else {
+                    if (file instanceof TFile) {
+                        this.sendFileUpdate(file, conn.peer);
+                    }
+                }
+            }
+        }
+        
+        // Timeout to close sync state if no more requests
+        this.extendFullSyncTimeout();
+    }
+
     async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { 
         if (this.isSyncing) { 
             this.showNotice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`, 'verbose'); 
@@ -2135,6 +2744,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 else if (localItem.type === 'file' && remoteItem.type === 'file') { 
                     if (localItem.hash && remoteItem.hash && localItem.hash === remoteItem.hash) {
                         // Content matches, skip
+                    } else if (this.isTwoDeviceMode() && localItem.versionVector && remoteItem.versionVector) {
+                        if (this.isNewerThan(localItem.versionVector, remoteItem.versionVector)) filesReceiverWillSend.push(path);
                     } else if (localItem.mtime > remoteItem.mtime + this.settings.mtimeTolerance) { 
                         filesReceiverWillSend.push(path); 
                     } 
@@ -2147,6 +2758,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 else if (remoteItem.type === 'file' && localItem.type === 'file') { 
                     if (remoteItem.hash && localItem.hash && remoteItem.hash === localItem.hash) {
                         // Content matches, skip
+                    } else if (this.isTwoDeviceMode() && localItem.versionVector && remoteItem.versionVector) {
+                        if (this.isNewerThan(remoteItem.versionVector, localItem.versionVector)) filesInitiatorMustSend.push(path);
                     } else if (remoteItem.mtime > localItem.mtime + this.settings.mtimeTolerance) { 
                         filesInitiatorMustSend.push(path); 
                     } 
@@ -2225,7 +2838,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             this.syncedHashes.set(file.path, { hash, timestamp: Date.now() });
                         }
                     }
-                    manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash }); 
+                    let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[file.path] : undefined;
+                    manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash, versionVector: vv }); 
                     
                     count++;
                     if (count % 50 === 0) {
@@ -2385,7 +2999,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.peer || this.peer.disconnected) return { text: "Sync Offline", icon: "wifi-off", state: 'error' };
         if (!this.peer.id) return { text: "Connecting...", icon: "plug", spin: true, state: 'loading' };
         if (this.connections.size > 0) {
-            if (this.connections.size === 1) return { text: "Connected", icon: "check-circle", state: 'success' };
+            if (this.isTwoDeviceMode()) return { text: "Paired Sync Active", icon: "link", state: 'success' };
             return { text: `Connected (${this.connections.size})`, icon: "users", state: 'success' };
         }
         return { text: "Online", icon: "globe", state: 'neutral' };
@@ -2427,10 +3041,11 @@ class ConnectionModal extends Modal {
     private activeTab: 'quick-pair' | 'advanced' = 'quick-pair';
     private statusState: 'idle' | 'connecting' | 'connected' | 'error' = 'idle';
     private statusMessage: string = 'Not connected';
+    private activePsk: string | null = null;
 
     constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
 
-    onOpen() {
+    async onOpen() {
         this.injectStyles();
         this.contentEl.addClass(Platform.isMobile ? 'od-mobile' : 'od-desktop');
         
@@ -2438,6 +3053,8 @@ class ConnectionModal extends Modal {
             this.statusState = 'connected';
             this.statusMessage = `Connected to ${this.plugin.connections.size} device(s)`;
         }
+        
+        this.activePsk = await this.plugin.generatePSK();
         
         this.render();
     }
@@ -2520,10 +3137,6 @@ class ConnectionModal extends Modal {
             .od-mobile .od-full-width { width: 100%; margin-top: 10px; }
             .od-mobile .od-input-row { flex-direction: column; }
             .od-mobile .od-input-row button { width: 100%; margin-top: 5px; }
-
-            .od-id-icons { display: flex; gap: 8px; }
-            .od-icon-button { padding: 4px; border-radius: 4px; color: var(--text-muted); display: flex; align-items: center; transition: color 0.2s; }
-            .od-icon-button:hover { color: var(--text-normal); background-color: var(--background-modifier-hover); }
         `;
         document.head.appendChild(style);
     }
@@ -2589,14 +3202,23 @@ class ConnectionModal extends Modal {
         advancedBtn.onclick = () => { this.activeTab = 'advanced'; this.render(); };
     }
 
-    attemptConnection(peerId: string) {
-        if (!peerId.trim()) return;
+    async attemptConnection(scannedId: string) {
+        if (!scannedId.trim()) return;
+        
+        const parts = scannedId.split('|');
+        const peerId = this.normalizePairingCodeInput(parts[0]);
+        const psk = parts[1];
+        
+        if (psk) {
+            this.plugin.settings.peerKeys[peerId] = psk;
+            await this.plugin.saveSettings();
+        }
         
         this.statusState = 'connecting';
         this.statusMessage = `Connecting to ${peerId}...`;
         this.render();
 
-        const conn = this.plugin.peer?.connect(peerId.trim());
+        const conn = this.plugin.peer?.connect(peerId);
         if (!conn) {
             this.statusState = 'error';
             this.statusMessage = 'Failed to initiate connection. Are you online?';
@@ -2633,9 +3255,11 @@ class ConnectionModal extends Modal {
         const formattedCode = this.formatPairingCodeForDisplay(myInfo.deviceId);
         codeContainer.createDiv({ text: formattedCode, cls: 'od-pairing-code-text' });
         
+        const qrPayload = `${myInfo.deviceId}|${this.activePsk || ''}`;
+        
         const copyBtn = codeContainer.createEl('button', { text: 'Copy' });
         copyBtn.onclick = () => {
-            navigator.clipboard.writeText(myInfo.deviceId);
+            navigator.clipboard.writeText(qrPayload);
             copyBtn.setText('Copied!');
             setTimeout(() => copyBtn.setText('Copy'), 2000);
         };
@@ -2643,10 +3267,10 @@ class ConnectionModal extends Modal {
         contentEl.createDiv({ text: 'Type this code on your other device to connect', cls: 'od-instruction-text' });
         
         const qrSection = contentEl.createDiv({ cls: 'od-qr-section' });
-        qrSection.createDiv({ text: 'Or scan QR code', cls: 'od-qr-label' });
+        qrSection.createDiv({ text: 'Or scan QR code (Includes Encryption Key)', cls: 'od-qr-label' });
         
         const imgEl = qrSection.createEl('img');
-        QRCode.toDataURL(myInfo.deviceId, { width: 150, margin: 2 }).then(url => {
+        QRCode.toDataURL(qrPayload, { width: 150, margin: 2 }).then(url => {
             imgEl.src = url;
         }).catch(err => {
             qrSection.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
@@ -2655,7 +3279,7 @@ class ConnectionModal extends Modal {
         const scanBtn = qrSection.createEl('button', { text: 'Scan QR Code', cls: 'od-full-width' });
         scanBtn.onclick = () => {
             new QRScannerModal(this.app, (scannedId) => {
-                this.attemptConnection(this.normalizePairingCodeInput(scannedId));
+                this.attemptConnection(scannedId);
             }).open();
         };
 
@@ -2665,12 +3289,11 @@ class ConnectionModal extends Modal {
         contentEl.createDiv({ text: 'Step 2: Enter Their Code', cls: 'od-step-header' });
         
         const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
-        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter their pairing code' });
+        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter their pairing code or paste full key' });
         
         const connectBtn = inputRow.createEl('button', { text: 'Connect', cls: 'mod-cta' });
         connectBtn.onclick = () => {
-            const normalized = this.normalizePairingCodeInput(input.value);
-            this.attemptConnection(normalized);
+            this.attemptConnection(input.value);
         };
 
         // LAN Discovery
@@ -3126,6 +3749,38 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     }
 
     displayAdvancedSettings(containerEl: HTMLElement): void {
+        containerEl.createEl('h4', { text: 'Two-Device Enhancements' });
+        
+        new Setting(containerEl)
+            .setName("Enable Two-Device Optimizations")
+            .setDesc("If exactly one device is connected, enables Version Vectors, Merkle Tree syncing, and Role-based conflict resolution.")
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableTwoDeviceOptimizations)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableTwoDeviceOptimizations = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Enable End-to-End Encryption")
+            .setDesc("Uses AES-GCM encryption with a PSK exchanged during pairing. Highly recommended.")
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableEncryption)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableEncryption = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName("Enable Real-time Editor Sync")
+            .setDesc("Streams keystrokes via CM6 transactions while typing to avoid sync conflicts completely.")
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableRealtimeSync)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableRealtimeSync = value;
+                    await this.plugin.saveSettings();
+                }));
+
         containerEl.createEl('h4', { text: 'Advanced Settings' });
         
         new Setting(containerEl)
