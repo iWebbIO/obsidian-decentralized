@@ -4135,17 +4135,17 @@ class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
+        containerEl.createEl('h4', { text: 'Advanced Settings' });
+
         new Setting(containerEl)
-            .setName("Enable Real-time Editor Sync")
-            .setDesc("Streams keystrokes via CM6 transactions while typing to avoid sync conflicts completely.")
+            .setName("Turbo Real-time")
+            .setDesc("WARNING: Streams live keystrokes instantly to avoid conflicts. Requires a flawless connection and a strict 2-device setup. Can be destructive if misused.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.enableRealtimeSync)
                 .onChange(async (value) => {
                     this.plugin.settings.enableRealtimeSync = value;
                     await this.plugin.saveSettings();
                 }));
-
-        containerEl.createEl('h4', { text: 'Advanced Settings' });
         
         new Setting(containerEl)
             .setName("Enable Text Compression")
