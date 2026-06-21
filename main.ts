@@ -290,7 +290,7 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 }
 
 function formatBytes(bytes: number, decimals = 2) {
-    if (bytes === 0) return '0 Bytes';
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 Bytes';
     const k = 1024;
     const dm = decimals < 0 ? 0 : decimals;
     const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
@@ -547,7 +547,12 @@ class DirectIpServer {
             if (deviceId !== 'unknown' && this.clients.has(deviceId)) {
                 const client = this.clients.get(deviceId)!;
                 messagesToSend = client.queue.splice(0, 200);
-                client.bufferedAmount = 0;
+                if (client.queue.length === 0) {
+                    client.bufferedAmount = 0;
+                } else {
+                    const sentSize = messagesToSend.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+                    client.bufferedAmount = Math.max(0, client.bufferedAmount - sentSize);
+                }
             }
 
             const messages = messagesToSend.map(msg => {
@@ -787,6 +792,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
     private currentConcurrency = 8;
+    private processingQueue = false;
     private currentChunkSize = 512 * 1024;
     private targetChunkSize = 512 * 1024;
     private successfulTransfersSinceLastIncrease = 0;
@@ -889,6 +895,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     // --- Core Two-Device Infrastructure ---
     isTwoDeviceMode(): boolean {
+        if (this.currentSyncIsTwoDeviceMode !== null) return this.currentSyncIsTwoDeviceMode;
         return this.settings.enableTwoDeviceOptimizations && this.connections.size === 1;
     }
 
@@ -1182,13 +1189,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     
     private async handleRenameEvent(file: TAbstractFile, oldPath: string) { 
-        await this.runLocked(oldPath, async () => { 
-            await this.runLocked(file.path, async () => { 
+        // Acquire locks in sorted order to prevent deadlock between concurrent renames (e.g. A→B and B→A)
+        const [firstLock, secondLock] = [oldPath, file.path].sort();
+        await this.runLocked(firstLock, async () => { 
+            await this.runLocked(secondLock, async () => { 
                 if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; 
                 if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; 
                 if (!this.hasPeers()) return; 
                 this.log(`Processing rename: ${oldPath} -> ${file.path}`); 
                 this.ignoreNextEventForPath(file.path); 
+                this.ignoreNextEventForPath(oldPath); 
                 
                 const cached = this.syncedHashes.get(oldPath);
                 if (cached) {
@@ -1218,8 +1228,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.isApplyingRemoteEdit || this.shouldIgnoreEvent(path)) return;
 
         if (!this.heldLocks.has(path)) {
-            this.requestLock(path);
-            this.sendData(this.twoDevicePeerId!, { type: 'editor-active', path });
+            // Await lock before sending edits to avoid racing with peer's active editing
+            this.requestLock(path).then(granted => {
+                if (granted) {
+                    this.sendData(this.twoDevicePeerId!, { type: 'editor-active', path });
+                }
+            });
         }
 
         this.debouncedEditorChange(editor, view.file);
@@ -1367,11 +1381,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return true;
     }
 
-    public async sendSyncMessage(peerId: string, data: any, retryCount = 0): Promise<void> {
+    public async sendSyncMessage(peerId: string, data: any, retryCount = 0, existingMessageId?: string): Promise<void> {
         if (!this.isConnectionHealthy(peerId)) {
             throw new SyncError(SyncErrorCategory.CONNECTION_ERROR, `Connection to ${peerId} is unhealthy.`, true, "Check network connection.");
         }
-        const messageId = this.generateTransferId(data.type);
+        // Reuse messageId on retries so the peer's ACK for any attempt resolves the original promise
+        const messageId = existingMessageId || this.generateTransferId(data.type);
         const payload = { ...data, messageId };
         
         return new Promise((resolve, reject) => {
@@ -1380,7 +1395,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (retryCount < 3) {
                     this.log(`Timeout sending ${data.type}, retrying (${retryCount + 1}/3)...`);
                     try {
-                        await this.sendSyncMessage(peerId, data, retryCount + 1);
+                        await this.sendSyncMessage(peerId, data, retryCount + 1, messageId);
                         resolve();
                     } catch (e) { reject(e); }
                 } else {
@@ -1408,6 +1423,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.peerSyncComplete.clear();
         this.pullRetries.clear();
         this.syncState.peerId = null;
+        this.peerFileSizes = {};
         if (this.syncIdleTimeout) { clearTimeout(this.syncIdleTimeout); this.syncIdleTimeout = null; }
         if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
         if (this.syncState.phaseTimeoutHandle) { clearTimeout(this.syncState.phaseTimeoutHandle); this.syncState.phaseTimeoutHandle = null; }
@@ -1507,6 +1523,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     private processQueue() {
+        if (this.processingQueue) return;
+        this.processingQueue = true;
         this.updateStatus();
         while (this.activeQueueTransfers < this.getConcurrencyLimit() && this.syncQueue.length > 0) {
             const item = this.syncQueue.shift();
@@ -1522,6 +1540,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.syncDrainCallback();
             this.syncDrainCallback = null;
         }
+        this.processingQueue = false;
     }
 
     private async processQueueItem(item: { peerId: string | null, task?: SyncTask, data?: any, retries: number, priority: number }) {
@@ -1539,8 +1558,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const file = this.app.vault.getAbstractFileByPath(task.path);
                     if (file instanceof TFile) {
                         const now = Date.now();
+                        const MAX_SENT_CONTENT_CACHE = 200;
                         for (const [p, cacheData] of this.lastSentContent.entries()) {
                             if (now - cacheData.timestamp > 10 * 60 * 1000) this.lastSentContent.delete(p);
+                        }
+                        // Evict oldest entries if cache exceeds size limit
+                        if (this.lastSentContent.size > MAX_SENT_CONTENT_CACHE) {
+                            const sorted = Array.from(this.lastSentContent.entries()).sort((a, b) => a[1].timestamp - b[1].timestamp);
+                            const toEvict = sorted.slice(0, this.lastSentContent.size - MAX_SENT_CONTENT_CACHE);
+                            for (const [p] of toEvict) this.lastSentContent.delete(p);
                         }
                         
                         let content: string | ArrayBuffer = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
@@ -1874,6 +1900,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     public reinitializeConnectionManager() {
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
+        if (this.clusterConnectionInterval) { clearInterval(this.clusterConnectionInterval); this.clusterConnectionInterval = null; }
         this.peer?.destroy();
         this.directIpClient?.stop();
         this.directIpServer?.stop();
@@ -1976,12 +2003,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.pendingConnections.delete(conn.peer);
             this.log("DataConnection open with:", conn.peer);
             conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin });
-            
-            if (this.isTwoDeviceMode()) {
-                this.currentRole = this.getMyRole(conn.peer);
-                conn.send({ type: 'role-announcement', role: this.currentRole, deviceId: this.settings.deviceId });
-            }
-            
+            // Role announcement is deferred to handleHandshake (after conn is in this.connections)
+            // to avoid isTwoDeviceMode() seeing wrong connections.size
             this.resumeTransfers(conn.peer);
         });
         conn.on('data', async (raw: any) => {
@@ -2499,8 +2522,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             const changes: Array<{ from: number, to?: number, insert?: string }> = [];
                             for (const [op, text] of diff) {
                                 if (op === 0) { offset += text.length; } 
-                                else if (op === -1) { changes.push({ from: offset, to: offset + text.length }); } 
-                                else if (op === 1) { changes.push({ from: offset, insert: text }); offset += text.length; }
+                                else if (op === -1) { changes.push({ from: offset, to: offset + text.length }); offset += text.length; } 
+                                else if (op === 1) { changes.push({ from: offset, insert: text }); }
                             }
                     
                     const tx: any = { changes };
@@ -2721,18 +2744,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const computedHash = await this.getHash(reassembled.buffer);
                 if (transfer.fileHash && computedHash && transfer.fileHash !== computedHash) {
                     this.log(`Integrity check failed for chunked transfer ${transfer.path}. Rejecting.`);
-                    conn.send({ type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
+                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
                     return;
                 }
 
                 await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId, compressed: transfer.compressed, versionVector: transfer.versionVector });
-                conn.send({ type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
+                this.sendData(conn.peer, { type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
             } catch (e) {
                 this.log(`Failed to apply chunked file update: ${transfer.path}`, e);
                 if (e instanceof Error && e.message.includes('IntegrityError')) {
-                    conn.send({ type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
+                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
                 } else {
-                    conn.send({ type: 'nack', transferId: payload.transferId, reason: 'write-error' });
+                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'write-error' });
                 }
             }
         }
@@ -2753,6 +2776,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (now - transfer.lastUpdate > 60000) { 
                 this.log(`Cleaning up stale active transfer: ${id}`);
                 this.activeTransfers.delete(id);
+                // Clean up any associated pending ACK to prevent unhandled rejections
+                if (this.pendingAcks.has(id)) {
+                    this.pendingAcks.get(id)!.resolve();
+                    this.pendingAcks.delete(id);
+                }
                 statusChanged = true;
             }
         }
@@ -2773,8 +2801,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (this.isNewerThan(localVV, data.versionVector) && !this.isNewerThan(data.versionVector, localVV)) {
                     return;
                 }
-            } else if (data.mtime <= existingFile.stat.mtime + this.settings.mtimeTolerance && data.mtime >= existingFile.stat.mtime - this.settings.mtimeTolerance) {
-                return;
+            } else if (data.mtime <= existingFile.stat.mtime + this.settings.mtimeTolerance &&
+                       data.mtime >= existingFile.stat.mtime - this.settings.mtimeTolerance) {
+                // Within mtime tolerance — fall through to baseHash check below instead of
+                // silently dropping the delta. If baseHash matches, the delta is valid and
+                // should be applied; if not, IntegrityError is thrown and triggers full resend.
             }
 
             const localContent = await this.app.vault.read(existingFile);
@@ -2939,11 +2970,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 return;
             }
 
-            if (existingFile.stat.mtime > data.mtime + this.settings.mtimeTolerance) {
-                this.log(`File ${data.path} changed locally during processing. Aborting update.`);
-                return;
-            }
-
             await this.resolveConflict(data, existingFile, localContent);
         } catch (e) {
             if (e instanceof Error && (e.message.includes("File not found") || e.message.includes("no such file"))) {
@@ -2971,8 +2997,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.twoDeviceState.fileVersions[data.path] = merged;
                     this.debouncedSaveState();
                     
-                    if (this.twoDevicePeerId) {
-                        this.sendFileUpdate(existingFile, this.twoDevicePeerId, true);
+                    // Debounce re-send to prevent tight conflict resolution loops:
+                    // if we just resolved this path, skip the immediate re-send.
+                    // The file will be sent on next edit or full sync.
+                    const lastResolved = this.ignoreEvents.get(`conflict:${data.path}`);
+                    if (!lastResolved || Date.now() > lastResolved) {
+                        this.ignoreEvents.set(`conflict:${data.path}`, Date.now() + 5000);
+                        if (this.twoDevicePeerId) {
+                            this.sendFileUpdate(existingFile, this.twoDevicePeerId, true);
+                        }
+                    } else {
+                        this.log(`Skipping re-send for ${data.path} — conflict cooldown active`);
                     }
                 } else {
                     this.log(`Conflict resolved by 'role-based' (Secondary yields - adopting remote): ${data.path}`);
@@ -3157,7 +3192,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { 
-        if (this.syncState.isSyncing && this.syncState.currentPhase !== SyncPhase.IDLE) { 
+        if (this.syncState.isSyncing) { 
             this.log(`Received a sync request from ${conn.peer}, but a sync is already in progress in phase ${this.syncState.currentPhase}. Ignoring.`); 
             return; 
         } 
@@ -3265,6 +3300,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             }
                         }
                     } else if (localItem.type === 'deleted' && remoteItem.type === 'file') {
+                        // Tombstone mtime = deletion time; file mtime = last modification time.
+                        // Comparing directly is intentional: if the file was modified AFTER it
+                        // was deleted on the other side, the newer modification takes precedence.
                         if (localItem.mtime > remoteItem.mtime) filesInitiatorMustDelete.push(path);
                         else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
                     } else if (localItem.type === 'file' && remoteItem.type === 'deleted') {
@@ -3311,7 +3349,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
     async handleSyncPlan(data: SyncPlanPayload, conn: DataConnection) {
         if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
-        if (this.syncState.currentPhase !== SyncPhase.PLANNING) {
+        if (this.syncState.currentPhase !== SyncPhase.PLANNING && this.syncState.currentPhase !== SyncPhase.REQUESTING) {
             this.log(`Received sync plan but current phase is ${this.syncState.currentPhase}. Ignoring.`);
             return;
         }
@@ -3489,8 +3527,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     checkFullSyncCompletion(peerId: string) {
         const pending = this.syncState.pendingPulls;
         const allowed = this.syncState.allowedPulls;
+        const activeBatches = this.syncState.activeBatches;
         
-        if ((!pending || pending.size === 0) && (!allowed || allowed.size === 0)) {
+        // Only declare complete when no pulls are pending, no pulls are allowed, AND
+        // no batches are still in-flight (being sent by the peer).
+        if ((!pending || pending.size === 0) && (!allowed || allowed.size === 0) && (!activeBatches || activeBatches.size === 0)) {
             if (!this.localSyncComplete.get(peerId)) {
                 this.localSyncComplete.set(peerId, true);
                 this.sendSyncMessage(peerId, { type: 'full-sync-complete' }).catch(e => this.abortSync(e));
