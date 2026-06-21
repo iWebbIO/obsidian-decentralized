@@ -859,8 +859,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (success) {
             this.successfulTransfersSinceLastIncrease++;
             if (this.successfulTransfersSinceLastIncrease >= this.currentConcurrency) {
-                if (this.currentConcurrency < 32) {
-                    this.currentConcurrency++;
+                if (this.currentConcurrency < 200) {
+                    this.currentConcurrency = Math.min(200, this.currentConcurrency + Math.max(1, Math.floor(this.currentConcurrency * 0.1)));
                     this.log(`Network stable. Increasing concurrency to ${this.currentConcurrency}`);
                 }
                 if (this.currentChunkSize < this.targetChunkSize && this.getConnectionMode() !== 'direct-ip') {

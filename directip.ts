@@ -261,7 +261,7 @@ export class DirectIpClient {
 
         if (hasMessages) {
             this.consecutiveEmptyPolls = 0;
-            this.pollInterval = 100;
+            this.pollInterval = 10;
         } else {
             this.consecutiveEmptyPolls++;
             if (this.consecutiveEmptyPolls > 3) {
@@ -269,7 +269,7 @@ export class DirectIpClient {
             }
         }
         
-        this.pollTimeout = window.setTimeout(() => this.poll(), Math.max(100, this.pollInterval));
+        this.pollTimeout = window.setTimeout(() => this.poll(), Math.max(10, this.pollInterval));
     }
 
     async send(data: any) {
