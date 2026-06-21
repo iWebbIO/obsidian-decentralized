@@ -1,751 +1,92 @@
-import { App, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, TAbstractFile, Modal, Platform, requestUrl, debounce, setIcon, MarkdownView } from 'obsidian';
+import { Notice, Plugin, TFile, TFolder, TAbstractFile, Platform, debounce, MarkdownView, setIcon } from 'obsidian';
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
-import * as QRCode from 'qrcode';
-import { Html5Qrcode } from 'html5-qrcode';
-// @ts-ignore
-import * as pako from 'pako';
 
-// --- Constants ---
-const DISCOVERY_PORT = 41234;
-const DISCOVERY_MULTICAST_ADDRESS = '224.0.0.114';
-const COMPANION_RECONNECT_INTERVAL_MS = 10000;
-const TARGET_CHUNK_TIME_MS = 3000;
-const MIN_CHUNK_SIZE = 64 * 1024;
-const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
-const MAX_BANDWIDTH_SAMPLES = 10;
-const MAX_QUEUE_DEPTH = 50;
-const LOCK_EXPIRATION_MS = 30000;
-const MAX_HASH_CACHE_SIZE = 10000;
+// UI imports
+import { ConnectionModal, SelectPeerModal, ConflictCenter, SyncProgressModal, formatBytes } from './ui';
+
+// Settings tab import
+import { ObsidianDecentralizedSettingTab } from './settings-tab';
+
+// LAN Discovery imports
+import { DummyLANDiscovery, DesktopLANDiscovery } from './discovery';
+
+// Direct IP imports
+import { DirectIpServer, DirectIpClient } from './directip';
+
+// Types & Constants imports
+import {
+    COMPANION_RECONNECT_INTERVAL_MS,
+    TARGET_CHUNK_TIME_MS,
+    MIN_CHUNK_SIZE,
+    MAX_CHUNK_SIZE,
+    MAX_BANDWIDTH_SAMPLES,
+    MAX_QUEUE_DEPTH,
+    LOCK_EXPIRATION_MS,
+    MAX_HASH_CACHE_SIZE,
+    REQUESTING_TIMEOUT,
+    PLANNING_TIMEOUT,
+    BATCH_TIMEOUT,
+    COMPLETING_TIMEOUT,
+    SyncPhase,
+    SyncErrorCategory,
+    SyncError,
+    SyncState,
+    PeerInfo,
+    VaultManifest,
+    DeviceRole,
+    VersionVector,
+    HandshakePayload,
+    ClusterGossipPayload,
+    CompanionPairPayload,
+    FileUpdatePayload,
+    FileDeltaPayload,
+    FileDeletePayload,
+    FileRenamePayload,
+    FolderCreatePayload,
+    FolderDeletePayload,
+    FolderRenamePayload,
+    FullSyncRequestPayload,
+    SyncPlanPayload,
+    RequestBatchPayload,
+    BatchCompletePayload,
+    RequestFilePayload,
+    FileChunkStartPayload,
+    FileChunkDataPayload,
+    ClusterForgetPayload,
+    ClusterKickPayload,
+    ClusterRenamePayload,
+    LockRequestPayload,
+    LockGrantPayload,
+    LockDenyPayload,
+    LockReleasePayload,
+    EditorActivatePayload,
+    EditorDeltaPayload,
+    MerkleRootPayload,
+    MerkleNodeRequestPayload,
+    MerkleNodeResponsePayload,
+    MerkleNode,
+    TransferStatus,
+    FailedSync,
+    SyncStatusState,
+    SyncTask,
+    BatchState,
+    SyncData,
+    DirectIpConfig,
+    ObsidianDecentralizedSettings,
+    TwoDeviceState,
+    DEFAULT_SETTINGS,
+    ILANDiscovery
+} from './types';
+
+// Utils imports
+import {
+    compressText,
+    decompressText,
+    arrayBufferToBase64,
+    base64ToArrayBuffer
+} from './utils';
 
-// Phase Timeouts
-const REQUESTING_TIMEOUT = 120000;
-const PLANNING_TIMEOUT = 120000;
-const BATCH_TIMEOUT = 300000;
-const COMPLETING_TIMEOUT = 60000;
-
-enum SyncPhase { IDLE = 'IDLE', REQUESTING = 'REQUESTING', PLANNING = 'PLANNING', TRANSFERRING = 'TRANSFERRING', COMPLETING = 'COMPLETING', ABORTING = 'ABORTING' }
-enum SyncErrorCategory { CONNECTION_ERROR = 'CONNECTION_ERROR', TIMEOUT_ERROR = 'TIMEOUT_ERROR', INTEGRITY_ERROR = 'INTEGRITY_ERROR', PROTOCOL_ERROR = 'PROTOCOL_ERROR', VAULT_ERROR = 'VAULT_ERROR' }
-
-class SyncError extends Error {
-    constructor(public category: SyncErrorCategory, message: string, public recoverable: boolean, public suggestedAction: string) {
-        super(message);
-        this.name = 'SyncError';
-    }
-}
-
-export interface SyncState {
-    isSyncing: boolean;
-    currentPhase: SyncPhase;
-    peerId: string | null;
-    pendingPulls: Set<string>;
-    allowedPulls: Set<string>;
-    activeBatches: Map<string, BatchState>;
-    phaseStartTime: number;
-    phaseTimeoutHandle: number | null;
-    missedPings: number;
-    filesTotal: number;
-    filesTransferred: number;
-    bytesTotal: number;
-    bytesTransferred: number;
-}
-
-// --- Type Definitions ---
-type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; port?: number; mode?: 'peerjs' | 'direct-ip'; };
-type DiscoveryBeacon = { type: 'obsidian-decentralized-beacon'; peerInfo: PeerInfo; };
-type FileManifestEntry = { path: string; mtime: number; size: number; type: 'file' | 'deleted'; hash?: string; versionVector?: VersionVector };
-type FolderManifestEntry = { path: string; type: 'folder' };
-type VaultManifest = (FileManifestEntry | FolderManifestEntry)[];
-
-type DeviceRole = 'primary' | 'secondary';
-type VersionVector = { [deviceId: string]: number };
-
-type BasePayload = { transferId: string; messageId?: string; };
-type HandshakePayload = { type: 'handshake'; peerInfo: PeerInfo; pin?: string; };
-type RoleAnnouncementPayload = { type: 'role-announcement'; role: DeviceRole; deviceId: string; };
-type ClusterGossipPayload = { type: 'cluster-gossip'; peers: PeerInfo[]; };
-type CompanionPairPayload = { type: 'companion-pair'; peerInfo: PeerInfo; };
-type AckPayload = { type: 'ack', transferId: string };
-type NackPayload = { type: 'nack', transferId: string, reason: 'integrity-failure' | 'write-error' };
-type FileUpdatePayload = BasePayload & { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary' | 'base64'; fileHash?: string; compressed?: boolean; versionVector?: VersionVector; };
-type FileDeltaPayload = BasePayload & { type: 'file-delta'; path: string; mtime: number; patches: string; baseHash: string; versionVector?: VersionVector; };
-type FileDeletePayload = BasePayload & { type: 'file-delete'; path: string; };
-type FileRenamePayload = BasePayload & { type: 'file-rename'; oldPath: string; newPath: string; versionVector?: VersionVector; };
-type FolderCreatePayload = BasePayload & { type: 'folder-create', path: string; };
-type FolderDeletePayload = BasePayload & { type: 'folder-delete', path: string; };
-type FolderRenamePayload = BasePayload & { type: 'folder-rename', oldPath: string, newPath: string; };
-
-// Full Sync Pull-based Payloads
-type FullSyncRequestPayload = { type: 'request-full-sync', manifest: VaultManifest };
-type SyncPlanPayload = { type: 'sync-plan', filesReceiverWillSend: string[], filesInitiatorMustSend: string[], filesReceiverMustDelete: string[], filesInitiatorMustDelete: string[], fileSizes: Record<string, number> };
-type RequestBatchPayload = { type: 'request-batch', paths: string[], batchId: string };
-type BatchCompletePayload = { type: 'batch-complete', batchId: string, receivedPaths: string[], failedPaths: string[] };
-type FullSyncCompletePayload = { type: 'full-sync-complete' };
-type InitiatorSyncDonePayload = { type: 'initiator-sync-done' };
-type RequestFilePayload = { type: 'request-file', path: string };
-
-type FileChunkStartPayload = { type: 'file-chunk-start', path: string, mtime: number, totalChunks: number, transferId: string, fileHash: string, compressed?: boolean, versionVector?: VersionVector };
-type FileChunkDataPayload = { type: 'file-chunk-data', transferId: string, index: number, data: ArrayBuffer };
-type PingPayload = { type: 'ping' };
-type PongPayload = { type: 'pong' };
-type SyncPingPayload = { type: 'sync-ping' };
-type SyncPongPayload = { type: 'sync-pong' };
-type ClusterForgetPayload = { type: 'cluster-forget'; targetDeviceId: string; };
-type ClusterKickPayload = { type: 'cluster-kick'; targetDeviceId: string; };
-type ClusterRenamePayload = { type: 'cluster-rename'; targetDeviceId: string; newName: string; };
-
-// Locking & Realtime Payloads
-type LockRequestPayload = { type: 'lock-request', path: string, requestId: string };
-type LockGrantPayload = { type: 'lock-grant', path: string, requestId: string, grantedUntil: number };
-type LockDenyPayload = { type: 'lock-deny', path: string, requestId: string, reason: string };
-type LockReleasePayload = { type: 'lock-release', path: string };
-type EditorActivatePayload = { type: 'editor-active', path: string };
-type EditorDeltaPayload = { type: 'editor-delta', path: string, patches: string };
-
-type SyncAckPayload = { type: 'sync-ack', messageId: string };
-
-// Merkle Tree Payloads
-type MerkleRootPayload = { type: 'merkle-root', rootHash: string };
-type MerkleNodeRequestPayload = { type: 'merkle-node-request', path: string };
-type MerkleNodeResponsePayload = { type: 'merkle-node-response', path: string, children: Record<string, string> };
-
-interface MerkleNode {
-    hash: string;
-    children?: Record<string, MerkleNode>;
-}
-
-interface TransferStatus {
-    id: string;
-    path: string;
-    direction: 'upload' | 'download';
-    peerId: string;
-    totalChunks: number;
-    processedChunks: number;
-    startTime: number;
-    lastUpdate: number;
-    status: 'active' | 'paused';
-    chunkSize?: number;
-    compressed?: boolean;
-}
-
-interface FailedSync {
-    path: string;
-    peerId: string | null;
-    timestamp: number;
-    type: 'file-update' | 'file-delete' | 'file-delta';
-    reason?: string;
-    retryCount: number;
-}
-
-export interface SyncStatusState {
-    text: string;
-    icon: string;
-    spin?: boolean;
-    state: 'loading' | 'success' | 'error' | 'neutral';
-}
-
-type SyncTask = 
-    | { taskType: 'send-file', path: string, mtime: number, forceFull: boolean, batchId?: string }
-    | { taskType: 'send-folder-create', path: string, batchId?: string }
-    | { taskType: 'send-delete', path: string }
-    | { taskType: 'send-rename', oldPath: string, newPath: string };
-
-interface BatchState {
-    peerId: string;
-    batchId: string;
-    totalCount: number;
-    sentCount: number;
-    succeededPaths: string[];
-    failedPaths: string[];
-}
-
-type SyncData =
-    | HandshakePayload | RoleAnnouncementPayload | ClusterGossipPayload | CompanionPairPayload | AckPayload | NackPayload
-    | FileUpdatePayload | FileDeltaPayload | FileDeletePayload | FileRenamePayload
-    | FolderCreatePayload | FolderDeletePayload | FolderRenamePayload
-    | FullSyncRequestPayload | SyncPlanPayload | RequestBatchPayload | BatchCompletePayload | FullSyncCompletePayload | InitiatorSyncDonePayload | RequestFilePayload
-    | FileChunkStartPayload | FileChunkDataPayload | PingPayload | PongPayload | SyncPingPayload | SyncPongPayload
-    | ClusterForgetPayload | ClusterKickPayload | ClusterRenamePayload
-    | LockRequestPayload | LockGrantPayload | LockDenyPayload | LockReleasePayload
-    | EditorActivatePayload | EditorDeltaPayload | SyncAckPayload
-    | MerkleRootPayload | MerkleNodeRequestPayload | MerkleNodeResponsePayload;
-
-// Interfaces
-interface PeerServerConfig { host: string; port: number; path: string; secure: boolean; }
-interface DirectIpConfig { host: string; port: number; pin: string; }
-interface ObsidianDecentralizedSettings {
-    syncMode: 'auto' | 'manual' | 'advanced';
-    showToasts: boolean;
-    deviceId: string;
-    friendlyName: string;
-    companionPeerId?: string;
-    useCustomPeerServer: boolean;
-    customPeerServerConfig: PeerServerConfig;
-    verboseLogging: boolean;
-    connectionMode: 'peerjs' | 'direct-ip';
-    directIpHostAddress: string;
-    directIpHostPort: number;
-    syncAllFileTypes: boolean;
-    syncObsidianConfig: boolean;
-    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins' | 'role-based';
-    includedFolders: string;
-    excludedFolders: string;
-    hideNativeSyncStatus: boolean;
-    maximumConcurrentTransfers: number | null;
-    chunkSize: number | null;
-    debounceDelay: number;
-    mtimeTolerance: number;
-    knownPeers: PeerInfo[];
-    requirePinForAllConnections: boolean;
-    idleTimeoutMs: number;
-    tombstoneRetentionDays: number;
-    enableCompression: boolean;
-    enableDeltaSync: boolean;
-    deltaSyncThreshold: number;
-    
-    // Two-Device Mode Settings
-    enableTwoDeviceOptimizations: boolean;
-    enableEncryption: boolean;
-    enableRealtimeSync: boolean;
-    peerKeys: Record<string, string>; // peerId -> base64 PSK
-}
-
-export interface TwoDeviceState {
-    fileVersions: Record<string, VersionVector>; // path -> { deviceId: version }
-    merkleTreeRoot: MerkleNode | null;
-}
-
-const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
-    syncMode: 'auto',
-    showToasts: false,
-    deviceId: '',
-    friendlyName: 'My New Device',
-    companionPeerId: undefined,
-    useCustomPeerServer: false,
-    customPeerServerConfig: { host: 'localhost', port: 9000, path: '/myapp', secure: false },
-    verboseLogging: false,
-    connectionMode: 'peerjs',
-    directIpHostAddress: '192.168.1.100',
-    directIpHostPort: 41235,
-    syncAllFileTypes: true,
-    syncObsidianConfig: false,
-    conflictResolutionStrategy: 'create-conflict-file',
-    includedFolders: '',
-    excludedFolders: '',
-    hideNativeSyncStatus: false,
-    maximumConcurrentTransfers: null,
-    chunkSize: null,
-    debounceDelay: 2000,
-    mtimeTolerance: 1500,
-    knownPeers: [],
-    requirePinForAllConnections: false,
-    idleTimeoutMs: 30000,
-    tombstoneRetentionDays: 30,
-    enableCompression: true,
-    enableDeltaSync: true,
-    deltaSyncThreshold: 50,
-    
-    enableTwoDeviceOptimizations: true,
-    enableEncryption: true,
-    enableRealtimeSync: true,
-    peerKeys: {}
-};
-
-interface ILANDiscovery {
-    on(event: string, listener: (...args: any[]) => void): this;
-    off(event: string, listener: (...args: any[]) => void): this;
-    startBroadcasting(peerInfo: PeerInfo): void;
-    stopBroadcasting(): void;
-    startListening(): void;
-    stop(): void;
-}
-
-// --- Helper Functions ---
-function compressText(content: string): ArrayBuffer {
-    return pako.deflate(content).buffer;
-}
-
-function decompressText(data: ArrayBuffer): string {
-    return pako.inflate(new Uint8Array(data), { to: 'string' });
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
-    return window.btoa(binary);
-}
-
-function base64ToArrayBuffer(base64: string): ArrayBuffer {
-    const binary_string = window.atob(base64);
-    const len = binary_string.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binary_string.charCodeAt(i);
-    }
-    return bytes.buffer;
-}
-
-function formatBytes(bytes: number, decimals = 2) {
-    if (!Number.isFinite(bytes) || bytes <= 0) return '0 Bytes';
-    const k = 1024;
-    const dm = decimals < 0 ? 0 : decimals;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
-}
-
-class DummyLANDiscovery implements ILANDiscovery {
-    on(event: string, listener: (...args: any[]) => void): this { return this; }
-    off(event: string, listener: (...args: any[]) => void): this { return this; }
-    startBroadcasting(peerInfo: PeerInfo): void { }
-    stopBroadcasting(): void { }
-    startListening(): void { }
-    stop(): void { }
-}
-
-class DesktopLANDiscovery implements ILANDiscovery {
-    private socket: any | null = null;
-    private broadcastInterval: number | null = null;
-    private discoveredPeers: Map<string, PeerInfo> = new Map();
-    private peerTimeouts: Map<string, number> = new Map();
-    private discoveryTimeoutMs: number = 5000;
-    private _emitter: any;
-    private myDeviceId: string | null = null;
-
-    constructor() {
-        const { EventEmitter } = require('events');
-        this._emitter = new EventEmitter();
-    }
-
-    public on(event: string, listener: (...args: any[]) => void): this {
-        this._emitter.on(event, listener);
-        return this;
-    }
-
-    public off(event: string, listener: (...args: any[]) => void): this {
-        this._emitter.removeListener(event, listener);
-        return this;
-    }
-
-    private emit(event: string, ...args: any[]): boolean {
-        return this._emitter.emit(event, ...args);
-    }
-
-    private createSocket() {
-        if (this.socket) return;
-
-        const dgram = require('dgram');
-        this.socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-
-        this.socket.on('error', (err: Error) => {
-            console.error('LAN Discovery Socket Error:', err);
-            this.stop();
-            new Notice('LAN discovery failed. Your firewall might be blocking it.', 10000);
-        });
-
-        this.socket.on('listening', () => {
-            try {
-                this.socket?.setMulticastTTL(128);
-
-                const os = require('os');
-                const interfaces = os.networkInterfaces();
-                let membershipAdded = false;
-
-                for (const name in interfaces) {
-                    const ifaceList = interfaces[name];
-                    if (!ifaceList) continue;
-                    for (const net of ifaceList) {
-                        if (net.family === 'IPv4' && !net.internal) {
-                            try {
-                                this.socket?.addMembership(DISCOVERY_MULTICAST_ADDRESS, net.address);
-                                membershipAdded = true;
-                            } catch (e) { /* Ignore specific interface errors */ }
-                        }
-                    }
-                }
-
-                if (!membershipAdded) this.socket?.addMembership(DISCOVERY_MULTICAST_ADDRESS);
-
-                console.log(`LAN Discovery listening on ${DISCOVERY_MULTICAST_ADDRESS}:${DISCOVERY_PORT}`);
-            } catch (e) {
-                console.error("Error setting up multicast:", e);
-                new Notice("Could not set up multicast. LAN discovery might not work.");
-            }
-        });
-
-        this.socket.on('message', (msg: Buffer, rinfo: any) => {
-            try {
-                const data: DiscoveryBeacon = JSON.parse(msg.toString());
-                if (data.type === 'obsidian-decentralized-beacon' && data.peerInfo?.deviceId) {
-                    const peerId = data.peerInfo.deviceId;
-                    if (this.myDeviceId && peerId === this.myDeviceId) return;
-
-                    if (this.peerTimeouts.has(peerId)) {
-                        clearTimeout(this.peerTimeouts.get(peerId)!);
-                    }
-
-                    const isNew = !this.discoveredPeers.has(peerId);
-                    data.peerInfo.ip = rinfo.address;
-                    this.discoveredPeers.set(peerId, data.peerInfo);
-                    if (isNew) {
-                        this.emit('discover', data.peerInfo);
-                    }
-
-                    const timeout = window.setTimeout(() => {
-                        this.discoveredPeers.delete(peerId);
-                        this.peerTimeouts.delete(peerId);
-                        this.emit('lose', data.peerInfo);
-                    }, this.discoveryTimeoutMs);
-                    this.peerTimeouts.set(peerId, timeout);
-                }
-            } catch (e) { /* ignore parse errors */ }
-        });
-
-        this.socket.bind(DISCOVERY_PORT, '0.0.0.0');
-    }
-
-    public startBroadcasting(peerInfo: PeerInfo) {
-        this.myDeviceId = peerInfo.deviceId;
-        this.stopBroadcasting();
-        this.createSocket();
-
-        const beaconMessage = JSON.stringify({
-            type: 'obsidian-decentralized-beacon',
-            peerInfo
-        });
-
-        const sendBeacon = () => {
-            this.socket?.send(beaconMessage, 0, beaconMessage.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
-                if (err) console.error("Beacon send error:", err);
-            });
-        };
-
-        this.broadcastInterval = window.setInterval(sendBeacon, 2000);
-    }
-
-    public stopBroadcasting() {
-        if (this.broadcastInterval) {
-            clearInterval(this.broadcastInterval);
-            this.broadcastInterval = null;
-        }
-    }
-
-    public startListening() {
-        this.createSocket();
-    }
-
-    public stop() {
-        this.stopBroadcasting();
-        if (this.socket) {
-            this.socket.close();
-            this.socket = null;
-        }
-        this.discoveredPeers.clear();
-        this.peerTimeouts.forEach(timeout => clearTimeout(timeout));
-        this.peerTimeouts.clear();
-        console.log('LAN Discovery stopped.');
-    }
-}
-
-class DirectIpServer {
-    private server: any | null = null;
-    private clients: Map<string, { lastSeen: number, queue: any[], bufferedAmount: number }> = new Map();
-    private pin: string;
-    private readonly MAX_QUEUE_SIZE = 2000;
-
-    constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
-        if (Platform.isMobile) {
-            this.plugin.showNotice("Offline Host mode is only available on Desktop.", 'important');
-            return;
-        }
-        this.pin = pin;
-        this.start(port);
-    }
-
-    private start(port: number) {
-        const http = require('http');
-        this.server = http.createServer(this.handleRequest.bind(this));
-        this.server.on('error', (err: Error) => {
-            this.plugin.showNotice(`Offline server error: ${err.message}`, 'error');
-            this.plugin.log("Offline Server Error:", err);
-            this.server = null;
-        });
-        this.server.listen(port, () => {
-            this.plugin.log(`Offline server listening on port ${port}`);
-        });
-    }
-
-    getClients(): string[] {
-        const now = Date.now();
-        for (const [id, client] of this.clients.entries()) {
-            if (now - client.lastSeen > 10000) {
-                this.clients.delete(id);
-            }
-        }
-        return Array.from(this.clients.keys());
-    }
-
-    sendTo(peerId: string, data: any) {
-        const client = this.clients.get(peerId);
-        if (client) {
-            if (client.queue.length >= this.MAX_QUEUE_SIZE) {
-                const evicted = client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
-                const evictedSize = evicted.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
-                client.bufferedAmount = Math.max(0, client.bufferedAmount - evictedSize);
-            }
-            client.queue.push(data);
-            client.bufferedAmount += JSON.stringify(data).length;
-        }
-    }
-
-    hasClient(peerId: string): boolean {
-        this.getClients();
-        return this.clients.has(peerId);
-    }
-
-    getBufferedAmount(peerId: string): number {
-        return this.clients.get(peerId)?.bufferedAmount || 0;
-    }
-
-    private handleRequest(req: any, res: any) {
-        const CORS_HEADERS = {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, X-Device-Id, X-Pin'
-        };
-        if (req.method === 'OPTIONS') {
-            res.writeHead(204, CORS_HEADERS);
-            res.end();
-            return;
-        }
-
-        const pin = req.headers['x-pin'];
-        const deviceId = req.headers['x-device-id'] as string || 'unknown';
-
-        if (pin !== this.pin) {
-            res.writeHead(403, CORS_HEADERS);
-            res.end(JSON.stringify({ error: 'Invalid PIN' }));
-            return;
-        }
-
-        if (deviceId !== 'unknown') {
-            if (!this.clients.has(deviceId)) {
-                this.clients.set(deviceId, { lastSeen: Date.now(), queue: [], bufferedAmount: 0 });
-            } else {
-                this.clients.get(deviceId)!.lastSeen = Date.now();
-            }
-        }
-
-        if (req.url === '/poll' && req.method === 'GET') {
-            res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            let messagesToSend: any[] = [];
-            
-            if (deviceId !== 'unknown' && this.clients.has(deviceId)) {
-                const client = this.clients.get(deviceId)!;
-                messagesToSend = client.queue.splice(0, 200);
-                if (client.queue.length === 0) {
-                    client.bufferedAmount = 0;
-                } else {
-                    const sentSize = messagesToSend.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
-                    client.bufferedAmount = Math.max(0, client.bufferedAmount - sentSize);
-                }
-            }
-
-            const messages = messagesToSend.map(msg => {
-                if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
-                    return { ...msg, content: arrayBufferToBase64(msg.content), encoding: 'base64' };
-                }
-                if (msg.type === 'file-chunk-data' && msg.data instanceof ArrayBuffer) {
-                    return { ...msg, data: arrayBufferToBase64(msg.data) };
-                }
-                return msg;
-            });
-            res.end(JSON.stringify(messages));
-        } else if (req.url === '/push' && req.method === 'POST') {
-            let body = '';
-            let totalSize = 0;
-            const MAX_BODY_SIZE = 50 * 1024 * 1024;
-            let destroyed = false;
-
-            req.on('data', (chunk: any) => {
-                if (destroyed) return;
-                totalSize += chunk.length;
-                if (totalSize > MAX_BODY_SIZE) {
-                    destroyed = true;
-                    res.writeHead(413, CORS_HEADERS);
-                    res.end(JSON.stringify({ error: 'Payload too large' }));
-                    req.destroy();
-                    return;
-                }
-                body += chunk.toString();
-            });
-            req.on('end', () => {
-                if (destroyed) return;
-                try {
-                    let data: any = JSON.parse(body);
-                    if (data.type === 'file-update' && data.encoding === 'base64' && typeof data.content === 'string') {
-                         data = { ...data, content: base64ToArrayBuffer(data.content), encoding: 'binary' };
-                    }
-                    if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
-                        (data as any).data = base64ToArrayBuffer((data as any).data);
-                    }
-
-                    const mockConn = {
-                        send: (msg: any) => this.sendTo(deviceId, msg),
-                        peer: deviceId !== 'unknown' ? deviceId : 'direct-ip-client',
-                        open: true,
-                    } as any;
-
-                    this.plugin.handleRawIncomingData(data, mockConn);
-                    res.writeHead(200, CORS_HEADERS);
-                    res.end(JSON.stringify({ status: 'ok' }));
-                } catch (e) {
-                    res.writeHead(400, CORS_HEADERS);
-                    res.end(JSON.stringify({ error: 'Invalid data format' }));
-                }
-            });
-        } else {
-            res.writeHead(404, CORS_HEADERS);
-            res.end();
-        }
-    }
-
-    send(data: any) {
-        for (const client of this.clients.values()) {
-            if (client.queue.length >= this.MAX_QUEUE_SIZE) {
-                const evicted = client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
-                const evictedSize = evicted.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
-                client.bufferedAmount = Math.max(0, client.bufferedAmount - evictedSize);
-            }
-            client.queue.push(data);
-            client.bufferedAmount += JSON.stringify(data).length;
-        }
-    }
-
-    stop() {
-        this.server?.close();
-        this.server = null;
-        this.plugin.log("Offline Server stopped.");
-    }
-}
-
-class DirectIpClient {
-    public isOpen: boolean = false;
-    private pollTimeout: number | null = null;
-    private baseUrl: string;
-    private headers: Record<string, string>;
-    private pendingBytes: number = 0;
-    private pollInterval: number = 1000;
-    private consecutiveEmptyPolls: number = 0;
-
-    constructor(private plugin: ObsidianDecentralizedPlugin, config: DirectIpConfig) {
-        this.baseUrl = `http://${config.host}:${config.port}`;
-        this.headers = {
-            'Content-Type': 'application/json',
-            'X-Device-Id': plugin.settings.deviceId,
-            'X-Pin': config.pin,
-        };
-        this.startPolling();
-        this.plugin.showNotice(`Connected to Offline Host at ${config.host}`, 'important', 3000);
-    }
-    
-    getBufferedAmount(): number {
-        return this.pendingBytes;
-    }
-
-    private async poll() {
-        let hasMessages = false;
-        try {
-            const response = await requestUrl({
-                url: `${this.baseUrl}/poll`,
-                method: 'GET',
-                headers: this.headers,
-            });
-            if (response.status === 200) {
-                this.isOpen = true;
-                const messages: any[] = response.json;
-                if (messages && messages.length > 0) hasMessages = true;
-                for (let msg of messages) {
-                    if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
-                        msg = { ...msg, content: base64ToArrayBuffer(msg.content), encoding: 'binary' } as FileUpdatePayload;
-                    }
-                    if (msg.type === 'file-chunk-data' && typeof (msg as any).data === 'string') {
-                        (msg as any).data = base64ToArrayBuffer((msg as any).data);
-                    }
-
-                    const mockConn = {
-                        send: (data: any) => this.send(data),
-                        peer: 'direct-ip-host',
-                        open: true
-                    } as any;
-
-                    this.plugin.handleRawIncomingData(msg, mockConn);
-                }
-            }
-        } catch (e) {
-            this.isOpen = false;
-            this.plugin.log('Offline Poll Error:', e);
-            this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
-        }
-        
-        if (hasMessages) {
-            this.consecutiveEmptyPolls = 0;
-            this.pollInterval = 100;
-        } else {
-            this.consecutiveEmptyPolls++;
-            if (this.consecutiveEmptyPolls > 3) {
-                this.pollInterval = Math.min(2000, Math.floor(this.pollInterval * 1.5));
-            }
-        }
-        
-        this.pollTimeout = window.setTimeout(() => this.poll(), Math.max(100, this.pollInterval));
-    }
-
-    async send(data: any) {
-        let payloadToSend = data;
-        
-        if (data.type === 'file-update' && data.encoding === 'binary' && data.content instanceof ArrayBuffer) {
-            payloadToSend = { ...data, content: arrayBufferToBase64(data.content), encoding: 'base64' };
-        }
-        if (data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer) {
-            payloadToSend = { ...data, data: arrayBufferToBase64(data.data) } as any;
-        }
-
-        const bodyStr = JSON.stringify(payloadToSend);
-        this.pendingBytes += bodyStr.length;
-
-        try {
-            await requestUrl({
-                url: `${this.baseUrl}/push`,
-                method: 'POST',
-                headers: this.headers,
-                body: bodyStr,
-            });
-        } catch (e) {
-            this.plugin.showNotice('Failed to send data to host.', 'error');
-            this.plugin.log('Offline Push Error:', e);
-            this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
-        } finally {
-            this.pendingBytes = Math.max(0, this.pendingBytes - bodyStr.length);
-        }
-    }
-
-    startPolling() {
-        if (this.pollTimeout) clearTimeout(this.pollTimeout);
-        this.poll();
-    }
-
-    stop() {
-        this.isOpen = false;
-        if (this.pollTimeout) clearTimeout(this.pollTimeout);
-        this.pollTimeout = null;
-        this.plugin.showNotice("Disconnected from Offline Host.", 'important', 3000);
-    }
-}
 
 
 export default class ObsidianDecentralizedPlugin extends Plugin {
@@ -889,8 +230,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.syncIdleTimeout) clearTimeout(this.syncIdleTimeout);
         if (this.syncKeepAliveInterval) clearInterval(this.syncKeepAliveInterval);
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
+        if (this.clusterConnectionInterval) clearInterval(this.clusterConnectionInterval); // Fix: Clear cluster connection interval on unload
         this.activeTransfers.clear();
-        this.debouncedSaveState();
+        this.connections.clear(); // Fix: Clear connections map references
+        this.saveState(); // Fix: Force immediate save on unload instead of debounced delay
     }
 
     // --- Core Two-Device Infrastructure ---
@@ -1089,6 +432,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             await callback();
         }).catch(err => {
             this.log(`Lock error for ${path}:`, err);
+            throw err; // Fix: Rethrow to prevent swallowing errors
+        }).finally(() => {
+            // Fix: Delete path from fileLocks map if it is the last lock in the chain to prevent memory leaks
+            if (this.fileLocks.get(path) === newLock) {
+                this.fileLocks.delete(path);
+            }
         });
         this.fileLocks.set(path, newLock);
         return newLock;
@@ -1621,9 +970,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         }
                         
                         if (!item.data) {
-                            if (typeof content === 'string' && content.length > this.getChunkSize()) {
-                                content = new TextEncoder().encode(content).buffer;
-                                encoding = 'binary';
+                            if (typeof content === 'string') {
+                                const encoded = new TextEncoder().encode(content);
+                                if (encoded.byteLength > this.getChunkSize()) {
+                                    content = encoded.buffer;
+                                    encoding = 'binary';
+                                }
                             }
                             item.data = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding, transferId: this.generateTransferId(file.path), fileHash: hash, compressed: isCompressedText, versionVector: vv };
                         }
@@ -1751,6 +1103,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
 
         } catch (e) {
+            // Fix: Clear and resolve pending timeouts in pendingAcks to prevent memory leaks and unhandled promise rejections
+            if (transferId && this.pendingAcks.has(transferId)) {
+                const ack = this.pendingAcks.get(transferId);
+                ack?.resolve();
+                this.pendingAcks.delete(transferId);
+            }
+
             if (e.message === 'Paused') {
                 this.log(`Transfer ${transferId} paused due to connection loss.`);
                 isPaused = true;
@@ -1772,17 +1131,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             
             if (item && item.retries < 3) {
-                this.log(`Retrying transfer ${transferId} (Attempt ${item.retries + 1}/3)`);
+                this.log(`Retrying transfer ${transferId} (Attempt ${item.retries + 1}/3) with backoff`);
                 item.retries++;
                 const priority = item.priority;
-                let low = 0, high = this.syncQueue.length;
-                while (low < high) {
-                    const mid = (low + high) >>> 1;
-                    if (this.syncQueue[mid].priority < priority) high = mid;
-                    else low = mid + 1;
-                }
-                this.syncQueue.splice(low, 0, item);
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+                // Fix: Push back to the queue asynchronously after a 5-second backoff delay
+                setTimeout(() => {
+                    let low = 0, high = this.syncQueue.length;
+                    while (low < high) {
+                        const mid = (low + high) >>> 1;
+                        if (this.syncQueue[mid].priority < priority) high = mid;
+                        else low = mid + 1;
+                    }
+                    this.syncQueue.splice(low, 0, item);
+                    this.processQueue();
+                }, 5000);
             } else if (item) {
                 const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : item.task.path) : undefined;
                 const path = item.data?.path || taskPath || 'an item';
@@ -2033,6 +1396,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             }
             this.updateStatus();
+
+            // Fix: Abort sync immediately if the connection to the syncing peer closes mid-sync
+            if (this.syncState.isSyncing && this.syncState.peerId === peerId) {
+                this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, "Connection closed mid-sync.", false, "Check peer connection."));
+            }
 
             if (this.pendingAcks.size > 0) {
                 for (const [id, ack] of this.pendingAcks.entries()) {
@@ -2373,7 +1741,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         attemptConnection();
         if (!this.clusterConnectionInterval) {
             this.clusterConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS); 
-            this.registerInterval(this.clusterConnectionInterval);
+            // Fix: Do not register this dynamically recreated interval to avoid leaking in Obsidian core's internal list.
         }
     }
 
@@ -2521,14 +1889,27 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 
                 if (results.every((r: boolean) => r === true)) {
                     const diff = dmp.diff_main(currentText, newText);
-                            dmp.diff_cleanupSemantic(diff);
-                            let offset = 0;
-                            const changes: Array<{ from: number, to?: number, insert?: string }> = [];
-                            for (const [op, text] of diff) {
-                                if (op === 0) { offset += text.length; } 
-                                else if (op === -1) { changes.push({ from: offset, to: offset + text.length }); offset += text.length; } 
-                                else if (op === 1) { changes.push({ from: offset, insert: text }); }
+                    dmp.diff_cleanupSemantic(diff);
+                    let offset = 0;
+                    const changes: Array<{ from: number, to?: number, insert?: string }> = [];
+                    for (let i = 0; i < diff.length; i++) {
+                        const [op, text] = diff[i];
+                        if (op === 0) {
+                            offset += text.length;
+                        } else if (op === -1) {
+                            const nextDiff = diff[i + 1];
+                            if (nextDiff && nextDiff[0] === 1) {
+                                changes.push({ from: offset, to: offset + text.length, insert: nextDiff[1] });
+                                offset += text.length;
+                                i++; // skip insert
+                            } else {
+                                changes.push({ from: offset, to: offset + text.length });
+                                offset += text.length;
                             }
+                        } else if (op === 1) {
+                            changes.push({ from: offset, insert: text });
+                        }
+                    }
                     
                     const tx: any = { changes };
                     const syncAnnotation = (window as any).CM_Annotation ? (window as any).CM_Annotation.define() : null;
@@ -2714,6 +2095,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleFileChunkData(payload: FileChunkDataPayload, conn: DataConnection) {
         const transfer = this.pendingFileChunks.get(payload.transferId); if (!transfer) { this.log("Received chunk for unknown transfer:", payload.transferId); return; }
+        // Fix: Validate chunk size does not exceed MAX_CHUNK_SIZE to prevent OOM / heap memory allocation exploits
+        if (payload.data.byteLength > MAX_CHUNK_SIZE) {
+            this.log(`Received chunk exceeding MAX_CHUNK_SIZE (${payload.data.byteLength} bytes). Aborting transfer.`);
+            this.pendingFileChunks.delete(payload.transferId);
+            this.activeTransfers.delete(payload.transferId);
+            return;
+        }
         if (payload.index < 0 || payload.index >= transfer.total) {
             this.log(`Received invalid chunk index ${payload.index} for transfer ${payload.transferId}`);
             return;
@@ -2833,6 +2221,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             if (this.isTwoDeviceMode() && data.versionVector) {
                 this.twoDeviceState.fileVersions[data.path] = data.versionVector;
+                this.debouncedSaveState();
             }
             
             const newHash = await this.getHash(newContent);
@@ -2867,6 +2256,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await this.handleNewFileCreation(data);
                 if (this.isTwoDeviceMode() && data.versionVector) {
                     this.twoDeviceState.fileVersions[data.path] = data.versionVector;
+                    this.debouncedSaveState();
                 }
             } else if (existingFile instanceof TFile) {
                 await this.handleFileModification(data, existingFile);
@@ -2929,6 +2319,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log(`Ignoring update (content is identical): ${data.path}`);
                 if (this.isTwoDeviceMode() && data.versionVector) {
                     this.twoDeviceState.fileVersions[data.path] = this.mergeVersions(this.twoDeviceState.fileVersions[data.path] || {}, data.versionVector);
+                    this.debouncedSaveState();
                 }
                 return;
             }
@@ -2948,6 +2339,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
                     }
                     this.twoDeviceState.fileVersions[data.path] = remoteVV;
+                    this.debouncedSaveState();
                     return;
                 } else if (isLocalNewer && !isRemoteNewer) {
                     this.log(`Ignoring update (local vector dominates): ${data.path}`);
@@ -3048,41 +2440,139 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); this.ignoreNextEventForPath(conflictPath); if (data.encoding === 'binary' || data.encoding === 'base64') { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
-    async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; this.tombstones[data.path] = Date.now(); this.debouncedSaveState(); this.syncedHashes.delete(data.path); const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.delete(existingFile); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); this.showNotice(`Failed to delete file: ${data.path}`, 'error'); } } }
+
+    async applyFileDelete(data: FileDeletePayload) {
+        if (!this.isPathSyncable(data.path)) return;
+        await this.runLocked(data.path, async () => {
+            if (this.isTwoDeviceMode() && data.versionVector) {
+                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+                const remoteVV = data.versionVector;
+                const isRemoteNewer = this.isNewerThan(remoteVV, localVV);
+
+                if (!isRemoteNewer) {
+                    // Local edit wins (local is strictly newer, or there's a concurrent conflict).
+                    // We merge the remote vector, increment local version, and push the local file back to the peer.
+                    this.log(`Edit-vs-delete conflict: local edit wins for ${data.path}`);
+                    const merged = this.mergeVersions(localVV, remoteVV);
+                    merged[this.settings.deviceId] = (merged[this.settings.deviceId] || 0) + 1;
+                    this.twoDeviceState.fileVersions[data.path] = merged;
+                    this.debouncedSaveState();
+
+                    const file = this.app.vault.getAbstractFileByPath(data.path);
+                    if (file instanceof TFile && this.twoDevicePeerId) {
+                        this.sendFileUpdate(file, this.twoDevicePeerId, true);
+                    }
+                    return;
+                } else {
+                    // Remote delete dominates. Update version vector to reflect the deletion.
+                    this.twoDeviceState.fileVersions[data.path] = remoteVV;
+                    this.debouncedSaveState();
+                }
+            }
+
+            this.tombstones[data.path] = Date.now();
+            this.debouncedSaveState();
+            this.syncedHashes.delete(data.path);
+            const existingFile = this.app.vault.getAbstractFileByPath(data.path);
+            if (existingFile) {
+                try {
+                    this.log(`Deleting file: ${data.path}`);
+                    this.ignoreNextEventForPath(data.path);
+                    await this.app.vault.delete(existingFile);
+                } catch (e) {
+                    console.error(`Error deleting file: ${data.path}`, e);
+                    this.showNotice(`Failed to delete file: ${data.path}`, 'error');
+                }
+            }
+        });
+    }
+
     async applyFileRename(data: FileRenamePayload) { 
         if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; 
-        const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); 
-        if (fileToRename instanceof TFile) { 
-            try { 
-                this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); 
-                this.ignoreNextEventForPath(data.newPath); 
-                const cached = this.syncedHashes.get(data.oldPath); 
-                if (cached) { 
-                    this.syncedHashes.set(data.newPath, cached); 
-                    this.syncedHashes.delete(data.oldPath); 
-                } 
-                if (data.versionVector) {
-                    this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
-                    delete this.twoDeviceState.fileVersions[data.oldPath];
+        const [firstLock, secondLock] = [data.oldPath, data.newPath].sort();
+        await this.runLocked(firstLock, async () => {
+            await this.runLocked(secondLock, async () => {
+                const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); 
+                if (fileToRename instanceof TFile) { 
+                    try { 
+                        this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); 
+                        this.ignoreNextEventForPath(data.newPath); 
+                        const cached = this.syncedHashes.get(data.oldPath); 
+                        if (cached) { 
+                            this.syncedHashes.set(data.newPath, cached); 
+                            this.syncedHashes.delete(data.oldPath); 
+                        } 
+                        if (data.versionVector) {
+                            this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
+                            delete this.twoDeviceState.fileVersions[data.oldPath];
+                        }
+                        this.debouncedSaveState(); 
+                        await this.app.vault.rename(fileToRename, data.newPath); 
+                    } catch (e) { 
+                        console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); 
+                        this.showNotice(`Failed to rename file: ${data.oldPath}`, 'error'); 
+                    } 
+                } else {
+                    const newFile = this.app.vault.getAbstractFileByPath(data.newPath);
+                    if (newFile instanceof TFile && data.versionVector) {
+                        this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
+                        delete this.twoDeviceState.fileVersions[data.oldPath];
+                        this.debouncedSaveState();
+                    }
                 }
-                this.debouncedSaveState(); 
-                await this.app.vault.rename(fileToRename, data.newPath); 
-            } catch (e) { 
-                console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); 
-                this.showNotice(`Failed to rename file: ${data.oldPath}`, 'error'); 
-            } 
-        } else {
-            const newFile = this.app.vault.getAbstractFileByPath(data.newPath);
-            if (newFile instanceof TFile && data.versionVector) {
-                this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
-                delete this.twoDeviceState.fileVersions[data.oldPath];
-                this.debouncedSaveState();
-            }
-        }
+            });
+        });
     }
-    async applyFolderCreate(data: FolderCreatePayload) { if (!this.isPathSyncable(data.path)) return; if (this.app.vault.getAbstractFileByPath(data.path)) return; this.log(`Creating folder: ${data.path}`); this.ignoreNextEventForPath(data.path); try { await this.app.vault.createFolder(data.path); } catch (e) { console.error(`Failed to create folder ${data.path}`, e); } }
-    async applyFolderDelete(data: FolderDeletePayload) { if (!this.isPathSyncable(data.path)) return; const folder = this.app.vault.getAbstractFileByPath(data.path); if (folder instanceof TFolder) { this.log(`Deleting folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); try { await this.app.vault.delete(folder, true); } catch (e) { console.error(`Failed to delete folder ${data.path}`, e); } } }
-    async applyFolderRename(data: FolderRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const folder = this.app.vault.getAbstractFileByPath(data.oldPath); if (folder instanceof TFolder) { this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.oldPath); this.ignoreNextEventForPath(data.newPath); try { await this.app.vault.rename(folder, data.newPath); } catch (e) { console.error(`Failed to rename folder ${data.oldPath}`, e); } } }
+
+    async applyFolderCreate(data: FolderCreatePayload) { 
+        if (!this.isPathSyncable(data.path)) return; 
+        await this.runLocked(data.path, async () => {
+            if (this.app.vault.getAbstractFileByPath(data.path)) return; 
+            this.log(`Creating folder: ${data.path}`); 
+            this.ignoreNextEventForPath(data.path); 
+            try { 
+                await this.app.vault.createFolder(data.path); 
+            } catch (e) { 
+                console.error(`Failed to create folder ${data.path}`, e); 
+            } 
+        });
+    }
+
+    async applyFolderDelete(data: FolderDeletePayload) { 
+        if (!this.isPathSyncable(data.path)) return; 
+        await this.runLocked(data.path, async () => {
+            const folder = this.app.vault.getAbstractFileByPath(data.path); 
+            if (folder instanceof TFolder) { 
+                this.log(`Deleting folder: ${data.path}`); 
+                this.ignoreNextEventForPath(data.path, 5000); 
+                try { 
+                    await this.app.vault.delete(folder, true); 
+                } catch (e) { 
+                    console.error(`Failed to delete folder ${data.path}`, e); 
+                } 
+            } 
+        });
+    }
+
+    async applyFolderRename(data: FolderRenamePayload) { 
+        if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; 
+        const [firstLock, secondLock] = [data.oldPath, data.newPath].sort();
+        await this.runLocked(firstLock, async () => {
+            await this.runLocked(secondLock, async () => {
+                const folder = this.app.vault.getAbstractFileByPath(data.oldPath); 
+                if (folder instanceof TFolder) { 
+                    this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); 
+                    this.ignoreNextEventForPath(data.oldPath); 
+                    this.ignoreNextEventForPath(data.newPath); 
+                    try { 
+                        await this.app.vault.rename(folder, data.newPath); 
+                    } catch (e) { 
+                        console.error(`Failed to rename folder ${data.oldPath}`, e); 
+                    } 
+                } 
+            });
+        });
+    }
 
     async requestFullSyncFromPeer(peerId: string) { 
         if (this.syncState.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } 
@@ -3329,16 +2819,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             await this.sendSyncMessage(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes }); ; 
             
             for (const path of filesReceiverMustDelete) {
-                const file = this.app.vault.getAbstractFileByPath(path);
-                if (file) {
-                    try {
-                        this.ignoreNextEventForPath(path);
-                        await this.app.vault.delete(file);
-                        this.syncedHashes.delete(path);
-                    } catch (e) {
-                        this.log(`Failed to delete file ${path}:`, e);
+                await this.runLocked(path, async () => {
+                    const file = this.app.vault.getAbstractFileByPath(path);
+                    if (file) {
+                        try {
+                            this.ignoreNextEventForPath(path);
+                            await this.app.vault.delete(file);
+                            this.syncedHashes.delete(path);
+                            if (this.isTwoDeviceMode()) {
+                                this.incrementVersion(path);
+                            }
+                            this.tombstones[path] = Date.now();
+                            this.debouncedSaveState();
+                        } catch (e) {
+                            this.log(`Failed to delete file ${path}:`, e);
+                        }
                     }
-                }
+                });
             }
             
             this.syncState.allowedPulls = new Set(filesReceiverWillSend);
@@ -3366,16 +2863,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.syncState.filesTotal = data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length;
             
             for (const path of data.filesInitiatorMustDelete || []) {
-                const file = this.app.vault.getAbstractFileByPath(path);
-                if (file) {
-                    try {
-                        this.ignoreNextEventForPath(path);
-                        await this.app.vault.delete(file);
-                        this.syncedHashes.delete(path);
-                    } catch (e) {
-                        this.log(`Failed to delete file ${path}:`, e);
+                await this.runLocked(path, async () => {
+                    const file = this.app.vault.getAbstractFileByPath(path);
+                    if (file) {
+                        try {
+                            this.ignoreNextEventForPath(path);
+                            await this.app.vault.delete(file);
+                            this.syncedHashes.delete(path);
+                            if (this.isTwoDeviceMode()) {
+                                this.incrementVersion(path);
+                            }
+                            this.tombstones[path] = Date.now();
+                            this.debouncedSaveState();
+                        } catch (e) {
+                            this.log(`Failed to delete file ${path}:`, e);
+                        }
                     }
-                }
+                });
             }
             
             for (const [path, size] of Object.entries(data.fileSizes)) {
@@ -3790,1065 +3294,5 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 }
 
-class ConnectionModal extends Modal {
-    private discoveredPeers: Map<string, PeerInfo> = new Map();
-    private discoverListener: ((p: PeerInfo) => void) | null = null;
-    private loseListener: ((p: PeerInfo) => void) | null = null;
-    
-    private activeTab: 'quick-pair' | 'advanced' = 'quick-pair';
-    private statusState: 'idle' | 'connecting' | 'connected' | 'error' = 'idle';
-    private statusMessage: string = 'Not connected';
-    private activePsk: string | null = null;
 
-    constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
-
-    async onOpen() {
-        this.injectStyles();
-        this.contentEl.addClass(Platform.isMobile ? 'od-mobile' : 'od-desktop');
-        
-        if (this.plugin.connections.size > 0) {
-            this.statusState = 'connected';
-            this.statusMessage = `Connected to ${this.plugin.connections.size} device(s)`;
-        }
-        
-        this.activePsk = await this.plugin.generatePSK();
-        
-        this.render();
-    }
-
-    onClose() {
-        if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
-        if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
-        this.contentEl.empty();
-    }
-
-    injectStyles() {
-        const styleId = 'obsidian-decentralized-styles';
-        const existing = document.getElementById(styleId);
-        if (existing) existing.remove();
-        const style = document.createElement('style');
-        style.id = styleId;
-        style.innerHTML = `
-            .od-dashboard-header { text-align: center; margin-bottom: 5px; font-weight: 600; color: var(--text-normal); }
-            .od-dashboard-subtitle { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 20px; }
-            .od-id-container { background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); user-select: all; font-family: var(--font-monospace); cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--background-modifier-border); transition: all 0.2s ease; }
-            .od-id-container:hover { border-color: var(--interactive-accent); box-shadow: 0 0 0 1px var(--interactive-accent); }
-            .od-section-title { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; color: var(--text-muted); margin-top: 15px; margin-bottom: 10px; }
-            .od-section-divider { height: 1px; background: var(--background-modifier-border); margin: 25px 0; }
-            .od-peer-list { display: flex; flex-direction: column; gap: 8px; }
-            .od-peer-item { padding: 12px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); display: flex; align-items: center; justify-content: space-between; transition: background 0.1s; }
-            .od-peer-item:hover { background: var(--background-modifier-hover); }
-            .od-peer-item .info { display: flex; flex-direction: column; }
-            .od-peer-item .sub-text { font-size: 0.8em; color: var(--text-muted); margin-top: 2px; }
-            .od-mode-switch { margin-top: 40px; text-align: center; font-size: 0.85em; color: var(--text-muted); cursor: pointer; text-decoration: none; opacity: 0.7; transition: opacity 0.2s; }
-            .od-mode-switch:hover { opacity: 1; text-decoration: underline; }
-            .od-input-row { display: flex; gap: 10px; margin-bottom: 5px; }
-            .od-input-row input { flex-grow: 1; }
-            .od-right-align { display: flex; justify-content: flex-end; }
-
-            .od-id-name { font-weight: bold; margin-bottom: 4px; }
-            .od-id-value { font-size: 0.9em; color: var(--text-muted); }
-            .od-scanning { color: var(--text-muted); font-style: italic; display: flex; align-items: center; justify-content: center; padding: 20px; }
-            .od-peer-name { font-weight: bold; }
-            .od-full-width { width: 100%; }
-            .od-ip-display { font-size: 1.2em; text-align: center; margin: 10px; }
-            .od-pin-display { font-size: 2em; font-weight: bold; text-align: center; margin: 20px; }
-            .od-text-muted { color: var(--text-muted); }
-
-            /* Tabs & Banner */
-            .od-connection-tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 10px; }
-            .od-tab-btn { background: transparent; border: none; box-shadow: none; color: var(--text-muted); font-weight: 600; cursor: pointer; padding: 6px 16px; border-radius: var(--radius-s); transition: all 0.2s; }
-            .od-tab-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
-            .od-tab-btn.active { color: var(--text-normal); background: var(--background-modifier-active-hover); }
-            
-            .od-status-banner { padding: 12px; border-radius: var(--radius-m); margin-bottom: 20px; text-align: center; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 8px; }
-            .od-status-banner.idle { background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); color: var(--text-muted); }
-            .od-status-banner.connecting { background: var(--background-modifier-hover); color: var(--text-normal); }
-            .od-status-banner.connected { background: var(--background-modifier-success); color: var(--text-success); border: 1px solid var(--background-modifier-success-hover); }
-            .od-status-banner.error { background: var(--background-modifier-error); color: var(--text-error); border: 1px solid var(--background-modifier-error-hover); }
-
-            /* Quick Pair specifics */
-            .od-step-header { font-size: 1.1em; font-weight: 600; color: var(--text-normal); margin-top: 20px; margin-bottom: 10px; }
-            .od-pairing-code-container { display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); border: 1px solid var(--background-modifier-border); margin: 10px 0; }
-            .od-pairing-code-text { font-family: var(--font-monospace); font-size: 1.5em; font-weight: bold; letter-spacing: 0.05em; color: var(--text-normal); user-select: all; }
-            .od-instruction-text { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 15px; }
-            
-            .od-qr-section { display: flex; flex-direction: column; align-items: center; margin-top: 15px; padding: 15px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); }
-            .od-qr-section img { width: 150px; height: 150px; border-radius: var(--radius-s); margin-bottom: 10px; }
-            .od-qr-label { font-size: 0.9em; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; }
-            
-            .od-lan-card { padding: 15px; background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); cursor: pointer; transition: all 0.2s; text-align: center; display: flex; flex-direction: column; gap: 4px; }
-            .od-lan-card:hover { border-color: var(--interactive-accent); background: var(--background-modifier-hover); transform: translateY(-1px); }
-            .od-pulsing-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--interactive-accent); animation: pulse 1.5s infinite; margin-right: 8px; }
-            @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.5); } 100% { opacity: 1; transform: scale(1); } }
-
-            /* Responsive & Platform Specifics */
-            .od-desktop .od-full-width { width: auto; min-width: 200px; display: block; margin: 10px auto; }
-            .od-desktop .od-direct-ip-wrapper { max-width: 400px; margin: 0 auto; }
-            .od-desktop .od-direct-ip-wrapper input { margin-bottom: 10px; width: 100%; }
-            .od-desktop .od-id-container { max-width: 500px; margin: 0 auto; }
-            .od-desktop .od-peer-list { max-width: 600px; margin: 0 auto; }
-            .od-desktop .od-section-title { text-align: center; max-width: 600px; margin-left: auto; margin-right: auto; }
-            .od-desktop .od-input-row { max-width: 500px; margin: 0 auto 10px auto; }
-            
-            .od-mobile .od-full-width { width: 100%; margin-top: 10px; }
-            .od-mobile .od-input-row { flex-direction: column; }
-            .od-mobile .od-input-row button { width: 100%; margin-top: 5px; }
-        `;
-        document.head.appendChild(style);
-    }
-
-    formatPairingCodeForDisplay(deviceId: string): string {
-        if (deviceId.startsWith('device-') && deviceId.length === 15) {
-            const hex = deviceId.substring(7);
-            return `device-${hex.substring(0, 4)}-${hex.substring(4)}`;
-        }
-        return deviceId;
-    }
-
-    normalizePairingCodeInput(input: string): string {
-        let cleaned = input.trim().replace(/\s+/g, '');
-        if (cleaned.startsWith('device-')) {
-            const hexPart = cleaned.substring(7).replace(/-/g, '');
-            return `device-${hexPart}`;
-        }
-        const justHex = cleaned.replace(/-/g, '');
-        if (justHex.length === 8 && /^[0-9a-fA-F]{8}$/.test(justHex)) {
-            return `device-${justHex.toLowerCase()}`;
-        }
-        return cleaned;
-    }
-
-    render() {
-        this.contentEl.empty();
-        this.renderStatusBanner();
-        this.renderTabNavigation();
-        
-        if (this.activeTab === 'quick-pair') {
-            this.renderQuickPairTab();
-        } else {
-            this.renderAdvancedTab();
-        }
-    }
-
-    renderStatusBanner() {
-        const banner = this.contentEl.createDiv({ cls: `od-status-banner ${this.statusState}` });
-        
-        if (this.statusState === 'connecting') {
-            const spinner = banner.createSpan();
-            setIcon(spinner, 'loader');
-            spinner.addClass('lucide-spin');
-        } else if (this.statusState === 'connected') {
-            const check = banner.createSpan();
-            setIcon(check, 'check-circle');
-        } else if (this.statusState === 'error') {
-            const alert = banner.createSpan();
-            setIcon(alert, 'alert-triangle');
-        }
-        
-        banner.createSpan({ text: this.statusMessage });
-    }
-
-    renderTabNavigation() {
-        const tabsContainer = this.contentEl.createDiv({ cls: 'od-connection-tabs' });
-        
-        const quickPairBtn = tabsContainer.createEl('button', { text: 'Quick Pair', cls: `od-tab-btn ${this.activeTab === 'quick-pair' ? 'active' : ''}` });
-        quickPairBtn.onclick = () => { this.activeTab = 'quick-pair'; this.render(); };
-        
-        const advancedBtn = tabsContainer.createEl('button', { text: 'Advanced', cls: `od-tab-btn ${this.activeTab === 'advanced' ? 'active' : ''}` });
-        advancedBtn.onclick = () => { this.activeTab = 'advanced'; this.render(); };
-    }
-
-    async attemptConnection(scannedId: string) {
-        if (!scannedId.trim()) return;
-        
-        const parts = scannedId.split('|');
-        const peerId = this.normalizePairingCodeInput(parts[0]);
-        const psk = parts[1];
-        
-        if (psk) {
-            this.plugin.settings.peerKeys[peerId] = psk;
-            await this.plugin.saveSettings();
-        }
-        
-        this.statusState = 'connecting';
-        this.statusMessage = `Connecting to ${peerId}...`;
-        this.render();
-
-        const conn = this.plugin.peer?.connect(peerId);
-        if (!conn) {
-            this.statusState = 'error';
-            this.statusMessage = 'Failed to initiate connection. Are you online?';
-            this.render();
-            return;
-        }
-
-        conn.on('open', () => {
-            this.statusState = 'connected';
-            this.statusMessage = `Connected to ${conn.peer}`;
-            this.plugin.setupConnection(conn);
-            this.render();
-            setTimeout(() => this.close(), 1500);
-        });
-
-        conn.on('error', (err) => {
-            this.statusState = 'error';
-            this.statusMessage = `Connection failed. Try again.`;
-            this.render();
-        });
-    }
-
-    renderQuickPairTab() {
-        const { contentEl } = this;
-        contentEl.createEl('h2', { text: 'Quick Pair', cls: 'od-dashboard-header' });
-        contentEl.createDiv({ text: 'Connect devices easily using codes or QR', cls: 'od-dashboard-subtitle' });
-
-        const myInfo = this.plugin.getMyPeerInfo();
-
-        // Step 1: Share Your Code
-        contentEl.createDiv({ text: 'Step 1: Share Your Code', cls: 'od-step-header' });
-        
-        const codeContainer = contentEl.createDiv({ cls: 'od-pairing-code-container' });
-        const formattedCode = this.formatPairingCodeForDisplay(myInfo.deviceId);
-        codeContainer.createDiv({ text: formattedCode, cls: 'od-pairing-code-text' });
-        
-        const qrPayload = `${myInfo.deviceId}|${this.activePsk || ''}`;
-        
-        const copyBtn = codeContainer.createEl('button', { text: 'Copy' });
-        copyBtn.onclick = () => {
-            navigator.clipboard.writeText(qrPayload);
-            copyBtn.setText('Copied!');
-            setTimeout(() => copyBtn.setText('Copy'), 2000);
-        };
-        
-        contentEl.createDiv({ text: 'Type this code on your other device to connect', cls: 'od-instruction-text' });
-        
-        const qrSection = contentEl.createDiv({ cls: 'od-qr-section' });
-        qrSection.createDiv({ text: 'Or scan QR code (Includes Encryption Key)', cls: 'od-qr-label' });
-        
-        const imgEl = qrSection.createEl('img');
-        QRCode.toDataURL(qrPayload, { width: 150, margin: 2 }).then(url => {
-            imgEl.src = url;
-        }).catch(err => {
-            qrSection.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
-        });
-        
-        const scanBtn = qrSection.createEl('button', { text: 'Scan QR Code', cls: 'od-full-width' });
-        scanBtn.onclick = () => {
-            new QRScannerModal(this.app, (scannedId) => {
-                this.attemptConnection(scannedId);
-            }).open();
-        };
-
-        contentEl.createDiv({ cls: 'od-section-divider' });
-
-        // Step 2: Enter Their Code
-        contentEl.createDiv({ text: 'Step 2: Enter Their Code', cls: 'od-step-header' });
-        
-        const inputRow = contentEl.createDiv({ cls: 'od-input-row' });
-        const input = inputRow.createEl('input', { type: 'text', placeholder: 'Enter their pairing code or paste full key' });
-        
-        const connectBtn = inputRow.createEl('button', { text: 'Connect', cls: 'mod-cta' });
-        connectBtn.onclick = () => {
-            this.attemptConnection(input.value);
-        };
-
-        // LAN Discovery
-        if (!Platform.isMobile) {
-            contentEl.createDiv({ cls: 'od-section-divider' });
-            contentEl.createDiv({ text: 'Or connect to nearby devices', cls: 'od-step-header' });
-            
-            const lanList = contentEl.createDiv({ cls: 'od-peer-list' });
-            
-            const renderLanList = () => {
-                lanList.empty();
-                if (this.discoveredPeers.size === 0) {
-                    const emptyState = lanList.createDiv({ cls: 'od-scanning' });
-                    emptyState.createSpan({ cls: 'od-pulsing-indicator' });
-                    emptyState.createSpan({ text: 'Scanning for devices...' });
-                } else {
-                    this.discoveredPeers.forEach((peer) => {
-                        const card = lanList.createDiv({ cls: 'od-lan-card mod-clickable' });
-                        card.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
-                        card.createDiv({ text: Platform.isMobile ? 'Tap to connect' : 'Click to connect', cls: 'od-text-muted' });
-                        card.onclick = () => this.attemptConnection(peer.deviceId);
-                    });
-                }
-            };
-            
-            if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
-            if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
-
-            this.discoverListener = (p: PeerInfo) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); };
-            this.loseListener = (p: PeerInfo) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); };
-
-            this.plugin.lanDiscovery.on('discover', this.discoverListener);
-            this.plugin.lanDiscovery.on('lose', this.loseListener);
-            this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
-            this.plugin.lanDiscovery.startListening();
-            renderLanList();
-        }
-    }
-
-    renderAdvancedTab() {
-        const { contentEl } = this;
-
-        if (this.plugin.settings.connectionMode === 'direct-ip') {
-            this.renderDirectIpDashboard();
-            return;
-        }
-
-        contentEl.createEl('h2', { text: 'Advanced Configuration', cls: 'od-dashboard-header' });
-        contentEl.createDiv({ text: 'Manual connection options and settings', cls: 'od-dashboard-subtitle' });
-
-        // Offline Mode Switch
-        contentEl.createDiv({ cls: 'od-section-title', text: 'Offline Mode (Direct IP)' });
-        contentEl.createEl('p', { text: 'Use Offline Mode when you have no internet access but are on the same local network.', cls: 'od-text-muted', attr: { style: 'font-size: 0.85em;' } });
-        
-        const footer = contentEl.createDiv({ cls: 'od-mode-switch', attr: { style: 'margin-top: 10px;' } });
-        footer.setText("Switch to Offline Mode");
-        footer.onclick = async () => {
-            this.plugin.settings.connectionMode = 'direct-ip';
-            await this.plugin.saveSettings();
-            this.plugin.reinitializeConnectionManager();
-            this.render();
-        };
-    }
-
-    renderDirectIpDashboard() {
-        const { contentEl } = this;
-        contentEl.createEl('h2', { text: 'Offline Mode', cls: 'od-dashboard-header' });
-        contentEl.createDiv({ text: 'Connect directly over your local network', cls: 'od-dashboard-subtitle' });
-        
-        const container = contentEl.createDiv({ cls: 'od-direct-ip-wrapper' });
-
-        container.createDiv({ cls: 'od-section-title', text: 'Step 1: Host a Network (Main device)' });
-        if (!Platform.isMobile) {
-            const hostBtn = container.createEl('button', { text: 'Start Hosting', cls: 'mod-cta od-full-width' });
-            hostBtn.onclick = () => {
-                const pin = this.plugin.startDirectIpHost();
-                if (pin) {
-                    contentEl.empty();
-                    contentEl.createEl('h2', { text: 'Hosting Active', cls: 'od-dashboard-header' });
-                    contentEl.createDiv({ text: `IP: ${this.plugin.getLocalIp()}`, cls: 'od-ip-display' });
-                    contentEl.createDiv({ text: `Token: ${pin}`, cls: 'od-pin-display', attr: { style: 'font-size: 1.2em; word-break: break-all;' } });
-                    contentEl.createEl('button', { text: 'Done', cls: 'od-full-width', attr: { style: 'margin-top: 20px;' } }).onclick = () => this.close();
-                }
-            };
-        } else {
-            container.createDiv({ text: 'Hosting is not available on mobile.', cls: 'od-text-muted' });
-        }
-
-        if (!Platform.isMobile) {
-            container.createDiv({ cls: 'od-section-title', text: 'Discovered Hosts' });
-            const lanList = container.createDiv({ cls: 'od-peer-list' });
-            const renderLanList = () => {
-                lanList.empty();
-                if (this.discoveredPeers.size === 0) {
-                    const emptyState = lanList.createDiv({ cls: 'od-scanning' });
-                    emptyState.createSpan({ cls: 'od-pulsing-indicator' });
-                    emptyState.createSpan({ text: 'Scanning for hosts...' });
-                } else {
-                    this.discoveredPeers.forEach((peer) => {
-                        const item = lanList.createDiv({ cls: 'od-peer-item' });
-                        const info = item.createDiv({ cls: 'info' });
-                        info.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
-                        info.createDiv({ text: `${peer.ip || 'Unknown IP'}:${peer.port || '???'}`, cls: 'sub-text' });
-                        const btn = item.createEl('button', { text: 'Select' });
-                        btn.onclick = async () => {
-                            if (peer.ip) ipInput.value = peer.ip;
-                            if (peer.port) { this.plugin.settings.directIpHostPort = peer.port; await this.plugin.saveSettings(); }
-                            new Notice(`Selected ${peer.friendlyName}`);
-                        };
-                    });
-                }
-            };
-            
-            if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
-            if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
-
-            this.discoverListener = (p: PeerInfo) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); };
-            this.loseListener = (p: PeerInfo) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); };
-
-            this.plugin.lanDiscovery.on('discover', this.discoverListener);
-            this.plugin.lanDiscovery.on('lose', this.loseListener);
-            this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
-            this.plugin.lanDiscovery.startListening();
-            renderLanList();
-        }
-
-        container.createDiv({ cls: 'od-section-divider' });
-
-        container.createDiv({ cls: 'od-section-title', text: 'Step 2: Join a Network (Other devices)' });
-        const ipInput = container.createEl('input', { type: 'text', placeholder: 'Host IP Address' });
-        ipInput.value = this.plugin.settings.directIpHostAddress;
-        if (Platform.isMobile) { ipInput.style.width = '100%'; ipInput.style.marginBottom = '10px'; }
-        
-        const pinInput = container.createEl('input', { type: 'text', placeholder: 'Security Token' });
-        if (Platform.isMobile) { pinInput.style.width = '100%'; pinInput.style.marginBottom = '10px'; }
-
-        const connectBtn = container.createEl('button', { text: 'Connect', cls: 'mod-cta od-full-width' });
-        connectBtn.onclick = async () => {
-            if (ipInput.value && pinInput.value) {
-                this.plugin.settings.directIpHostAddress = ipInput.value;
-                await this.plugin.saveSettings();
-                this.plugin.connectToDirectIpHost({ host: ipInput.value, port: this.plugin.settings.directIpHostPort, pin: pinInput.value });
-                this.close();
-            }
-        };
-
-        const footer = contentEl.createDiv({ cls: 'od-mode-switch' });
-        footer.setText("Switch to Standard Mode");
-        footer.onclick = async () => {
-            this.plugin.settings.connectionMode = 'peerjs';
-            await this.plugin.saveSettings();
-            this.plugin.reinitializeConnectionManager();
-            this.render();
-        };
-    }
-}
-
-class QRScannerModal extends Modal {
-    private html5QrCode: Html5Qrcode | null = null;
-    constructor(app: App, private onScan: (text: string) => void) { super(app); }
-    
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.createEl('h2', { text: 'Scan QR Code' });
-        const readerId = 'od-qr-reader';
-        contentEl.createDiv({ attr: { id: readerId } });
-        
-        this.html5QrCode = new Html5Qrcode(readerId);
-        this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
-            this.onScan(decodedText);
-            this.close();
-        }, () => {}).catch(err => {
-            contentEl.createEl('p', { text: 'Error starting camera: ' + err, cls: 'mod-warning' });
-        });
-    }
-    
-    onClose() {
-        if (this.html5QrCode && this.html5QrCode.isScanning) { this.html5QrCode.stop().then(() => this.html5QrCode?.clear()).catch(console.error); }
-        this.contentEl.empty();
-    }
-}
-
-class SelectPeerModal extends Modal { constructor(app: App, private connections: Map<string, DataConnection>, private clusterPeers: Map<string, PeerInfo>, private onSubmit: (peerId: string) => void) { super(app); } onOpen() { const { contentEl } = this; contentEl.createEl('h2', { text: 'Force Full Sync with Peer' }); contentEl.createEl('p', { text: 'This will perform a two-way sync. Files will be exchanged based on which is newer. This is the safest way to reconcile two vaults.' }).addClass('mod-warning'); let selectedPeer = ''; const peerList = Array.from(this.connections.keys()); if (peerList.length === 0) { contentEl.createEl('p', { text: 'No peers are currently connected.' }); new Setting(contentEl).addButton(btn => btn.setButtonText("OK").onClick(() => this.close())); return; } new Setting(contentEl).setName('Sync with Device').addDropdown(dropdown => { peerList.forEach(peerId => { const peerInfo = this.clusterPeers.get(peerId); dropdown.addOption(peerId, peerInfo?.friendlyName || peerId); }); selectedPeer = dropdown.getValue(); dropdown.onChange(value => selectedPeer = value); }); new Setting(contentEl) .addButton(btn => btn.setButtonText('Cancel').onClick(() => this.close())) .addButton(btn => btn.setButtonText('Start Full Sync').setWarning().onClick(() => { if (selectedPeer) this.onSubmit(selectedPeer); this.close(); })); } onClose() { this.contentEl.empty(); } }
-class ConflictCenter { private conflicts: Map<string, string> = new Map(); private ribbonEl: HTMLElement | null = null; constructor(private app: App, private plugin: ObsidianDecentralizedPlugin) { } registerRibbon() { this.ribbonEl = this.plugin.addRibbonIcon('swords', 'Resolve Sync Conflicts', () => this.showConflictList()); this.ribbonEl.style.display = 'none'; } addConflict(originalPath: string, conflictPath: string) { this.conflicts.set(originalPath, conflictPath); this.updateRibbon(); } resolveConflict(originalPath: string) { this.conflicts.delete(originalPath); this.updateRibbon(); } updateRibbon() { if (!this.ribbonEl) return; if (this.conflicts.size > 0) { this.ribbonEl.show(); this.ribbonEl.setAttribute('aria-label', `Resolve ${this.conflicts.size} sync conflicts`); this.ribbonEl.setText(this.conflicts.size.toString()); } else { this.ribbonEl.hide(); } } showConflictList() { new ConflictListModal(this.app, this, this.plugin).open(); } }
-class ConflictListModal extends Modal { constructor(app: App, private conflictCenter: ConflictCenter, private plugin: ObsidianDecentralizedPlugin) { super(app); } onOpen() { const { contentEl } = this; contentEl.createEl('h2', { text: 'Sync Conflicts' }); const conflicts: Map<string, string> = (this.conflictCenter as any).conflicts; if (conflicts.size === 0) { contentEl.createEl('p', { text: 'No conflicts to resolve.' }); return; } conflicts.forEach((conflictPath, originalPath) => { new Setting(contentEl).setName(originalPath).setDesc(`Conflict file: ${conflictPath}`) .addButton(btn => btn.setButtonText('Resolve').setCta().onClick(async () => { this.close(); await this.showResolutionModal(originalPath, conflictPath); })); }); } async showResolutionModal(originalPath: string, conflictPath: string) { const originalFile = this.app.vault.getAbstractFileByPath(originalPath) as TFile; const conflictFile = this.app.vault.getAbstractFileByPath(conflictPath) as TFile; if (!originalFile || !conflictFile) { this.plugin.showNotice("One of the conflict files is missing.", 'error'); this.conflictCenter.resolveConflict(originalPath); return; } if (this.plugin.isBinary(originalFile.extension)) { new BinaryConflictResolutionModal(this.app, originalFile.name, async (choice) => { this.plugin.ignoreNextEventForPath(originalPath); if (choice === 'remote') { const remoteData = await this.app.vault.readBinary(conflictFile); await this.app.vault.modifyBinary(originalFile, remoteData); } this.plugin.ignoreNextEventForPath(conflictPath); await this.app.vault.delete(conflictFile); this.conflictCenter.resolveConflict(originalPath); this.plugin.showNotice(`${originalPath} has been resolved.`, 'info'); }).open(); } else { const localContent = await this.app.vault.read(originalFile); const remoteContent = await this.app.vault.read(conflictFile); new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => { this.plugin.ignoreNextEventForPath(originalPath); await this.app.vault.modify(originalFile, chosenContent); this.plugin.ignoreNextEventForPath(conflictPath); await this.app.vault.delete(conflictFile); this.conflictCenter.resolveConflict(originalPath); this.plugin.showNotice(`${originalPath} has been resolved.`, 'info'); }).open(); } } onClose() { this.contentEl.empty(); } }
-class ConflictResolutionModal extends Modal { constructor(app: App, private localContent: string, private remoteContent: string, private onResolve: (chosenContent: string) => void) { super(app); } onOpen() { const { contentEl } = this; contentEl.addClass('obsidian-decentralized-diff-modal'); contentEl.createEl('h2', { text: 'Resolve Conflict' }); const dmp = new DiffMatchPatch(); const diff = dmp.diff_main(this.localContent, this.remoteContent); dmp.diff_cleanupSemantic(diff); const diffEl = contentEl.createDiv({ cls: 'obsidian-decentralized-diff-view' }); diffEl.innerHTML = dmp.diff_prettyHtml(diff); new Setting(contentEl) .addButton(btn => btn.setButtonText('Keep My Version').onClick(() => { this.onResolve(this.localContent); this.close(); })) .addButton(btn => btn.setButtonText('Use Their Version').setWarning().onClick(() => { this.onResolve(this.remoteContent); this.close(); })); } onClose() { this.contentEl.empty(); } }
-class BinaryConflictResolutionModal extends Modal { constructor(app: App, private fileName: string, private onResolve: (choice: 'local' | 'remote') => void) { super(app); } onOpen() { const { contentEl } = this; contentEl.createEl('h2', { text: 'Resolve Binary Conflict' }); contentEl.createEl('p', { text: `The file "${this.fileName}" is a binary file (e.g. image, pdf, audio). Differences cannot be shown.` }); new Setting(contentEl).addButton(btn => btn.setButtonText('Keep My Version (Local)').onClick(() => { this.onResolve('local'); this.close(); })).addButton(btn => btn.setButtonText('Use Their Version (Remote)').setWarning().onClick(() => { this.onResolve('remote'); this.close(); })); } onClose() { this.contentEl.empty(); } }
-
-class SyncProgressModal extends Modal {
-    private container: HTMLElement;
-    private refreshInterval: number | null = null;
-
-    constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
-
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.addClass('od-progress-modal');
-        contentEl.createEl('h2', { text: 'Sync Progress' });
-        this.container = contentEl.createDiv();
-        this.refresh();
-        this.refreshInterval = window.setInterval(() => this.refresh(), 500);
-    }
-
-    onClose() {
-        if (this.refreshInterval) clearInterval(this.refreshInterval);
-        this.contentEl.empty();
-    }
-
-    refresh() {
-        this.container.empty();
-        const hasActive = this.plugin.activeTransfers.size > 0;
-        const hasFailed = this.plugin.failedSyncs.length > 0;
-        const isSyncing = this.plugin.syncState.isSyncing;
-
-        if (!hasActive && !hasFailed && !isSyncing) {
-            this.container.createEl('p', { text: 'No active file transfers or syncs.' });
-            return;
-        }
-
-        if (isSyncing) {
-            this.container.createEl('h4', { text: 'Full Sync Progress', attr: { style: 'margin-top: 0;' } });
-            const item = this.container.createDiv({ cls: 'od-transfer-item' });
-            item.createDiv({ text: `Phase: ${this.plugin.syncState.currentPhase}`, attr: { style: 'font-weight: bold; margin-bottom: 8px;' } });
-            
-            if (this.plugin.syncState.filesTotal > 0) {
-                item.createEl('progress', { attr: { value: this.plugin.syncState.filesTransferred, max: this.plugin.syncState.filesTotal } });
-                const meta = item.createDiv({ cls: 'od-transfer-meta' });
-                meta.createSpan({ text: `${this.plugin.syncState.filesTransferred} / ${this.plugin.syncState.filesTotal} files` });
-                meta.createSpan({ text: `${formatBytes(this.plugin.syncState.bytesTransferred)} / ${formatBytes(this.plugin.syncState.bytesTotal)}` });
-            } else {
-                item.createDiv({ text: 'Analyzing differences...', cls: 'od-transfer-meta' });
-            }
-        }
-
-        if (hasActive) {
-            if (hasFailed || isSyncing) this.container.createEl('h4', { text: 'Active Data Transfers', attr: { style: 'margin-top: 20px;' } });
-            this.plugin.activeTransfers.forEach(transfer => {
-                const item = this.container.createDiv({ cls: 'od-transfer-item' });
-                const title = item.createDiv({ cls: 'od-transfer-title', attr: { style: 'display: flex; align-items: center; margin-bottom: 4px;' } });
-                
-                const iconSpan = title.createSpan({ cls: 'od-transfer-icon' });
-                setIcon(iconSpan, transfer.direction === 'upload' ? 'arrow-up-circle' : 'arrow-down-circle');
-                iconSpan.style.marginRight = '6px';
-                iconSpan.style.color = transfer.direction === 'upload' ? 'var(--text-success)' : 'var(--interactive-accent)';
-                
-                title.createSpan({ text: transfer.path, attr: { style: 'font-weight: 600;' } });
-                if (transfer.status === 'paused') title.createSpan({ text: ' (Paused)', attr: { style: 'color: var(--text-muted); font-size: 0.8em; margin-left: 6px;' } });
-                
-                item.createEl('progress', { attr: { value: transfer.processedChunks, max: transfer.totalChunks } });
-
-                const now = Date.now();
-                const elapsedSeconds = (now - transfer.startTime) / 1000;
-                const chunkSize = transfer.chunkSize || this.plugin.getChunkSize();
-                const processedBytes = transfer.processedChunks * chunkSize;
-                const totalBytes = transfer.totalChunks * chunkSize;
-                const speedBytesPerSec = elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0;
-                const remainingBytes = totalBytes - processedBytes;
-                const remainingSeconds = speedBytesPerSec > 0 ? remainingBytes / speedBytesPerSec : 0;
-
-                const meta = item.createDiv({ cls: 'od-transfer-meta' });
-                meta.createSpan({ text: `${formatBytes(speedBytesPerSec)}/s` });
-                meta.createSpan({ text: `${Math.round(remainingSeconds)}s remaining` });
-                meta.createSpan({ text: `${Math.round((transfer.processedChunks / transfer.totalChunks) * 100)}%` });
-            });
-        }
-
-        if (hasFailed) {
-            this.container.createEl('h4', { text: 'Pending Retries', attr: { style: hasActive ? 'margin-top: 20px;' : 'margin-top: 0;' } });
-            this.plugin.failedSyncs.forEach(fail => {
-                const item = this.container.createDiv({ cls: 'od-transfer-item' });
-                const title = item.createDiv({ cls: 'od-transfer-title', attr: { style: 'display: flex; align-items: center; margin-bottom: 4px;' } });
-                
-                const iconSpan = title.createSpan({ cls: 'od-transfer-icon' });
-                setIcon(iconSpan, fail.type === 'file-delete' ? 'trash-2' : 'alert-circle');
-                iconSpan.style.marginRight = '6px';
-                iconSpan.style.color = 'var(--text-error)';
-                title.createSpan({ text: fail.path, attr: { style: 'font-weight: 600;' } });
-
-                const meta = item.createDiv({ cls: 'od-transfer-meta' });
-                const peerName = fail.peerId ? (this.plugin.clusterPeers.get(fail.peerId)?.friendlyName || fail.peerId) : 'Broadcast';
-                meta.createSpan({ text: `To: ${peerName}` });
-                
-                const secondsAgo = Math.round((Date.now() - fail.timestamp) / 1000);
-                meta.createSpan({ text: `Failed ${secondsAgo}s ago (Attempt ${fail.retryCount || 0})` });
-
-                if (fail.reason) {
-                    const reasonMeta = item.createDiv({ cls: 'od-transfer-meta' });
-                    reasonMeta.createSpan({ text: `Error: ${fail.reason}`, attr: { style: 'color: var(--text-error);' } });
-                }
-            });
-        }
-    }
-}
-
-class ObsidianDecentralizedSettingTab extends PluginSettingTab {
-    plugin: ObsidianDecentralizedPlugin;
-    private clusterStatusEl: HTMLDivElement | null = null;
-    private statusInterval: number | null = null;
-    private statusTextEl: HTMLDivElement | null = null;
-    private isEditingName = false;
-
-    constructor(app: App, plugin: ObsidianDecentralizedPlugin) {
-        super(app, plugin);
-        this.plugin = plugin;
-    }
-
-    display(): void {
-        this.isEditingName = false;
-        const { containerEl } = this;
-        containerEl.empty();
-        containerEl.createEl('h2', { text: 'Obsidian Decentralized' });
-        const isAuto = this.plugin.settings.syncMode === 'auto';
-
-        const statusContainer = containerEl.createDiv();
-        statusContainer.createEl('h3', { text: 'Live Status' });
-        this.statusTextEl = statusContainer.createDiv({ cls: 'obsidian-decentralized-status-text' });
-        this.statusTextEl.style.fontFamily = 'monospace';
-        this.statusTextEl.style.marginBottom = '1em';
-
-        new Setting(containerEl)
-            .setName(isAuto ? 'Settings Profile' : 'Mode')
-            .setDesc(isAuto ? 'Auto mode is easiest and syncs everything safely. Manual lets you pick folders and behaviors. Advanced unlocks all technical settings.' : 'Auto mode syncs all files. Manual mode allows configuration. Advanced mode unlocks all settings.')
-            .addDropdown(dd => dd
-                .addOption('auto', 'Auto (Recommended)')
-                .addOption('manual', 'Manual')
-                .addOption('advanced', 'Advanced')
-                .setValue(this.plugin.settings.syncMode)
-                .onChange(async (value: 'auto' | 'manual' | 'advanced') => {
-                    this.plugin.settings.syncMode = value;
-                    await this.plugin.saveSettings();
-                    this.display(); 
-                }));
-
-        new Setting(containerEl)
-            .setName('Connect Devices')
-            .setDesc('Open the connection helper to pair with your other devices.')
-            .addButton(btn => btn.setButtonText("Connect").setCta().onClick(() => new ConnectionModal(this.app, this.plugin).open()));
-
-        containerEl.createEl('h3', { text: 'Current Cluster' });
-        this.clusterStatusEl = containerEl.createDiv();
-        this.updateStatus();
-
-        // Shared Settings (Visible in both modes)
-        containerEl.createEl('h3', { text: 'Settings' });
-        new Setting(containerEl)
-            .setName("Excluded folders")
-            .setDesc("Never sync folders in this list. One folder per line. Example: 'Attachments/Large Files'.")
-            .addTextArea(text => text.setPlaceholder("Path/To/Exclude\nAnother/Path").setValue(this.plugin.settings.excludedFolders).onChange(async (value) => { this.plugin.settings.excludedFolders = value; await this.plugin.saveSettings(); }));
-
-        if (this.plugin.settings.syncMode === 'manual' || this.plugin.settings.syncMode === 'advanced') {
-            this.displayManualSettings(containerEl);
-        } else {
-             new Setting(containerEl)
-                .setName('Show Sync Notifications')
-                .setDesc('Show notifications for sync events. Important events like connections and conflicts always appear. This toggle controls additional progress notifications.')
-                .addToggle(toggle => toggle
-                    .setValue(this.plugin.settings.showToasts)
-                    .onChange(async (value) => {
-                        this.plugin.settings.showToasts = value;
-                        await this.plugin.saveSettings();
-                    }));
-        }
-        
-        if (this.plugin.settings.syncMode === 'advanced') {
-            this.displayAdvancedSettings(containerEl);
-        }
-
-        if (this.statusInterval) clearInterval(this.statusInterval);
-        this.statusInterval = window.setInterval(() => this.updateStatus(), 3000);
-    }
-
-    displayManualSettings(containerEl: HTMLElement): void {
-        containerEl.createEl('h4', { text: 'Manual Configuration' });
-
-        new Setting(containerEl)
-            .setName('Show Sync Notifications')
-            .setDesc('Show notifications for sync events. Important events like connections and conflicts always appear. This toggle controls additional progress notifications.')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.showToasts)
-                .onChange(async (value) => {
-                    this.plugin.settings.showToasts = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Conflict Resolution Strategy")
-            .setDesc("How to handle a file being edited on two devices at once.")
-            .addDropdown(dd => dd
-                .addOption('create-conflict-file', 'Create Conflict File (Safest)')
-                .addOption('last-write-wins', 'Last Write Wins (Newest file is kept)')
-                .setValue(this.plugin.settings.conflictResolutionStrategy)
-                .onChange(async (value: 'create-conflict-file' | 'last-write-wins') => {
-                    this.plugin.settings.conflictResolutionStrategy = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Sync all file types")
-            .setDesc("Sync not just markdown, but also images, PDFs, etc. This will increase sync traffic.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.syncAllFileTypes)
-                .onChange(async (value) => {
-                    this.plugin.settings.syncAllFileTypes = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Sync '.obsidian' configuration folder")
-            .setDesc("DANGEROUS: Syncs settings, themes, and snippets. Can cause issues if devices have different plugins or Obsidian versions. BACKUP FIRST.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.syncObsidianConfig)
-                .onChange(async (value) => {
-                    this.plugin.settings.syncObsidianConfig = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Hide Obsidian Sync status')
-            .setDesc('Hide the native Obsidian Sync button in the status bar.')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.hideNativeSyncStatus)
-                .onChange(async (value) => {
-                    this.plugin.settings.hideNativeSyncStatus = value;
-                    this.plugin.applyHideNativeSync();
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Enable Verbose Logging")
-            .setDesc("Outputs detailed sync information to the developer console for troubleshooting.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.verboseLogging)
-                .onChange(async (value) => {
-                    this.plugin.settings.verboseLogging = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Use custom signaling server")
-            .setDesc("For advanced users. Use your own self-hosted PeerJS server for a fully private syncing experience, even over the internet.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.useCustomPeerServer)
-                .onChange(async (value) => {
-                    this.plugin.settings.useCustomPeerServer = value;
-                    await this.plugin.saveSettings();
-                    this.display();
-                }));
-
-        if (this.plugin.settings.useCustomPeerServer) {
-            const config = this.plugin.settings.customPeerServerConfig;
-            new Setting(containerEl).setName("Host").addText(text => text.setValue(config.host).onChange(async (value) => { config.host = value; await this.plugin.saveSettings(); }));
-            new Setting(containerEl).setName("Port").addText(text => text.setValue(config.port.toString()).onChange(async (value) => { config.port = parseInt(value, 10) || 9000; await this.plugin.saveSettings(); }));
-            new Setting(containerEl).setName("Path").addText(text => text.setValue(config.path).onChange(async (value) => { config.path = value; await this.plugin.saveSettings(); }));
-            new Setting(containerEl).setName("Secure (SSL)").addToggle(toggle => toggle.setValue(config.secure).onChange(async (value) => { config.secure = value; await this.plugin.saveSettings(); }));
-
-            new Setting(containerEl)
-                .addButton(btn => btn.setButtonText("Apply and Reconnect").setWarning()
-                    .onClick(() => {
-                        this.plugin.showNotice("Reconnecting to new PeerJS server...", 'info');
-                        this.plugin.reinitializeConnectionManager();
-                    }));
-        }
-
-        containerEl.createEl('h4', { text: "Selective Sync" });
-        new Setting(containerEl)
-            .setName("Included folders")
-            .setDesc("Only sync folders in this list. One folder per line. If empty, all folders are included (unless excluded). Example: 'Journal/Daily'.")
-            .addTextArea(text => text.setPlaceholder("Path/To/Include\nAnother/Path").setValue(this.plugin.settings.includedFolders).onChange(async (value) => { this.plugin.settings.includedFolders = value; await this.plugin.saveSettings(); }));
-    }
-
-    displayAdvancedSettings(containerEl: HTMLElement): void {
-        containerEl.createEl('h4', { text: 'Two-Device Enhancements' });
-        
-        new Setting(containerEl)
-            .setName("Enable Two-Device Optimizations")
-            .setDesc("If exactly one device is connected, enables Version Vectors, Merkle Tree syncing, and Role-based conflict resolution.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableTwoDeviceOptimizations)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableTwoDeviceOptimizations = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Enable End-to-End Encryption")
-            .setDesc("Uses AES-GCM encryption with a PSK exchanged during pairing. Highly recommended.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableEncryption)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableEncryption = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        containerEl.createEl('h4', { text: 'Advanced Settings' });
-
-        new Setting(containerEl)
-            .setName("Turbo Real-time")
-            .setDesc("WARNING: Streams live keystrokes instantly to avoid conflicts. Requires a flawless connection and a strict 2-device setup. Can be destructive if misused.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableRealtimeSync)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableRealtimeSync = value;
-                    await this.plugin.saveSettings();
-                }));
-        
-        new Setting(containerEl)
-            .setName("Enable Text Compression")
-            .setDesc("Compress text files (markdown, css, etc.) before sending. Significantly reduces bandwidth usage.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableCompression)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableCompression = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Enable Delta Sync")
-            .setDesc("Only send changes (deltas) instead of the whole file when a text file is modified. Speeds up syncing for large notes.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableDeltaSync)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableDeltaSync = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Delta Sync Threshold (%)")
-            .setDesc("Only use delta sync if the patch is smaller than this percentage of the total file size.")
-            .addText(text => text
-                .setValue(this.plugin.settings.deltaSyncThreshold.toString())
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    this.plugin.settings.deltaSyncThreshold = isNaN(num) ? 50 : num;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Require PIN for all connections")
-            .setDesc("If set, the join PIN is never cleared and must be provided by all incoming connections.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.requirePinForAllConnections)
-                .onChange(async (value) => {
-                    this.plugin.settings.requirePinForAllConnections = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Idle Timeout (ms)")
-            .setDesc("Maximum time to wait for a sync operation without progress before aborting.")
-            .addText(text => text
-                .setValue(this.plugin.settings.idleTimeoutMs?.toString() || "30000")
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    this.plugin.settings.idleTimeoutMs = isNaN(num) ? 30000 : num;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Tombstone Retention (Days)")
-            .setDesc("How long to remember deleted files. Peers offline longer than this might resurrect deleted files.")
-            .addText(text => text
-                .setValue(this.plugin.settings.tombstoneRetentionDays?.toString() || "30")
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    this.plugin.settings.tombstoneRetentionDays = isNaN(num) ? 30 : num;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Max Concurrent Transfers")
-            .setDesc("Maximum number of files to transfer at once. Leave empty for dynamic (auto-tuning).")
-            .addText(text => text
-                .setPlaceholder("Auto")
-                .setValue(this.plugin.settings.maximumConcurrentTransfers?.toString() || "")
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    this.plugin.settings.maximumConcurrentTransfers = isNaN(num) ? null : num;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Chunk Size (Bytes)")
-            .setDesc("Size of file chunks in bytes. Default is dynamic (starts at 64KB).")
-            .addText(text => text
-                .setPlaceholder("Auto")
-                .setValue(this.plugin.settings.chunkSize?.toString() || "")
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    this.plugin.settings.chunkSize = isNaN(num) ? null : num;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Debounce Delay (ms)")
-            .setDesc("Time to wait after a file change before syncing. Higher values reduce sync frequency.")
-            .addText(text => text
-                .setValue(this.plugin.settings.debounceDelay.toString())
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    this.plugin.settings.debounceDelay = isNaN(num) ? DEFAULT_SETTINGS.debounceDelay : num;
-                    this.plugin.updateDebounceDelay();
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName("Modification Time Tolerance (ms)")
-            .setDesc("Time difference to consider files 'the same' to account for clock skew.")
-            .addText(text => text
-                .setValue(this.plugin.settings.mtimeTolerance.toString())
-                .onChange(async (value) => {
-                    const num = parseInt(value);
-                    this.plugin.settings.mtimeTolerance = isNaN(num) ? DEFAULT_SETTINGS.mtimeTolerance : num;
-                    await this.plugin.saveSettings();
-                }));
-    }
-
-    hide(): void {
-        if (this.statusInterval) {
-            clearInterval(this.statusInterval);
-            this.statusInterval = null;
-        }
-    }
-
-    private createEditableName(container: HTMLElement, displayName: string, editValue: string, onSave: (newName: string) => void) {
-        container.empty();
-        const wrapper = container.createDiv({ cls: 'od-editable-name-container' });
-        
-        wrapper.createSpan({ text: displayName, cls: 'od-editable-name-text' });
-        const iconEl = wrapper.createSpan({ cls: 'od-editable-name-icon' });
-        setIcon(iconEl, 'pencil');
-
-        const switchToEdit = () => {
-            this.isEditingName = true;
-            wrapper.empty();
-            wrapper.removeClass('od-editable-name-container'); 
-            wrapper.addClass('od-setting-item-name-wrapper');
-
-            const inputEl = wrapper.createEl('input', { type: 'text', value: editValue });
-            inputEl.addClass('od-editable-name-input');
-            
-            const save = () => {
-                this.isEditingName = false;
-                const newName = inputEl.value.trim();
-                if (newName && newName !== editValue) onSave(newName);
-                else this.createEditableName(container, displayName, editValue, onSave); 
-            };
-
-            const submitBtn = wrapper.createSpan({ cls: 'od-editable-name-submit' });
-            setIcon(submitBtn, 'check');
-            submitBtn.onclick = (e) => { e.stopPropagation(); save(); };
-
-            inputEl.onkeydown = (e) => { 
-                if (e.key === 'Enter') save(); 
-                if (e.key === 'Escape') { this.isEditingName = false; this.createEditableName(container, displayName, editValue, onSave); }
-            };
-            inputEl.onclick = (e) => e.stopPropagation();
-            
-            setTimeout(() => inputEl.focus(), 0);
-        };
-        wrapper.onclick = (e) => { e.preventDefault(); switchToEdit(); };
-    }
-
-    updateStatus() {
-        if (this.statusTextEl) {
-            const status = this.plugin.calculateStatus();
-            this.statusTextEl.empty();
-            const iconSpan = this.statusTextEl.createSpan({ cls: 'od-status-icon' });
-            setIcon(iconSpan, status.icon);
-            if (status.spin) iconSpan.addClass('lucide-spin');
-            this.statusTextEl.createSpan({ text: status.text });
-        }
-
-        if (!this.clusterStatusEl || !this.clusterStatusEl.isConnected) {
-            return;
-        }
-        if (this.isEditingName) return;
-        this.clusterStatusEl.empty();
-
-        const createEntry = (peer: PeerInfo, type: 'self' | 'companion' | 'peer' | 'host' | 'disconnected') => {
-            const settingItem = new Setting(this.clusterStatusEl!)
-                .setDesc(`ID: ${peer.deviceId}`);
-
-            if (type === 'self') {
-                this.createEditableName(settingItem.nameEl, peer.friendlyName + ' (This Device)', peer.friendlyName, async (newName) => {
-                    this.plugin.settings.friendlyName = newName;
-                    await this.plugin.saveSettings();
-                    this.plugin.broadcastData({ type: 'cluster-rename', targetDeviceId: this.plugin.settings.deviceId, newName });
-                    this.updateStatus();
-                });
-            } else if (type === 'peer' || type === 'disconnected') {
-                this.createEditableName(settingItem.nameEl, peer.friendlyName, peer.friendlyName, (newName) => {
-                    this.plugin.broadcastData({ type: 'cluster-rename', targetDeviceId: peer.deviceId, newName });
-                    peer.friendlyName = newName;
-                    this.plugin.saveKnownPeers();
-                    this.updateStatus();
-                });
-            } else {
-                settingItem.setName(peer.friendlyName);
-            }
-
-            if (type === 'companion') {
-                settingItem.addButton(btn => btn.setButtonText('Unpair').setWarning().onClick(async () => {
-                    await this.plugin.forgetCompanion();
-                    this.updateStatus();
-                }));
-            }
-            if (type === 'peer' || type === 'disconnected') {
-                settingItem.addExtraButton(btn => btn
-                    .setIcon('star')
-                    .setTooltip('Set as Primary Sync Partner')
-                    .onClick(async () => {
-                        this.plugin.settings.companionPeerId = peer.deviceId;
-                        await this.plugin.saveSettings();
-                        this.plugin.tryToConnectToClusterPeers();
-                        this.updateStatus();
-                    })
-                );
-            }
-            if (type === 'peer' || type === 'companion' || type === 'disconnected') {
-                const conn = this.plugin.connections.get(peer.deviceId);
-                if (conn && conn.open) {
-                    settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => {
-                        conn.close();
-                        this.plugin.showNotice(`Disconnecting from ${peer.friendlyName}`, 'important');
-                        setTimeout(() => this.updateStatus(), 100);
-                    }));
-                    settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Kick Device').onClick(() => {
-                        this.plugin.broadcastData({ type: 'cluster-kick', targetDeviceId: peer.deviceId });
-                        if (this.plugin.connections.has(peer.deviceId)) this.plugin.connections.get(peer.deviceId)?.close();
-                    }));
-                    settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
-                        this.plugin.manualPingStart.set(peer.deviceId, Date.now());
-                        conn.send({ type: 'ping' });
-                    }));
-                } else {
-                    settingItem.setDesc(settingItem.descEl.textContent + ' (Disconnected)');
-                    settingItem.nameEl.style.color = 'var(--text-muted)';
-                    
-                    settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
-                        if (this.plugin.peer && !this.plugin.peer.disconnected) {
-                            this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`, 'important');
-                            const newConn = this.plugin.peer.connect(peer.deviceId);
-                            this.plugin.setupConnection(newConn);
-                        } else {
-                            this.plugin.showNotice("Cannot reconnect: Your sync is offline.", 'error');
-                        }
-                    }));
-                    if (type !== 'companion') {
-                        settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(() => {
-                            this.plugin.pendingConnections.delete(peer.deviceId);
-                            this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
-                            this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
-                            this.plugin.saveKnownPeers();
-                        }));
-                    }
-                }
-            } else if (type === 'host') {
-                settingItem.addButton(btn => btn.setButtonText('Disconnect').onClick(() => {
-                    this.plugin.reinitializeConnectionManager();
-                    setTimeout(() => this.updateStatus(), 100);
-                }));
-            }
-        };
-        createEntry(this.plugin.getMyPeerInfo(), 'self');
-
-        if (this.plugin.getConnectionMode() === 'direct-ip') {
-            const list = this.clusterStatusEl;
-            if (this.plugin.directIpServer) {
-                list.createEl('p', { text: 'Hosting on Offline Mode. Other devices can connect to you.' });
-            } else if (this.plugin.directIpClient) {
-                const hostInfo = this.plugin.clusterPeers.values().next().value;
-                if (hostInfo) createEntry(hostInfo, 'host');
-            } else {
-                list.createEl('p', { text: 'Offline Mode is idle. Use the "Connect" button to start.' });
-            }
-            return;
-        }
-
-        const companionId = this.plugin.settings.companionPeerId;
-        if (companionId && this.plugin.clusterPeers.has(companionId)) {
-            createEntry(this.plugin.clusterPeers.get(companionId)!, 'companion');
-        }
-        this.plugin.clusterPeers.forEach(peer => {
-            if (peer.deviceId !== companionId) {
-                const isConnected = this.plugin.connections.has(peer.deviceId) && this.plugin.connections.get(peer.deviceId)?.open;
-                createEntry(peer, isConnected ? 'peer' : 'disconnected');
-            }
-        });
-
-        if (this.plugin.clusterPeers.size === 0) {
-            const list = this.clusterStatusEl;
-            if (!this.plugin.peer || this.plugin.peer.disconnected) {
-                list.createEl('p', { text: 'Sync is offline. Trying to reconnect...' });
-            } else if (!this.plugin.peer.id) {
-                list.createEl('p', { text: 'Connecting to sync network...' });
-            } else {
-                list.createEl('p', { text: 'Not connected to any other devices.' });
-            }
-        }
-    }
-}
+
