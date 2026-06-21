@@ -19,10 +19,10 @@ const LOCK_EXPIRATION_MS = 30000;
 const MAX_HASH_CACHE_SIZE = 10000;
 
 // Phase Timeouts
-const REQUESTING_TIMEOUT = 30000;
-const PLANNING_TIMEOUT = 60000;
-const BATCH_TIMEOUT = 120000;
-const COMPLETING_TIMEOUT = 30000;
+const REQUESTING_TIMEOUT = 120000;
+const PLANNING_TIMEOUT = 120000;
+const BATCH_TIMEOUT = 300000;
+const COMPLETING_TIMEOUT = 60000;
 
 enum SyncPhase { IDLE = 'IDLE', REQUESTING = 'REQUESTING', PLANNING = 'PLANNING', TRANSFERRING = 'TRANSFERRING', COMPLETING = 'COMPLETING', ABORTING = 'ABORTING' }
 enum SyncErrorCategory { CONNECTION_ERROR = 'CONNECTION_ERROR', TIMEOUT_ERROR = 'TIMEOUT_ERROR', INTEGRITY_ERROR = 'INTEGRITY_ERROR', PROTOCOL_ERROR = 'PROTOCOL_ERROR', VAULT_ERROR = 'VAULT_ERROR' }
@@ -1306,6 +1306,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
     private computePriority(data: SyncData): number {
         if (data.type === 'editor-delta' || data.type === 'editor-active' || data.type.startsWith('lock-')) return 1000000; 
+
+        const controlMessages = ['request-full-sync', 'sync-plan', 'request-batch', 'batch-complete', 'full-sync-complete'];
+        if (controlMessages.includes(data.type)) return 500000;
+
         if (data.type === 'folder-create' || data.type === 'folder-delete' || data.type === 'folder-rename') return 100000;
         if (data.type === 'file-delete' || data.type === 'file-rename' || data.type === 'file-delta') return 50000;
         if (data.type === 'file-update') {
