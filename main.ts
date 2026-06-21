@@ -652,7 +652,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private computePriority(data: SyncData): number {
         if (data.type === 'editor-delta' || data.type === 'editor-active' || data.type.startsWith('lock-')) return 1000000; 
 
-        const controlMessages = ['request-full-sync', 'sync-plan', 'request-batch', 'batch-complete', 'full-sync-complete'];
+        const controlMessages = ['request-full-sync', 'sync-plan', 'request-batch', 'batch-complete', 'full-sync-complete', 'sync-control-json'];
         if (controlMessages.includes(data.type)) return 500000;
 
         if (data.type === 'folder-create' || data.type === 'folder-delete' || data.type === 'folder-rename') return 100000;
@@ -745,7 +745,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         // Reuse messageId on retries so the peer's ACK for any attempt resolves the original promise
         const messageId = existingMessageId || this.generateTransferId(data.type);
-        const payload = { ...data, messageId };
+        // Wrap sync control messages as a JSON string inside a thin envelope.
+        // This prevents PeerJS's msgpack serializer from recursively packing
+        // large nested payloads (e.g. manifests with 20k+ items), which causes
+        // a "Maximum call stack size exceeded" RangeError.
+        const envelope = { type: 'sync-control-json', jsonPayload: JSON.stringify({ ...data, messageId }) };
         
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(async () => {
@@ -762,7 +766,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }, 30000);
             
             this.pendingSyncAcks.set(messageId, { resolve: () => { clearTimeout(timeout); resolve(); }, reject: (e) => { clearTimeout(timeout); reject(e); } });
-            this.sendData(peerId, payload as any);
+            this.sendData(peerId, envelope as any);
         });
     }
 
@@ -1534,7 +1538,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async processIncomingData(data: any, conn: DataConnection | null) {
-        if (!data || !data.type) return; this.log("Received data:", data.type, "from", conn?.peer);
+        if (!data || !data.type) return;
+        // Unwrap JSON-encoded sync control messages (see sendSyncMessage for why)
+        if (data.type === 'sync-control-json' && data.jsonPayload) {
+            try { data = JSON.parse(data.jsonPayload); } catch (e) { this.log('Failed to parse sync-control-json payload:', e); return; }
+        }
+        this.log("Received data:", data.type, "from", conn?.peer);
         if (conn?.peer) {
             this.lastHeard.set(conn.peer, Date.now());
             this.lastSuccessfulMessageTime.set(conn.peer, Date.now());
