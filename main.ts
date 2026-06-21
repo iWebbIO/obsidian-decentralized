@@ -70,7 +70,7 @@ type NackPayload = { type: 'nack', transferId: string, reason: 'integrity-failur
 type FileUpdatePayload = BasePayload & { type: 'file-update'; path: string; content: string | ArrayBuffer; mtime: number; encoding: 'utf8' | 'binary' | 'base64'; fileHash?: string; compressed?: boolean; versionVector?: VersionVector; };
 type FileDeltaPayload = BasePayload & { type: 'file-delta'; path: string; mtime: number; patches: string; baseHash: string; versionVector?: VersionVector; };
 type FileDeletePayload = BasePayload & { type: 'file-delete'; path: string; };
-type FileRenamePayload = BasePayload & { type: 'file-rename'; oldPath: string; newPath: string; };
+type FileRenamePayload = BasePayload & { type: 'file-rename'; oldPath: string; newPath: string; versionVector?: VersionVector; };
 type FolderCreatePayload = BasePayload & { type: 'folder-create', path: string; };
 type FolderDeletePayload = BasePayload & { type: 'folder-delete', path: string; };
 type FolderRenamePayload = BasePayload & { type: 'folder-rename', oldPath: string, newPath: string; };
@@ -1606,7 +1606,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } else if (task.taskType === 'send-folder-create') {
                     item.data = { type: 'folder-create', path: task.path, transferId: this.generateTransferId(task.path) };
                 } else if (task.taskType === 'send-rename') {
-                    item.data = { type: 'file-rename', oldPath: task.oldPath, newPath: task.newPath, transferId: this.generateTransferId(task.newPath) };
+                    let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[task.newPath] : undefined;
+                    item.data = { type: 'file-rename', oldPath: task.oldPath, newPath: task.newPath, transferId: this.generateTransferId(task.newPath), versionVector: vv };
                 }
             }
             
@@ -3009,7 +3010,37 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); this.ignoreNextEventForPath(conflictPath); if (data.encoding === 'binary' || data.encoding === 'base64') { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
     async applyFileDelete(data: FileDeletePayload) { if (!this.isPathSyncable(data.path)) return; this.tombstones[data.path] = Date.now(); this.debouncedSaveState(); this.syncedHashes.delete(data.path); const existingFile = this.app.vault.getAbstractFileByPath(data.path); if (existingFile) { try { this.log(`Deleting file: ${data.path}`); this.ignoreNextEventForPath(data.path); await this.app.vault.delete(existingFile); } catch (e) { console.error(`Error deleting file: ${data.path}`, e); this.showNotice(`Failed to delete file: ${data.path}`, 'error'); } } }
-    async applyFileRename(data: FileRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); if (fileToRename instanceof TFile) { try { this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.newPath); const cached = this.syncedHashes.get(data.oldPath); if (cached) { this.syncedHashes.set(data.newPath, cached); this.syncedHashes.delete(data.oldPath); this.debouncedSaveState(); } await this.app.vault.rename(fileToRename, data.newPath); } catch (e) { console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); this.showNotice(`Failed to rename file: ${data.oldPath}`, 'error'); } } }
+    async applyFileRename(data: FileRenamePayload) { 
+        if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; 
+        const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); 
+        if (fileToRename instanceof TFile) { 
+            try { 
+                this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); 
+                this.ignoreNextEventForPath(data.newPath); 
+                const cached = this.syncedHashes.get(data.oldPath); 
+                if (cached) { 
+                    this.syncedHashes.set(data.newPath, cached); 
+                    this.syncedHashes.delete(data.oldPath); 
+                } 
+                if (data.versionVector) {
+                    this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
+                    delete this.twoDeviceState.fileVersions[data.oldPath];
+                }
+                this.debouncedSaveState(); 
+                await this.app.vault.rename(fileToRename, data.newPath); 
+            } catch (e) { 
+                console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); 
+                this.showNotice(`Failed to rename file: ${data.oldPath}`, 'error'); 
+            } 
+        } else {
+            const newFile = this.app.vault.getAbstractFileByPath(data.newPath);
+            if (newFile instanceof TFile && data.versionVector) {
+                this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
+                delete this.twoDeviceState.fileVersions[data.oldPath];
+                this.debouncedSaveState();
+            }
+        }
+    }
     async applyFolderCreate(data: FolderCreatePayload) { if (!this.isPathSyncable(data.path)) return; if (this.app.vault.getAbstractFileByPath(data.path)) return; this.log(`Creating folder: ${data.path}`); this.ignoreNextEventForPath(data.path); try { await this.app.vault.createFolder(data.path); } catch (e) { console.error(`Failed to create folder ${data.path}`, e); } }
     async applyFolderDelete(data: FolderDeletePayload) { if (!this.isPathSyncable(data.path)) return; const folder = this.app.vault.getAbstractFileByPath(data.path); if (folder instanceof TFolder) { this.log(`Deleting folder: ${data.path}`); this.ignoreNextEventForPath(data.path, 5000); try { await this.app.vault.delete(folder, true); } catch (e) { console.error(`Failed to delete folder ${data.path}`, e); } } }
     async applyFolderRename(data: FolderRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const folder = this.app.vault.getAbstractFileByPath(data.oldPath); if (folder instanceof TFolder) { this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.oldPath); this.ignoreNextEventForPath(data.newPath); try { await this.app.vault.rename(folder, data.newPath); } catch (e) { console.error(`Failed to rename folder ${data.oldPath}`, e); } } }
@@ -3033,14 +3064,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.resetIdleTimeout();
         
         try {
-            if (this.currentSyncIsTwoDeviceMode) {
-                const tree = await this.buildMerkleTree();
-                await this.sendSyncMessage(peerId, { type: 'merkle-root', rootHash: tree.hash });
-            } else {
-                const localManifest = await this.buildVaultManifest(); 
-                this.log(`Sending sync request with ${localManifest.length} items.`); 
-                await this.sendSyncMessage(peerId, { type: 'request-full-sync', manifest: localManifest }); 
-            }
+            const localManifest = await this.buildVaultManifest(); 
+            this.log(`Sending sync request with ${localManifest.length} items.`); 
+            await this.sendSyncMessage(peerId, { type: 'request-full-sync', manifest: localManifest }); 
         } catch (e) {
             this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check network connection."));
         }
@@ -3185,33 +3211,57 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                 } else if (localItem && remoteItem) {
                     if (localItem.type === 'file' && remoteItem.type === 'file') {
+                        let conflictResolved = false;
                         if (this.currentSyncIsTwoDeviceMode && localItem.versionVector && remoteItem.versionVector) {
-                            if (this.isNewerThan(localItem.versionVector, remoteItem.versionVector)) {
+                            const isLocalNewer = this.isNewerThan(localItem.versionVector, remoteItem.versionVector);
+                            const isRemoteNewer = this.isNewerThan(remoteItem.versionVector, localItem.versionVector);
+                            if (isLocalNewer && !isRemoteNewer) {
                                 filesReceiverWillSend.push(path);
                                 fileSizes[path] = localItem.size;
+                                conflictResolved = true;
                             }
-                            else if (this.isNewerThan(remoteItem.versionVector, localItem.versionVector)) {
+                            else if (isRemoteNewer && !isLocalNewer) {
                                 filesInitiatorMustSend.push(path);
                                 this.peerFileSizes[path] = remoteItem.size;
+                                conflictResolved = true;
                             }
-                        } else if (localItem.size !== remoteItem.size) {
-                            if (localItem.mtime > remoteItem.mtime) { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
-                            else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
-                        } else if (Math.abs(localItem.mtime - remoteItem.mtime) > this.settings.mtimeTolerance) {
-                            let lHash = localItem.hash;
-                            if (!lHash) {
-                                const file = this.app.vault.getAbstractFileByPath(path);
-                                if (file instanceof TFile) {
-                                    const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
-                                    lHash = await this.getHash(content);
-                                    this.updateHashCache(path, lHash);
+                            else if (!isLocalNewer && !isRemoteNewer) {
+                                if (localItem.hash && remoteItem.hash && localItem.hash === remoteItem.hash) {
+                                    conflictResolved = true;
+                                } else {
+                                    const role = this.getMyRole(conn.peer);
+                                    if (role === 'primary') {
+                                        filesReceiverWillSend.push(path);
+                                        fileSizes[path] = localItem.size;
+                                    } else {
+                                        filesInitiatorMustSend.push(path);
+                                        this.peerFileSizes[path] = remoteItem.size;
+                                    }
+                                    conflictResolved = true;
                                 }
                             }
-                            if (remoteItem.hash && lHash === remoteItem.hash) {
-                                // Match
-                            } else {
+                        } 
+                        
+                        if (!conflictResolved) {
+                            if (localItem.size !== remoteItem.size) {
                                 if (localItem.mtime > remoteItem.mtime) { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
                                 else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
+                            } else if (Math.abs(localItem.mtime - remoteItem.mtime) > this.settings.mtimeTolerance) {
+                                let lHash = localItem.hash;
+                                if (!lHash) {
+                                    const file = this.app.vault.getAbstractFileByPath(path);
+                                    if (file instanceof TFile) {
+                                        const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
+                                        lHash = await this.getHash(content);
+                                        this.updateHashCache(path, lHash);
+                                    }
+                                }
+                                if (remoteItem.hash && lHash === remoteItem.hash) {
+                                    // Match
+                                } else {
+                                    if (localItem.mtime > remoteItem.mtime) { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
+                                    else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
+                                }
                             }
                         }
                     } else if (localItem.type === 'deleted' && remoteItem.type === 'file') {
