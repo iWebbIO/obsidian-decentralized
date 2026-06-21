@@ -2952,6 +2952,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             for (const path of data.paths) {
                 if (allowed.has(path)) {
+                    allowed.delete(path);
                     const file = this.app.vault.getAbstractFileByPath(path);
                     if (file instanceof TFile) {
                         this.addToQueueTask(conn.peer, { taskType: 'send-file', path, mtime: file.stat.mtime, forceFull: true, batchId });
