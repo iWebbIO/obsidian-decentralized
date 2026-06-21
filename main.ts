@@ -111,10 +111,19 @@ export interface SyncStatusState {
 }
 
 type SyncTask = 
-    | { taskType: 'send-file', path: string, mtime: number, forceFull: boolean }
-    | { taskType: 'send-folder-create', path: string }
+    | { taskType: 'send-file', path: string, mtime: number, forceFull: boolean, batchId?: string }
+    | { taskType: 'send-folder-create', path: string, batchId?: string }
     | { taskType: 'send-delete', path: string }
     | { taskType: 'send-rename', oldPath: string, newPath: string };
+
+interface BatchState {
+    peerId: string;
+    batchId: string;
+    totalCount: number;
+    sentCount: number;
+    succeededPaths: string[];
+    failedPaths: string[];
+}
 
 type SyncData =
     | HandshakePayload | RoleAnnouncementPayload | ClusterGossipPayload | CompanionPairPayload | AckPayload | NackPayload
@@ -759,6 +768,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private pendingPulls: Map<string, Set<string>> = new Map();
     private pullRetries: Map<string, number> = new Map();
     private peerFileSizes: Record<string, number> = {};
+    private activeBatches: Map<string, BatchState> = new Map();
+    private localSyncComplete: Map<string, boolean> = new Map();
+    private peerSyncComplete: Map<string, boolean> = new Map();
     
     // File Locking State
     public heldLocks: Map<string, { peerId: string, expiresAt: number }> = new Map();
@@ -1288,6 +1300,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.activeTransfers.clear();
         this.pendingPulls.clear();
         this.allowedPulls.clear();
+        this.activeBatches.clear();
+        this.localSyncComplete.clear();
+        this.peerSyncComplete.clear();
+        this.pullRetries.clear();
         if (this.syncIdleTimeout) { clearTimeout(this.syncIdleTimeout); this.syncIdleTimeout = null; }
         if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
         
@@ -1398,7 +1414,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const allowed = this.allowedPulls.get(peerId);
         
         if ((!pending || pending.size === 0) && (!allowed || allowed.size === 0)) {
-            this.handleFullSyncComplete();
+            if (!this.localSyncComplete.get(peerId)) {
+                this.localSyncComplete.set(peerId, true);
+                this.sendData(peerId, { type: 'full-sync-complete' });
+            }
+            if (this.localSyncComplete.get(peerId) && this.peerSyncComplete.get(peerId)) {
+                this.handleFullSyncComplete();
+            }
         }
     }
 
@@ -1658,6 +1680,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 item.data = null;
             }
         } finally {
+            let isFinal = false;
+            if (success) {
+                isFinal = true;
+            } else if (!isPaused && (!item || item.retries >= 3)) {
+                isFinal = true;
+            }
+
             if (transferId && !isPaused) {
                 this.reportTransferResult(success);
                 
@@ -1686,6 +1715,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.activeTransfers.delete(transferId);
                 this.debouncedSaveState();
             }
+
+            if (isFinal) {
+                const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : item.task.path) : undefined;
+                const path = item.data?.path || taskPath;
+                if (item.task && (item.task as any).batchId) {
+                    this.recordBatchTaskCompletion((item.task as any).batchId, path, success);
+                }
+            }
+
             this.updateStatus();
         }
     }
@@ -1989,111 +2027,121 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }, 10000);
     }
 
-    processIncomingData(data: any, conn: DataConnection | null) {
+    async processIncomingData(data: any, conn: DataConnection | null) {
         if (!data || !data.type) return; this.log("Received data:", data.type, "from", conn?.peer);
         if (conn?.peer) this.lastHeard.set(conn.peer, Date.now());
-        switch (data.type) {
-            case 'handshake': this.handleHandshake(data, conn!); break;
-            case 'role-announcement': 
-                if (this.isTwoDeviceMode()) {
-                    this.log(`Role announcement from ${data.deviceId}: ${data.role}`);
-                    // Validation: my role should be opposite
-                    if (data.role === this.currentRole) {
-                        this.log(`Role conflict detected! Re-evaluating.`);
-                        this.currentRole = this.getMyRole(data.deviceId);
+        
+        try {
+            switch (data.type) {
+                case 'handshake': this.handleHandshake(data, conn!); break;
+                case 'role-announcement': 
+                    if (this.isTwoDeviceMode()) {
+                        this.log(`Role announcement from ${data.deviceId}: ${data.role}`);
+                        // Validation: my role should be opposite
+                        if (data.role === this.currentRole) {
+                            this.log(`Role conflict detected! Re-evaluating.`);
+                            this.currentRole = this.getMyRole(data.deviceId);
+                        }
                     }
-                }
-                break;
-            case 'cluster-gossip': this.handleClusterGossip(data); break;
-            case 'companion-pair': this.handleCompanionPair(data); break;
-            case 'ack':
-                if (this.pendingAcks.has(data.transferId)) {
-                    this.log(`Ack received for ${data.transferId}.`);
-                    this.pendingAcks.get(data.transferId)!.resolve();
-                    this.pendingAcks.delete(data.transferId);
-                    this.resetIdleTimeout();
-                }
-                break;
-            case 'nack':
-                if (this.pendingAcks.has(data.transferId)) {
-                    this.log(`Nack received for ${data.transferId} (Reason: ${data.reason}).`);
-                    this.pendingAcks.get(data.transferId)!.reject(new Error(`IntegrityError: ${data.reason}`));
-                    this.pendingAcks.delete(data.transferId);
-                    this.resetIdleTimeout();
-                }
-                break;
-            case 'file-update': 
-                this.applyFileUpdate(data).then(() => {
-                    if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
-                    this.resetIdleTimeout();
-                }).catch(e => {
-                    this.log(`Failed to apply file update: ${data.path}`, e);
-                    if (conn && data.transferId) {
-                        const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
-                        conn.send({ type: 'nack', transferId: data.transferId, reason });
+                    break;
+                case 'cluster-gossip': this.handleClusterGossip(data); break;
+                case 'companion-pair': this.handleCompanionPair(data); break;
+                case 'ack':
+                    if (this.pendingAcks.has(data.transferId)) {
+                        this.log(`Ack received for ${data.transferId}.`);
+                        this.pendingAcks.get(data.transferId)!.resolve();
+                        this.pendingAcks.delete(data.transferId);
+                        this.resetIdleTimeout();
                     }
-                }); 
-                break;
-            case 'file-delta':
-                this.applyFileDelta(data).then(() => {
-                    if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
-                    this.resetIdleTimeout();
-                }).catch(e => {
-                    this.log(`Failed to apply delta: ${data.path}`, e);
-                    if (conn && data.transferId) {
-                        const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
-                        conn.send({ type: 'nack', transferId: data.transferId, reason });
+                    break;
+                case 'nack':
+                    if (this.pendingAcks.has(data.transferId)) {
+                        this.log(`Nack received for ${data.transferId} (Reason: ${data.reason}).`);
+                        this.pendingAcks.get(data.transferId)!.reject(new Error(`IntegrityError: ${data.reason}`));
+                        this.pendingAcks.delete(data.transferId);
+                        this.resetIdleTimeout();
                     }
-                });
-                break;
-            case 'file-delete': this.applyFileDelete(data); break;
-            case 'file-rename': this.applyFileRename(data); break;
-            case 'folder-create': this.applyFolderCreate(data); break;
-            case 'folder-delete': this.applyFolderDelete(data); break;
-            case 'folder-rename': this.applyFolderRename(data); break;
-            
-            // Pull-based Sync
-            case 'request-full-sync': this.handleFullSyncRequest(data, conn!); break;
-            case 'sync-plan': this.handleSyncPlan(data, conn!); break;
-            case 'request-batch': this.handleRequestBatch(data, conn!); break;
-            case 'batch-complete': this.handleBatchComplete(data, conn!); break;
-            
-            case 'initiator-sync-done': this.checkFullSyncCompletion(conn!.peer); break;
-            case 'full-sync-complete': this.checkFullSyncCompletion(conn!.peer); break;
-            case 'request-file': this.handleRequestFile(data, conn!); break;
-            case 'file-chunk-start': this.handleFileChunkStart(data, conn); break;
-            case 'file-chunk-data': this.handleFileChunkData(data, conn!); break;
-            
-            case 'ping': conn?.send({ type: 'pong' }); break;
-            case 'pong': 
-                if (this.manualPingStart.has(conn!.peer)) {
-                    const start = this.manualPingStart.get(conn!.peer)!;
-                    const rtt = Date.now() - start;
-                    this.manualPingStart.delete(conn!.peer);
-                    this.showNotice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`, 'important');
-                }
-                break;
-            case 'sync-ping': conn?.send({ type: 'sync-pong' }); this.resetIdleTimeout(); break;
-            case 'sync-pong': this.resetIdleTimeout(); break;
+                    break;
+                case 'file-update': 
+                    this.applyFileUpdate(data).then(() => {
+                        if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
+                        this.resetIdleTimeout();
+                    }).catch(e => {
+                        this.log(`Failed to apply file update: ${data.path}`, e);
+                        if (conn && data.transferId) {
+                            const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
+                            conn.send({ type: 'nack', transferId: data.transferId, reason });
+                        }
+                    }); 
+                    break;
+                case 'file-delta':
+                    this.applyFileDelta(data).then(() => {
+                        if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
+                        this.resetIdleTimeout();
+                    }).catch(e => {
+                        this.log(`Failed to apply delta: ${data.path}`, e);
+                        if (conn && data.transferId) {
+                            const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
+                            conn.send({ type: 'nack', transferId: data.transferId, reason });
+                        }
+                    });
+                    break;
+                case 'file-delete': this.applyFileDelete(data); break;
+                case 'file-rename': this.applyFileRename(data); break;
+                case 'folder-create': this.applyFolderCreate(data); break;
+                case 'folder-delete': this.applyFolderDelete(data); break;
+                case 'folder-rename': this.applyFolderRename(data); break;
                 
-            case 'cluster-forget': this.handleClusterForget(data); break;
-            case 'cluster-kick': this.handleClusterKick(data); break;
-            case 'cluster-rename': this.handleClusterRename(data); break;
-            
-            // Locking
-            case 'lock-request': this.handleLockRequest(data, conn!); break;
-            case 'lock-grant': this.handleLockGrant(data); break;
-            case 'lock-deny': this.handleLockDeny(data); break;
-            case 'lock-release': this.handleLockRelease(data, conn!); break;
-            
-            // Editor Sync
-            case 'editor-active': this.handleEditorActive(data, conn!); break;
-            case 'editor-delta': this.handleEditorDelta(data); break;
-            
-            // Merkle
-            case 'merkle-root': this.handleMerkleRoot(data, conn!); break;
-            case 'merkle-node-request': this.handleMerkleNodeRequest(data, conn!); break;
-            case 'merkle-node-response': this.handleMerkleNodeResponse(data, conn!); break;
+                // Pull-based Sync
+                case 'request-full-sync': await this.handleFullSyncRequest(data, conn!); break;
+                case 'sync-plan': await this.handleSyncPlan(data, conn!); break;
+                case 'request-batch': await this.handleRequestBatch(data, conn!); break;
+                case 'batch-complete': this.handleBatchComplete(data, conn!); break;
+                
+                case 'full-sync-complete': 
+                    this.peerSyncComplete.set(conn!.peer, true);
+                    this.checkFullSyncCompletion(conn!.peer);
+                    break;
+                case 'request-file': this.handleRequestFile(data, conn!); break;
+                case 'file-chunk-start': this.handleFileChunkStart(data, conn); break;
+                case 'file-chunk-data': await this.handleFileChunkData(data, conn!); break;
+                
+                case 'ping': conn?.send({ type: 'pong' }); break;
+                case 'pong': 
+                    if (this.manualPingStart.has(conn!.peer)) {
+                        const start = this.manualPingStart.get(conn!.peer)!;
+                        const rtt = Date.now() - start;
+                        this.manualPingStart.delete(conn!.peer);
+                        this.showNotice(`Ping to ${this.clusterPeers.get(conn!.peer)?.friendlyName || conn!.peer}: ${rtt}ms`, 'important');
+                    }
+                    break;
+                case 'sync-ping': conn?.send({ type: 'sync-pong' }); this.resetIdleTimeout(); break;
+                case 'sync-pong': this.resetIdleTimeout(); break;
+                    
+                case 'cluster-forget': this.handleClusterForget(data); break;
+                case 'cluster-kick': this.handleClusterKick(data); break;
+                case 'cluster-rename': this.handleClusterRename(data); break;
+                
+                // Locking
+                case 'lock-request': this.handleLockRequest(data, conn!); break;
+                case 'lock-grant': this.handleLockGrant(data); break;
+                case 'lock-deny': this.handleLockDeny(data); break;
+                case 'lock-release': this.handleLockRelease(data, conn!); break;
+                
+                // Editor Sync
+                case 'editor-active': this.handleEditorActive(data, conn!); break;
+                case 'editor-delta': this.handleEditorDelta(data); break;
+                
+                // Merkle
+                case 'merkle-root': await this.handleMerkleRoot(data, conn!); break;
+                case 'merkle-node-request': await this.handleMerkleNodeRequest(data, conn!); break;
+                case 'merkle-node-response': await this.handleMerkleNodeResponse(data, conn!); break;
+            }
+        } catch (e) {
+            this.log(`Error processing incoming data (type: ${data.type}):`, e);
+            if (this.isSyncing && (data.type === 'request-full-sync' || data.type === 'sync-plan' || data.type === 'request-batch')) {
+                this.abortSync(`Sync protocol error: ${e instanceof Error ? e.message : String(e)}`);
+            }
         }
     }
 
@@ -2856,6 +2904,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); 
         this.isSyncing = true; 
         this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
+        this.localSyncComplete.set(peerId, false);
+        this.peerSyncComplete.set(peerId, false);
         this.updateStatus(); 
         this.startSyncKeepAlive();
         this.resetIdleTimeout();
@@ -2961,6 +3011,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); 
         this.isSyncing = true; 
         this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
+        this.localSyncComplete.set(conn.peer, false);
+        this.peerSyncComplete.set(conn.peer, false);
         this.updateStatus(); 
         this.startSyncKeepAlive();
         this.resetIdleTimeout();
@@ -3067,54 +3119,88 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async handleSyncPlan(data: SyncPlanPayload, conn: DataConnection) {
         if (!this.isSyncing) return;
         this.resetIdleTimeout();
-        this.showNotice("Received sync plan. Exchanging files...", 'verbose'); 
-        this.log(`Sync plan: I must pull ${data.filesReceiverWillSend.length}, They pull ${data.filesInitiatorMustSend.length}`); 
-        
-        for (const path of data.filesInitiatorMustDelete || []) {
-            const file = this.app.vault.getAbstractFileByPath(path);
-            if (file) {
-                this.ignoreNextEventForPath(path);
-                await this.app.vault.delete(file);
-                this.syncedHashes.delete(path);
+        try {
+            this.showNotice("Received sync plan. Exchanging files...", 'verbose'); 
+            this.log(`Sync plan: I must pull ${data.filesReceiverWillSend.length}, They pull ${data.filesInitiatorMustSend.length}`); 
+            
+            for (const path of data.filesInitiatorMustDelete || []) {
+                const file = this.app.vault.getAbstractFileByPath(path);
+                if (file) {
+                    this.ignoreNextEventForPath(path);
+                    await this.app.vault.delete(file);
+                    this.syncedHashes.delete(path);
+                }
             }
+            
+            for (const [path, size] of Object.entries(data.fileSizes)) {
+                this.peerFileSizes[path] = size;
+            }
+            
+            this.allowedPulls.set(conn.peer, new Set(data.filesInitiatorMustSend));
+            this.pendingPulls.set(conn.peer, new Set(data.filesReceiverWillSend));
+            this.requestNextBatch(conn.peer);
+        } catch (e) {
+            this.log('Error processing sync plan:', e);
+            this.abortSync(`Failed to process sync plan: ${e instanceof Error ? e.message : String(e)}`);
         }
-        
-        for (const [path, size] of Object.entries(data.fileSizes)) {
-            this.peerFileSizes[path] = size;
-        }
-        
-        this.allowedPulls.set(conn.peer, new Set(data.filesInitiatorMustSend));
-        this.pendingPulls.set(conn.peer, new Set(data.filesReceiverWillSend));
-        this.requestNextBatch(conn.peer);
     }
     
+    private recordBatchTaskCompletion(batchId: string | undefined, path: string | undefined, success: boolean) {
+        if (!batchId || !path) return;
+        const batch = this.activeBatches.get(batchId);
+        if (!batch) return;
+        
+        batch.sentCount++;
+        if (success) {
+            batch.succeededPaths.push(path);
+        } else {
+            batch.failedPaths.push(path);
+        }
+        
+        if (batch.sentCount >= batch.totalCount) {
+            this.sendData(batch.peerId, { type: 'batch-complete', batchId: batch.batchId, receivedPaths: batch.succeededPaths, failedPaths: batch.failedPaths });
+            this.activeBatches.delete(batchId);
+            this.checkFullSyncCompletion(batch.peerId);
+        }
+    }
+
     async handleRequestBatch(data: RequestBatchPayload, conn: DataConnection) {
         this.resetIdleTimeout();
         const allowed = this.allowedPulls.get(conn.peer) || new Set();
-        const sentPaths: string[] = [];
-        const failedPaths: string[] = [];
+        
+        const batchId = data.batchId;
+        const batchState: BatchState = {
+            peerId: conn.peer,
+            batchId,
+            totalCount: data.paths.length,
+            sentCount: 0,
+            succeededPaths: [],
+            failedPaths: []
+        };
+        this.activeBatches.set(batchId, batchState);
         
         for (const path of data.paths) {
             if (allowed.has(path)) {
                 const file = this.app.vault.getAbstractFileByPath(path);
                 if (file instanceof TFile) {
-                    this.addToQueueTask(conn.peer, { taskType: 'send-file', path, mtime: file.stat.mtime, forceFull: true });
-                    sentPaths.push(path);
+                    this.addToQueueTask(conn.peer, { taskType: 'send-file', path, mtime: file.stat.mtime, forceFull: true, batchId });
                     allowed.delete(path);
                 } else if (file instanceof TFolder) {
-                    this.addToQueueTask(conn.peer, { taskType: 'send-folder-create', path });
-                    sentPaths.push(path);
+                    this.addToQueueTask(conn.peer, { taskType: 'send-folder-create', path, batchId });
                     allowed.delete(path);
                 } else {
-                    failedPaths.push(path);
+                    this.recordBatchTaskCompletion(batchId, path, false);
                 }
             } else {
-                failedPaths.push(path);
+                this.recordBatchTaskCompletion(batchId, path, false);
             }
         }
         
-        this.addToQueue(conn.peer, { type: 'batch-complete', batchId: data.batchId, receivedPaths: sentPaths, failedPaths });
-        this.checkFullSyncCompletion(conn.peer);
+        if (data.paths.length === 0) {
+            this.sendData(conn.peer, { type: 'batch-complete', batchId, receivedPaths: [], failedPaths: [] });
+            this.activeBatches.delete(batchId);
+            this.checkFullSyncCompletion(conn.peer);
+        }
     }
     
     handleBatchComplete(data: BatchCompletePayload, conn: DataConnection) {
@@ -3124,6 +3210,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         
         for (const path of data.receivedPaths) {
             pending.delete(path);
+            this.pullRetries.delete(path);
         }
         
         for (const path of data.failedPaths) {
@@ -3132,6 +3219,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.pullRetries.set(path, retries + 1);
             } else {
                 pending.delete(path);
+                this.pullRetries.delete(path);
                 this.log(`Failed to pull ${path} after 3 attempts.`);
             }
         }
@@ -3142,7 +3230,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     requestNextBatch(peerId: string) {
         const pending = this.pendingPulls.get(peerId);
         if (!pending || pending.size === 0) {
-            this.sendData(peerId, { type: 'initiator-sync-done' });
             this.checkFullSyncCompletion(peerId);
             return;
         }
@@ -3175,6 +3262,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.pendingPulls.clear();
         this.allowedPulls.clear();
         this.pullRetries.clear();
+        this.activeBatches.clear();
+        this.localSyncComplete.clear();
+        this.peerSyncComplete.clear();
         this.peerFileSizes = {};
         this.processQueue(); 
         this.updateStatus(); 
