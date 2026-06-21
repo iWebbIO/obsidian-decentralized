@@ -115,7 +115,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         currentFile: null,
         currentFileSize: null,
         inFlightPulls: new Set(),
-        activePullBatches: new Set()
+        activePullBatches: new Set(),
+        adaptiveConfig: {
+            maxActiveBatches: 1,
+            filesPerBatch: 50,
+            maxBytesPerBatch: 50 * 1024 * 1024
+        },
+        batchStartTimes: new Map()
     };
     private pendingSyncAcks: Map<string, { resolve: () => void, reject: (e: Error) => void }> = new Map();
     private lastSuccessfulMessageTime: Map<string, number> = new Map();
@@ -2620,6 +2626,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.syncState.currentFileSize = null;
         this.syncState.inFlightPulls = new Set();
         this.syncState.activePullBatches = new Set();
+        this.syncState.adaptiveConfig = {
+            maxActiveBatches: 1,
+            filesPerBatch: 50,
+            maxBytesPerBatch: 50 * 1024 * 1024
+        };
+        this.syncState.batchStartTimes = new Map();
         this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
         this.localSyncComplete.set(peerId, false);
         this.peerSyncComplete.set(peerId, false);
@@ -2739,6 +2751,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.syncState.currentFileSize = null;
             this.syncState.inFlightPulls = new Set();
             this.syncState.activePullBatches = new Set();
+            this.syncState.adaptiveConfig = {
+                maxActiveBatches: 1,
+                filesPerBatch: 50,
+                maxBytesPerBatch: 50 * 1024 * 1024
+            };
+            this.syncState.batchStartTimes = new Map();
             this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
             this.localSyncComplete.set(conn.peer, false);
             this.peerSyncComplete.set(conn.peer, false);
@@ -3017,11 +3035,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const pending = this.syncState.pendingPulls;
             if (this.syncState.activePullBatches) this.syncState.activePullBatches.delete(data.batchId);
             
+            const startTime = this.syncState.batchStartTimes?.get(data.batchId);
+            this.syncState.batchStartTimes?.delete(data.batchId);
+            const durationSec = startTime ? (Date.now() - startTime) / 1000 : 0;
+            let batchBytes = 0;
+            
             for (const path of data.receivedPaths) {
                 pending.delete(path);
                 if (this.syncState.inFlightPulls) this.syncState.inFlightPulls.delete(path);
                 this.syncState.filesTransferred++;
-                this.syncState.bytesTransferred += this.peerFileSizes[path] || 0;
+                const size = this.peerFileSizes[path] || 0;
+                this.syncState.bytesTransferred += size;
+                batchBytes += size;
                 this.pullRetries.delete(path);
             }
             
@@ -3034,6 +3059,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     pending.delete(path);
                     this.pullRetries.delete(path);
                     this.log(`Failed to pull ${path} after 3 attempts. Giving up on this file.`);
+                }
+            }
+            
+            if (data.failedPaths.length > 0) {
+                this.syncState.adaptiveConfig.maxActiveBatches = Math.max(1, Math.floor(this.syncState.adaptiveConfig.maxActiveBatches / 2));
+                this.syncState.adaptiveConfig.filesPerBatch = Math.max(10, Math.floor(this.syncState.adaptiveConfig.filesPerBatch / 2));
+                this.log(`AdaptiveSync: Network issues detected (${data.failedPaths.length} failed). Decreasing limits to ${this.syncState.adaptiveConfig.maxActiveBatches} batches, ${this.syncState.adaptiveConfig.filesPerBatch} files/batch.`);
+            } else if (durationSec > 0 && data.receivedPaths.length > 0) {
+                const throughput = batchBytes / durationSec;
+                if (throughput > 100 * 1024 || durationSec < 0.5) {
+                    this.syncState.adaptiveConfig.maxActiveBatches = Math.min(5, this.syncState.adaptiveConfig.maxActiveBatches + 1);
+                    this.syncState.adaptiveConfig.filesPerBatch = Math.min(500, this.syncState.adaptiveConfig.filesPerBatch + 50);
+                    this.log(`AdaptiveSync: Good transfer (${(throughput / 1024 / 1024).toFixed(2)} MB/s). Increasing limits to ${this.syncState.adaptiveConfig.maxActiveBatches} batches, ${this.syncState.adaptiveConfig.filesPerBatch} files/batch.`);
                 }
             }
             
@@ -3054,7 +3092,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.syncState.activePullBatches) this.syncState.activePullBatches = new Set();
         if (!this.syncState.inFlightPulls) this.syncState.inFlightPulls = new Set();
         
-        while (this.syncState.activePullBatches.size < 3) {
+        while (this.syncState.activePullBatches.size < this.syncState.adaptiveConfig.maxActiveBatches) {
             const availablePending = Array.from(pending).filter(p => !this.syncState.inFlightPulls.has(p));
             if (availablePending.length === 0) {
                 if (this.syncState.activePullBatches.size === 0) {
@@ -3071,7 +3109,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             for (const path of sortedPending) {
                 const size = this.peerFileSizes[path] || 0;
-                if (paths.length >= 200 || (totalSize + size > 50 * 1024 * 1024 && paths.length > 0)) {
+                if (paths.length >= this.syncState.adaptiveConfig.filesPerBatch || (totalSize + size > this.syncState.adaptiveConfig.maxBytesPerBatch && paths.length > 0)) {
                     break;
                 }
                 paths.push(path);
@@ -3079,11 +3117,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.syncState.inFlightPulls.add(path);
             }
             
-            this.log(`Requesting batch of ${paths.length} files (${formatBytes(totalSize)}).`);
+            this.log(`Requesting batch of ${paths.length} files (${formatBytes(totalSize)}). Active batches: ${this.syncState.activePullBatches.size + 1}/${this.syncState.adaptiveConfig.maxActiveBatches}`);
             const batchId = this.generateTransferId('batch');
             this.syncState.activePullBatches.add(batchId);
+            this.syncState.batchStartTimes?.set(batchId, Date.now());
             this.sendSyncMessage(peerId, { type: 'request-batch', paths, batchId }).catch(e => {
                 this.syncState.activePullBatches?.delete(batchId);
+                this.syncState.batchStartTimes?.delete(batchId);
                 for (const p of paths) this.syncState.inFlightPulls?.delete(p);
                 this.abortSync(e);
             });

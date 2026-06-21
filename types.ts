@@ -45,6 +45,12 @@ export class SyncError extends Error {
     }
 }
 
+export interface AdaptiveSyncConfig {
+    maxActiveBatches: number;
+    filesPerBatch: number;
+    maxBytesPerBatch: number;
+}
+
 export interface SyncState {
     isSyncing: boolean;
     currentPhase: SyncPhase;
@@ -64,6 +70,8 @@ export interface SyncState {
     syncStartTime: number;
     currentFile: string | null;
     currentFileSize: number | null;
+    adaptiveConfig: AdaptiveSyncConfig;
+    batchStartTimes: Map<string, number>;
 }
 
 // --- Type Definitions ---
