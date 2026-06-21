@@ -18,6 +18,38 @@ const MAX_QUEUE_DEPTH = 50;
 const LOCK_EXPIRATION_MS = 30000;
 const MAX_HASH_CACHE_SIZE = 10000;
 
+// Phase Timeouts
+const REQUESTING_TIMEOUT = 30000;
+const PLANNING_TIMEOUT = 60000;
+const BATCH_TIMEOUT = 120000;
+const COMPLETING_TIMEOUT = 30000;
+
+enum SyncPhase { IDLE = 'IDLE', REQUESTING = 'REQUESTING', PLANNING = 'PLANNING', TRANSFERRING = 'TRANSFERRING', COMPLETING = 'COMPLETING', ABORTING = 'ABORTING' }
+enum SyncErrorCategory { CONNECTION_ERROR = 'CONNECTION_ERROR', TIMEOUT_ERROR = 'TIMEOUT_ERROR', INTEGRITY_ERROR = 'INTEGRITY_ERROR', PROTOCOL_ERROR = 'PROTOCOL_ERROR', VAULT_ERROR = 'VAULT_ERROR' }
+
+class SyncError extends Error {
+    constructor(public category: SyncErrorCategory, message: string, public recoverable: boolean, public suggestedAction: string) {
+        super(message);
+        this.name = 'SyncError';
+    }
+}
+
+export interface SyncState {
+    isSyncing: boolean;
+    currentPhase: SyncPhase;
+    peerId: string | null;
+    pendingPulls: Set<string>;
+    allowedPulls: Set<string>;
+    activeBatches: Map<string, BatchState>;
+    phaseStartTime: number;
+    phaseTimeoutHandle: number | null;
+    missedPings: number;
+    filesTotal: number;
+    filesTransferred: number;
+    bytesTotal: number;
+    bytesTransferred: number;
+}
+
 // --- Type Definitions ---
 type PeerInfo = { deviceId: string; friendlyName: string; ip: string | null; port?: number; mode?: 'peerjs' | 'direct-ip'; };
 type DiscoveryBeacon = { type: 'obsidian-decentralized-beacon'; peerInfo: PeerInfo; };
@@ -28,7 +60,7 @@ type VaultManifest = (FileManifestEntry | FolderManifestEntry)[];
 type DeviceRole = 'primary' | 'secondary';
 type VersionVector = { [deviceId: string]: number };
 
-type BasePayload = { transferId: string; };
+type BasePayload = { transferId: string; messageId?: string; };
 type HandshakePayload = { type: 'handshake'; peerInfo: PeerInfo; pin?: string; };
 type RoleAnnouncementPayload = { type: 'role-announcement'; role: DeviceRole; deviceId: string; };
 type ClusterGossipPayload = { type: 'cluster-gossip'; peers: PeerInfo[]; };
@@ -69,6 +101,8 @@ type LockDenyPayload = { type: 'lock-deny', path: string, requestId: string, rea
 type LockReleasePayload = { type: 'lock-release', path: string };
 type EditorActivatePayload = { type: 'editor-active', path: string };
 type EditorDeltaPayload = { type: 'editor-delta', path: string, patches: string };
+
+type SyncAckPayload = { type: 'sync-ack', messageId: string };
 
 // Merkle Tree Payloads
 type MerkleRootPayload = { type: 'merkle-root', rootHash: string };
@@ -133,7 +167,7 @@ type SyncData =
     | FileChunkStartPayload | FileChunkDataPayload | PingPayload | PongPayload | SyncPingPayload | SyncPongPayload
     | ClusterForgetPayload | ClusterKickPayload | ClusterRenamePayload
     | LockRequestPayload | LockGrantPayload | LockDenyPayload | LockReleasePayload
-    | EditorActivatePayload | EditorDeltaPayload
+    | EditorActivatePayload | EditorDeltaPayload | SyncAckPayload
     | MerkleRootPayload | MerkleNodeRequestPayload | MerkleNodeResponsePayload;
 
 // Interfaces
@@ -717,7 +751,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     lanDiscovery: ILANDiscovery;
     private fileLocks: Map<string, Promise<void>> = new Map();
 
-    private isSyncing: boolean = false;
+    public syncState: SyncState = {
+        isSyncing: false,
+        currentPhase: SyncPhase.IDLE,
+        peerId: null,
+        pendingPulls: new Set(),
+        allowedPulls: new Set(),
+        activeBatches: new Map(),
+        phaseStartTime: 0,
+        phaseTimeoutHandle: null,
+        missedPings: 0,
+        filesTotal: 0,
+        filesTransferred: 0,
+        bytesTotal: 0,
+        bytesTransferred: 0
+    };
+    private pendingSyncAcks: Map<string, { resolve: () => void, reject: (e: Error) => void }> = new Map();
+    private lastSuccessfulMessageTime: Map<string, number> = new Map();
+
     private ignoreEvents: Map<string, number> = new Map();
     private statusBar: HTMLElement;
     private conflictCenter: ConflictCenter;
@@ -764,11 +815,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private syncDrainCallback: (() => void) | null = null;
     
     // Pull-based Sync State
-    private allowedPulls: Map<string, Set<string>> = new Map();
-    private pendingPulls: Map<string, Set<string>> = new Map();
     private pullRetries: Map<string, number> = new Map();
     private peerFileSizes: Record<string, number> = {};
-    private activeBatches: Map<string, BatchState> = new Map();
     private localSyncComplete: Map<string, boolean> = new Map();
     private peerSyncComplete: Map<string, boolean> = new Map();
     
@@ -1291,27 +1339,94 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return Math.min(1, (this.syncQueue.length + this.activeQueueTransfers) / MAX_QUEUE_DEPTH);
     }
 
-    private abortSync(reason: string) {
-        if (!this.isSyncing) return;
-        this.isSyncing = false;
+    public transitionToPhase(newPhase: SyncPhase) {
+        this.log(`Sync phase transition: ${this.syncState.currentPhase} -> ${newPhase}`);
+        this.syncState.currentPhase = newPhase;
+        this.syncState.phaseStartTime = Date.now();
+        if (this.syncState.phaseTimeoutHandle) { clearTimeout(this.syncState.phaseTimeoutHandle); this.syncState.phaseTimeoutHandle = null; }
+        
+        let timeoutMs = 0;
+        if (newPhase === SyncPhase.REQUESTING) timeoutMs = REQUESTING_TIMEOUT;
+        else if (newPhase === SyncPhase.PLANNING) timeoutMs = PLANNING_TIMEOUT;
+        else if (newPhase === SyncPhase.TRANSFERRING) timeoutMs = BATCH_TIMEOUT;
+        else if (newPhase === SyncPhase.COMPLETING) timeoutMs = COMPLETING_TIMEOUT;
+
+        if (timeoutMs > 0) {
+            this.syncState.phaseTimeoutHandle = window.setTimeout(() => {
+                this.abortSync(new SyncError(SyncErrorCategory.TIMEOUT_ERROR, `Sync timed out during ${newPhase}.`, false, "The peer may be busy or have a slow connection. Try again later."));
+            }, timeoutMs);
+        }
+        this.updateStatus();
+    }
+
+    public isConnectionHealthy(peerId: string): boolean {
+        const conn = this.connections.get(peerId);
+        if (!conn || !conn.open) return false;
+        const lastSuccess = this.lastSuccessfulMessageTime.get(peerId);
+        if (lastSuccess && (Date.now() - lastSuccess > 35000)) return false;
+        return true;
+    }
+
+    public async sendSyncMessage(peerId: string, data: any, retryCount = 0): Promise<void> {
+        if (!this.isConnectionHealthy(peerId)) {
+            throw new SyncError(SyncErrorCategory.CONNECTION_ERROR, `Connection to ${peerId} is unhealthy.`, true, "Check network connection.");
+        }
+        const messageId = this.generateTransferId(data.type);
+        const payload = { ...data, messageId };
+        
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(async () => {
+                this.pendingSyncAcks.delete(messageId);
+                if (retryCount < 3) {
+                    this.log(`Timeout sending ${data.type}, retrying (${retryCount + 1}/3)...`);
+                    try {
+                        await this.sendSyncMessage(peerId, data, retryCount + 1);
+                        resolve();
+                    } catch (e) { reject(e); }
+                } else {
+                    reject(new SyncError(SyncErrorCategory.TIMEOUT_ERROR, `Failed to deliver ${data.type} after 3 retries.`, false, "Check peer connection."));
+                }
+            }, 30000);
+            
+            this.pendingSyncAcks.set(messageId, { resolve: () => { clearTimeout(timeout); resolve(); }, reject: (e) => { clearTimeout(timeout); reject(e); } });
+            this.sendData(peerId, payload as any);
+        });
+    }
+
+    public abortSync(error?: SyncError) {
+        if (!this.syncState.isSyncing) return;
+        this.transitionToPhase(SyncPhase.ABORTING);
+        this.syncState.isSyncing = false;
         this.currentSyncIsTwoDeviceMode = null;
         this.syncDrainCallback = null;
         this.syncQueue = [];
         this.activeTransfers.clear();
-        this.pendingPulls.clear();
-        this.allowedPulls.clear();
-        this.activeBatches.clear();
+        this.syncState.pendingPulls.clear();
+        this.syncState.allowedPulls.clear();
+        this.syncState.activeBatches.clear();
         this.localSyncComplete.clear();
         this.peerSyncComplete.clear();
         this.pullRetries.clear();
+        this.syncState.peerId = null;
         if (this.syncIdleTimeout) { clearTimeout(this.syncIdleTimeout); this.syncIdleTimeout = null; }
         if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
+        if (this.syncState.phaseTimeoutHandle) { clearTimeout(this.syncState.phaseTimeoutHandle); this.syncState.phaseTimeoutHandle = null; }
         
-        this.pendingAcks.forEach(ack => ack.reject(new Error(reason)));
+        const errorMessage = error ? error.message : "Sync aborted manually.";
+        this.pendingAcks.forEach(ack => ack.reject(new Error(errorMessage)));
         this.pendingAcks.clear();
+        this.pendingSyncAcks.forEach(ack => ack.reject(new Error(errorMessage)));
+        this.pendingSyncAcks.clear();
         
-        this.showNotice(`Sync aborted: ${reason}`, 'error', 10000);
-        this.log(`Sync aborted: ${reason}`);
+        if (error) {
+            this.showNotice(`Sync failed: ${error.message}\nAction: ${error.suggestedAction}`, 'error', 10000);
+            this.log(`Sync aborted [${error.category}]: ${error.message}`);
+        } else {
+            this.showNotice(`Sync aborted.`, 'warning', 5000);
+            this.log(`Sync aborted manually.`);
+        }
+        
+        this.syncState.currentPhase = SyncPhase.IDLE;
         this.updateStatus();
     }
 
@@ -1384,9 +1499,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     resetIdleTimeout() {
         if (this.syncIdleTimeout) clearTimeout(this.syncIdleTimeout);
-        if (this.isSyncing) {
+        if (this.syncState.isSyncing) {
             this.syncIdleTimeout = window.setTimeout(() => {
-                this.abortSync("Sync idle timeout reached. Connection may have dropped.");
+                this.abortSync(new SyncError(SyncErrorCategory.TIMEOUT_ERROR, "Sync idle timeout reached. Connection may have dropped.", false, "Check network connection."));
             }, this.settings.idleTimeoutMs || 30000);
         }
     }
@@ -1406,21 +1521,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.activeQueueTransfers === 0 && this.syncQueue.length === 0 && this.syncDrainCallback) {
             this.syncDrainCallback();
             this.syncDrainCallback = null;
-        }
-    }
-
-    checkFullSyncCompletion(peerId: string) {
-        const pending = this.pendingPulls.get(peerId);
-        const allowed = this.allowedPulls.get(peerId);
-        
-        if ((!pending || pending.size === 0) && (!allowed || allowed.size === 0)) {
-            if (!this.localSyncComplete.get(peerId)) {
-                this.localSyncComplete.set(peerId, true);
-                this.sendData(peerId, { type: 'full-sync-complete' });
-            }
-            if (this.localSyncComplete.get(peerId) && this.peerSyncComplete.get(peerId)) {
-                this.handleFullSyncComplete();
-            }
         }
     }
 
@@ -1656,7 +1756,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : item.task.path) : undefined;
                 const path = item.data?.path || taskPath || 'an item';
                 this.showNotice(`File transfer failed permanently for ${path}.`, 'error', 8000);
-                if (this.isSyncing) this.abortSync("Transfer failed permanently.");
+                if (this.syncState.isSyncing) this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, "Transfer failed permanently.", false, "Check peer connection."));
                 
                 if (item.data && (item.data.type === 'file-update' || item.data.type === 'file-delete' || item.data.type === 'file-delta')) {
                     const existing = this.failedSyncs.find(f => f.path === item.data.path && f.peerId === item.peerId && f.type === item.data.type);
@@ -2016,11 +2116,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
     startSyncKeepAlive() {
         if (this.syncKeepAliveInterval) clearInterval(this.syncKeepAliveInterval);
+        this.syncState.missedPings = 0;
         this.syncKeepAliveInterval = window.setInterval(() => {
-            if (this.isSyncing) {
-                this.connections.forEach((conn, peerId) => {
-                    if (conn.open) conn.send({ type: 'sync-ping' }); // Send directly
-                });
+            if (this.syncState.isSyncing && this.syncState.peerId) {
+                if (this.syncState.missedPings >= 2) {
+                    this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, "Peer stopped responding to pings.", false, "Check peer network connection."));
+                    return;
+                }
+                this.syncState.missedPings++;
+                const conn = this.connections.get(this.syncState.peerId);
+                if (conn && conn.open) conn.send({ type: 'sync-ping' });
             } else {
                 if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
             }
@@ -2029,7 +2134,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async processIncomingData(data: any, conn: DataConnection | null) {
         if (!data || !data.type) return; this.log("Received data:", data.type, "from", conn?.peer);
-        if (conn?.peer) this.lastHeard.set(conn.peer, Date.now());
+        if (conn?.peer) {
+            this.lastHeard.set(conn.peer, Date.now());
+            this.lastSuccessfulMessageTime.set(conn.peer, Date.now());
+        }
+
+        if (data.messageId && data.type !== 'sync-ack' && conn) {
+            conn.send({ type: 'sync-ack', messageId: data.messageId });
+        }
+        if (data.type === 'sync-ack') {
+            const ack = this.pendingSyncAcks.get(data.messageId);
+            if (ack) { ack.resolve(); this.pendingSyncAcks.delete(data.messageId); }
+            return;
+        }
         
         try {
             switch (data.type) {
@@ -2116,7 +2233,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                     break;
                 case 'sync-ping': conn?.send({ type: 'sync-pong' }); this.resetIdleTimeout(); break;
-                case 'sync-pong': this.resetIdleTimeout(); break;
+                case 'sync-pong': this.syncState.missedPings = 0; this.resetIdleTimeout(); break;
                     
                 case 'cluster-forget': this.handleClusterForget(data); break;
                 case 'cluster-kick': this.handleClusterKick(data); break;
@@ -2139,8 +2256,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         } catch (e) {
             this.log(`Error processing incoming data (type: ${data.type}):`, e);
-            if (this.isSyncing && (data.type === 'request-full-sync' || data.type === 'sync-plan' || data.type === 'request-batch')) {
-                this.abortSync(`Sync protocol error: ${e instanceof Error ? e.message : String(e)}`);
+            if (this.syncState.isSyncing && (data.type === 'request-full-sync' || data.type === 'sync-plan' || data.type === 'request-batch')) {
+                this.abortSync(new SyncError(SyncErrorCategory.PROTOCOL_ERROR, `Sync protocol error: ${e instanceof Error ? e.message : String(e)}`, false, "Check logs."));
             }
         }
     }
@@ -2898,34 +3015,44 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async applyFolderRename(data: FolderRenamePayload) { if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; const folder = this.app.vault.getAbstractFileByPath(data.oldPath); if (folder instanceof TFolder) { this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); this.ignoreNextEventForPath(data.oldPath); this.ignoreNextEventForPath(data.newPath); try { await this.app.vault.rename(folder, data.newPath); } catch (e) { console.error(`Failed to rename folder ${data.oldPath}`, e); } } }
 
     async requestFullSyncFromPeer(peerId: string) { 
-        if (this.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } 
+        if (this.syncState.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } 
         const conn = this.connections.get(peerId); 
         if (!conn) { this.showNotice("Peer not found.", 'error'); return; } 
         this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); 
-        this.isSyncing = true; 
+        this.syncState.isSyncing = true; 
+        this.syncState.peerId = peerId;
+        this.syncState.filesTotal = 0;
+        this.syncState.filesTransferred = 0;
+        this.syncState.bytesTotal = 0;
+        this.syncState.bytesTransferred = 0;
         this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
         this.localSyncComplete.set(peerId, false);
         this.peerSyncComplete.set(peerId, false);
-        this.updateStatus(); 
+        this.transitionToPhase(SyncPhase.REQUESTING);
         this.startSyncKeepAlive();
         this.resetIdleTimeout();
         
-        if (this.currentSyncIsTwoDeviceMode) {
-            const tree = await this.buildMerkleTree();
-            this.sendData(peerId, { type: 'merkle-root', rootHash: tree.hash });
-        } else {
-            const localManifest = await this.buildVaultManifest(); 
-            this.log(`Sending sync request with ${localManifest.length} items.`); 
-            this.sendData(peerId, { type: 'request-full-sync', manifest: localManifest }); 
+        try {
+            if (this.currentSyncIsTwoDeviceMode) {
+                const tree = await this.buildMerkleTree();
+                await this.sendSyncMessage(peerId, { type: 'merkle-root', rootHash: tree.hash });
+            } else {
+                const localManifest = await this.buildVaultManifest(); 
+                this.log(`Sending sync request with ${localManifest.length} items.`); 
+                await this.sendSyncMessage(peerId, { type: 'request-full-sync', manifest: localManifest }); 
+            }
+        } catch (e) {
+            this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check network connection."));
         }
     }
     
     // --- Merkle Handlers ---
     async handleMerkleRoot(data: MerkleRootPayload, conn: DataConnection) {
-        if (!this.isSyncing) { 
-            this.isSyncing = true; 
+        if (!this.syncState.isSyncing) { 
+            this.syncState.isSyncing = true; 
+            this.syncState.peerId = conn.peer;
             this.currentSyncIsTwoDeviceMode = true;
-            this.updateStatus(); 
+            this.transitionToPhase(SyncPhase.REQUESTING);
             this.startSyncKeepAlive();
         }
         this.resetIdleTimeout();
@@ -3004,20 +3131,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { 
-        if (this.isSyncing) { 
-            this.showNotice(`Received a sync request from ${this.clusterPeers.get(conn.peer)?.friendlyName}, but a sync is already in progress. Ignoring.`, 'verbose'); 
+        if (this.syncState.isSyncing && this.syncState.currentPhase !== SyncPhase.IDLE) { 
+            this.log(`Received a sync request from ${conn.peer}, but a sync is already in progress in phase ${this.syncState.currentPhase}. Ignoring.`); 
             return; 
         } 
-        this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); 
-        this.isSyncing = true; 
-        this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
-        this.localSyncComplete.set(conn.peer, false);
-        this.peerSyncComplete.set(conn.peer, false);
-        this.updateStatus(); 
-        this.startSyncKeepAlive();
-        this.resetIdleTimeout();
-        
         try {
+            if (!data.manifest) throw new SyncError(SyncErrorCategory.PROTOCOL_ERROR, "Received invalid sync request (missing manifest).", false, "Update plugin on both devices.");
+            this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); 
+            this.syncState.isSyncing = true; 
+            this.syncState.peerId = conn.peer;
+            this.syncState.filesTotal = 0;
+            this.syncState.filesTransferred = 0;
+            this.syncState.bytesTotal = 0;
+            this.syncState.bytesTransferred = 0;
+            this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
+            this.localSyncComplete.set(conn.peer, false);
+            this.peerSyncComplete.set(conn.peer, false);
+            this.transitionToPhase(SyncPhase.PLANNING);
+            this.startSyncKeepAlive();
+            this.resetIdleTimeout();
+        
             const remoteManifest = data.manifest; 
             const localManifest = await this.buildVaultManifest(); 
             const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); 
@@ -3096,7 +3229,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             
             this.log(`Sync plan: They pull ${filesReceiverWillSend.length}, I pull ${filesInitiatorMustSend.length}, They delete ${filesInitiatorMustDelete.length}, I delete ${filesReceiverMustDelete.length}`); 
-            this.sendData(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes }); 
+            this.syncState.filesTotal = filesReceiverWillSend.length + filesInitiatorMustSend.length;
+            
+            if (filesReceiverWillSend.length === 0 && filesInitiatorMustSend.length === 0 && filesReceiverMustDelete.length === 0 && filesInitiatorMustDelete.length === 0) {
+                this.log("Vaults are completely identical. No sync needed.");
+                await this.sendSyncMessage(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes }); 
+                this.transitionToPhase(SyncPhase.COMPLETING);
+                this.handleFullSyncComplete();
+                return;
+            }
+
+            await this.sendSyncMessage(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes }); 
             
             for (const path of filesReceiverMustDelete) {
                 const file = this.app.vault.getAbstractFileByPath(path);
@@ -3107,21 +3250,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             }
             
-            this.allowedPulls.set(conn.peer, new Set(filesReceiverWillSend));
-            this.pendingPulls.set(conn.peer, new Set(filesInitiatorMustSend));
+            this.syncState.allowedPulls = new Set(filesReceiverWillSend);
+            this.syncState.pendingPulls = new Set(filesInitiatorMustSend);
             this.requestNextBatch(conn.peer);
             
         } catch (e) {
-            this.abortSync(`Error during sync request: ${e}`);
+            this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check logs for error details."));
         }
     }
     
     async handleSyncPlan(data: SyncPlanPayload, conn: DataConnection) {
-        if (!this.isSyncing) return;
+        if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
+        if (this.syncState.currentPhase !== SyncPhase.PLANNING) {
+            this.log(`Received sync plan but current phase is ${this.syncState.currentPhase}. Ignoring.`);
+            return;
+        }
         this.resetIdleTimeout();
         try {
+            if (!data.filesReceiverWillSend || !data.filesInitiatorMustSend) throw new SyncError(SyncErrorCategory.PROTOCOL_ERROR, "Invalid sync plan received.", false, "Update plugin.");
+            
             this.showNotice("Received sync plan. Exchanging files...", 'verbose'); 
             this.log(`Sync plan: I must pull ${data.filesReceiverWillSend.length}, They pull ${data.filesInitiatorMustSend.length}`); 
+            this.syncState.filesTotal = data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length;
             
             for (const path of data.filesInitiatorMustDelete || []) {
                 const file = this.app.vault.getAbstractFileByPath(path);
@@ -3134,20 +3284,27 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             for (const [path, size] of Object.entries(data.fileSizes)) {
                 this.peerFileSizes[path] = size;
+                if (data.filesReceiverWillSend.includes(path)) this.syncState.bytesTotal += size;
             }
             
-            this.allowedPulls.set(conn.peer, new Set(data.filesInitiatorMustSend));
-            this.pendingPulls.set(conn.peer, new Set(data.filesReceiverWillSend));
-            this.requestNextBatch(conn.peer);
+            this.syncState.allowedPulls = new Set(data.filesInitiatorMustSend);
+            this.syncState.pendingPulls = new Set(data.filesReceiverWillSend);
+            
+            if (this.syncState.pendingPulls.size === 0 && this.syncState.allowedPulls.size === 0) {
+                this.transitionToPhase(SyncPhase.COMPLETING);
+                this.handleFullSyncComplete();
+            } else {
+                this.requestNextBatch(conn.peer);
+            }
         } catch (e) {
             this.log('Error processing sync plan:', e);
-            this.abortSync(`Failed to process sync plan: ${e instanceof Error ? e.message : String(e)}`);
+            this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check logs for details."));
         }
     }
     
     private recordBatchTaskCompletion(batchId: string | undefined, path: string | undefined, success: boolean) {
         if (!batchId || !path) return;
-        const batch = this.activeBatches.get(batchId);
+        const batch = this.syncState.activeBatches.get(batchId);
         if (!batch) return;
         
         batch.sentCount++;
@@ -3158,29 +3315,36 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         
         if (batch.sentCount >= batch.totalCount) {
-            this.sendData(batch.peerId, { type: 'batch-complete', batchId: batch.batchId, receivedPaths: batch.succeededPaths, failedPaths: batch.failedPaths });
-            this.activeBatches.delete(batchId);
+            this.sendSyncMessage(batch.peerId, { type: 'batch-complete', batchId: batch.batchId, receivedPaths: batch.succeededPaths, failedPaths: batch.failedPaths })
+                .catch(e => this.abortSync(e));
+            this.syncState.activeBatches.delete(batchId);
             this.checkFullSyncCompletion(batch.peerId);
         }
     }
 
     async handleRequestBatch(data: RequestBatchPayload, conn: DataConnection) {
+        if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
+        if (this.syncState.currentPhase !== SyncPhase.TRANSFERRING && this.syncState.currentPhase !== SyncPhase.PLANNING) return;
+        this.transitionToPhase(SyncPhase.TRANSFERRING); // Reset timeout
         this.resetIdleTimeout();
-        const allowed = this.allowedPulls.get(conn.peer) || new Set();
         
-        const batchId = data.batchId;
-        const batchState: BatchState = {
-            peerId: conn.peer,
-            batchId,
-            totalCount: data.paths.length,
-            sentCount: 0,
-            succeededPaths: [],
-            failedPaths: []
-        };
-        this.activeBatches.set(batchId, batchState);
-        
-        for (const path of data.paths) {
-            if (allowed.has(path)) {
+        try {
+            if (!data.paths || !data.batchId) throw new SyncError(SyncErrorCategory.PROTOCOL_ERROR, "Invalid batch request.", false, "Update plugin.");
+            
+            const allowed = this.syncState.allowedPulls;
+            const batchId = data.batchId;
+            const batchState: BatchState = {
+                peerId: conn.peer,
+                batchId,
+                totalCount: data.paths.length,
+                sentCount: 0,
+                succeededPaths: [],
+                failedPaths: []
+            };
+            this.syncState.activeBatches.set(batchId, batchState);
+            
+            for (const path of data.paths) {
+                if (allowed.has(path)) {
                 const file = this.app.vault.getAbstractFileByPath(path);
                 if (file instanceof TFile) {
                     this.addToQueueTask(conn.peer, { taskType: 'send-file', path, mtime: file.stat.mtime, forceFull: true, batchId });
@@ -3189,27 +3353,39 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.addToQueueTask(conn.peer, { taskType: 'send-folder-create', path, batchId });
                     allowed.delete(path);
                 } else {
+                    this.log(`Failed to read ${path} for batch, marking failed.`);
                     this.recordBatchTaskCompletion(batchId, path, false);
                 }
             } else {
+                this.log(`Peer requested unauthorized path ${path}. Marking failed.`);
                 this.recordBatchTaskCompletion(batchId, path, false);
             }
         }
         
         if (data.paths.length === 0) {
-            this.sendData(conn.peer, { type: 'batch-complete', batchId, receivedPaths: [], failedPaths: [] });
-            this.activeBatches.delete(batchId);
+            this.sendSyncMessage(conn.peer, { type: 'batch-complete', batchId, receivedPaths: [], failedPaths: [] }).catch(e => this.abortSync(e));
+            this.syncState.activeBatches.delete(batchId);
             this.checkFullSyncCompletion(conn.peer);
+        }
+        } catch (e) {
+            this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check logs."));
         }
     }
     
     handleBatchComplete(data: BatchCompletePayload, conn: DataConnection) {
+        if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
+        if (this.syncState.currentPhase !== SyncPhase.TRANSFERRING) return;
+        this.transitionToPhase(SyncPhase.TRANSFERRING); // Reset timeout
         this.resetIdleTimeout();
-        const pending = this.pendingPulls.get(conn.peer);
-        if (!pending) return;
         
-        for (const path of data.receivedPaths) {
-            pending.delete(path);
+        try {
+            if (!data.receivedPaths || !data.failedPaths) throw new SyncError(SyncErrorCategory.PROTOCOL_ERROR, "Invalid batch complete payload.", false, "Update plugin.");
+            const pending = this.syncState.pendingPulls;
+            
+            for (const path of data.receivedPaths) {
+                pending.delete(path);
+                this.syncState.filesTransferred++;
+                this.syncState.bytesTransferred += this.peerFileSizes[path] || 0;
             this.pullRetries.delete(path);
         }
         
@@ -3220,19 +3396,25 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             } else {
                 pending.delete(path);
                 this.pullRetries.delete(path);
-                this.log(`Failed to pull ${path} after 3 attempts.`);
+                this.log(`Failed to pull ${path} after 3 attempts. Giving up on this file.`);
             }
         }
         
         this.requestNextBatch(conn.peer);
+        } catch (e) {
+            this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check logs."));
+        }
     }
     
     requestNextBatch(peerId: string) {
-        const pending = this.pendingPulls.get(peerId);
+        if (this.syncState.currentPhase !== SyncPhase.TRANSFERRING && this.syncState.currentPhase !== SyncPhase.PLANNING) return;
+        const pending = this.syncState.pendingPulls;
         if (!pending || pending.size === 0) {
+            this.transitionToPhase(SyncPhase.COMPLETING);
             this.checkFullSyncCompletion(peerId);
             return;
         }
+        this.transitionToPhase(SyncPhase.TRANSFERRING);
         
         const paths: string[] = [];
         let totalSize = 0;
@@ -3248,27 +3430,46 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             totalSize += size;
         }
         
+        this.log(`Requesting batch of ${paths.length} files (${formatBytes(totalSize)}).`);
         const batchId = this.generateTransferId('batch');
-        this.sendData(peerId, { type: 'request-batch', paths, batchId });
+        this.sendSyncMessage(peerId, { type: 'request-batch', paths, batchId }).catch(e => this.abortSync(e));
         this.resetIdleTimeout();
     }
     
+    checkFullSyncCompletion(peerId: string) {
+        const pending = this.syncState.pendingPulls;
+        const allowed = this.syncState.allowedPulls;
+        
+        if ((!pending || pending.size === 0) && (!allowed || allowed.size === 0)) {
+            if (!this.localSyncComplete.get(peerId)) {
+                this.localSyncComplete.set(peerId, true);
+                this.sendSyncMessage(peerId, { type: 'full-sync-complete' }).catch(e => this.abortSync(e));
+            }
+            if (this.localSyncComplete.get(peerId) && this.peerSyncComplete.get(peerId)) {
+                this.handleFullSyncComplete();
+            }
+        }
+    }
+
     handleFullSyncComplete() { 
-        if (!this.isSyncing) return; 
+        if (!this.syncState.isSyncing) return; 
         if (this.syncIdleTimeout) { clearTimeout(this.syncIdleTimeout); this.syncIdleTimeout = null; } 
         if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
-        this.isSyncing = false; 
+        if (this.syncState.phaseTimeoutHandle) { clearTimeout(this.syncState.phaseTimeoutHandle); this.syncState.phaseTimeoutHandle = null; }
+        this.syncState.isSyncing = false; 
+        this.syncState.currentPhase = SyncPhase.IDLE;
         this.currentSyncIsTwoDeviceMode = null;
-        this.pendingPulls.clear();
-        this.allowedPulls.clear();
+        this.syncState.pendingPulls.clear();
+        this.syncState.allowedPulls.clear();
         this.pullRetries.clear();
-        this.activeBatches.clear();
+        this.syncState.activeBatches.clear();
         this.localSyncComplete.clear();
         this.peerSyncComplete.clear();
+        this.syncState.peerId = null;
         this.peerFileSizes = {};
         this.processQueue(); 
         this.updateStatus(); 
-        this.showNotice("Full sync complete.", 'important'); 
+        this.showNotice(`Sync complete. Transferred ${this.syncState.filesTransferred} files.`, 'important'); 
     }
 
     handleRequestFile(data: RequestFilePayload, conn: DataConnection) {
@@ -3434,7 +3635,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public calculateStatus(): SyncStatusState {
-        if (this.isSyncing) return { text: "Full Syncing...", icon: "refresh-cw", spin: true, state: 'loading' };
+        if (this.syncState.isSyncing) {
+            let text = "Syncing...";
+            if (this.syncState.currentPhase === SyncPhase.REQUESTING) text = "Requesting Sync...";
+            else if (this.syncState.currentPhase === SyncPhase.PLANNING) text = "Comparing Vaults...";
+            else if (this.syncState.currentPhase === SyncPhase.TRANSFERRING) text = `Syncing (${this.syncState.filesTransferred}/${this.syncState.filesTotal})...`;
+            else if (this.syncState.currentPhase === SyncPhase.COMPLETING) text = "Completing Sync...";
+            return { text, icon: "refresh-cw", spin: true, state: 'loading' };
+        }
         if (this.activeTransfers.size > 0) {
             const count = Array.from(this.activeTransfers.values()).filter(t => t.status === 'active').length;
             if (count === 0 && this.activeTransfers.size > 0) return { text: "Transfers Paused", icon: "pause-circle", state: 'neutral' };
@@ -3960,14 +4168,30 @@ class SyncProgressModal extends Modal {
         this.container.empty();
         const hasActive = this.plugin.activeTransfers.size > 0;
         const hasFailed = this.plugin.failedSyncs.length > 0;
+        const isSyncing = this.plugin.syncState.isSyncing;
 
-        if (!hasActive && !hasFailed) {
-            this.container.createEl('p', { text: 'No active file transfers.' });
+        if (!hasActive && !hasFailed && !isSyncing) {
+            this.container.createEl('p', { text: 'No active file transfers or syncs.' });
             return;
         }
 
+        if (isSyncing) {
+            this.container.createEl('h4', { text: 'Full Sync Progress', attr: { style: 'margin-top: 0;' } });
+            const item = this.container.createDiv({ cls: 'od-transfer-item' });
+            item.createDiv({ text: `Phase: ${this.plugin.syncState.currentPhase}`, attr: { style: 'font-weight: bold; margin-bottom: 8px;' } });
+            
+            if (this.plugin.syncState.filesTotal > 0) {
+                item.createEl('progress', { attr: { value: this.plugin.syncState.filesTransferred, max: this.plugin.syncState.filesTotal } });
+                const meta = item.createDiv({ cls: 'od-transfer-meta' });
+                meta.createSpan({ text: `${this.plugin.syncState.filesTransferred} / ${this.plugin.syncState.filesTotal} files` });
+                meta.createSpan({ text: `${formatBytes(this.plugin.syncState.bytesTransferred)} / ${formatBytes(this.plugin.syncState.bytesTotal)}` });
+            } else {
+                item.createDiv({ text: 'Analyzing differences...', cls: 'od-transfer-meta' });
+            }
+        }
+
         if (hasActive) {
-            if (hasFailed) this.container.createEl('h4', { text: 'Active Transfers', attr: { style: 'margin-top: 0;' } });
+            if (hasFailed || isSyncing) this.container.createEl('h4', { text: 'Active Data Transfers', attr: { style: 'margin-top: 20px;' } });
             this.plugin.activeTransfers.forEach(transfer => {
                 const item = this.container.createDiv({ cls: 'od-transfer-item' });
                 const title = item.createDiv({ cls: 'od-transfer-title', attr: { style: 'display: flex; align-items: center; margin-bottom: 4px;' } });
