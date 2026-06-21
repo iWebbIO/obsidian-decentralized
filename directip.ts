@@ -5,7 +5,7 @@ import type ObsidianDecentralizedPlugin from './main';
 
 export class DirectIpServer {
     private server: any | null = null;
-    private clients: Map<string, { lastSeen: number, queue: any[], bufferedAmount: number }> = new Map();
+    private clients: Map<string, { lastSeen: number, queue: { data: any, size: number }[], bufferedAmount: number }> = new Map();
     private pin: string;
     private readonly MAX_QUEUE_SIZE = 2000;
 
@@ -44,13 +44,15 @@ export class DirectIpServer {
     sendTo(peerId: string, data: any) {
         const client = this.clients.get(peerId);
         if (client) {
+            const dataStr = JSON.stringify(data);
+            const size = dataStr.length;
             if (client.queue.length >= this.MAX_QUEUE_SIZE) {
                 const evicted = client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
-                const evictedSize = evicted.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+                const evictedSize = evicted.reduce((sum, item) => sum + item.size, 0);
                 client.bufferedAmount = Math.max(0, client.bufferedAmount - evictedSize);
             }
-            client.queue.push(data);
-            client.bufferedAmount += JSON.stringify(data).length;
+            client.queue.push({ data, size });
+            client.bufferedAmount += size;
         }
     }
 
@@ -102,12 +104,13 @@ export class DirectIpServer {
                 if (client.queue.length === 0) {
                     client.bufferedAmount = 0;
                 } else {
-                    const sentSize = messagesToSend.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+                    const sentSize = messagesToSend.reduce((sum, item) => sum + item.size, 0);
                     client.bufferedAmount = Math.max(0, client.bufferedAmount - sentSize);
                 }
             }
 
-            const messages = messagesToSend.map(msg => {
+            const messages = messagesToSend.map(item => {
+                let msg = item.data;
                 if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
                     return { ...msg, content: arrayBufferToBase64(msg.content), encoding: 'base64' };
                 }
@@ -167,14 +170,16 @@ export class DirectIpServer {
     }
 
     send(data: any) {
+        const dataStr = JSON.stringify(data);
+        const size = dataStr.length;
         for (const client of this.clients.values()) {
             if (client.queue.length >= this.MAX_QUEUE_SIZE) {
                 const evicted = client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
-                const evictedSize = evicted.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+                const evictedSize = evicted.reduce((sum, item) => sum + item.size, 0);
                 client.bufferedAmount = Math.max(0, client.bufferedAmount - evictedSize);
             }
-            client.queue.push(data);
-            client.bufferedAmount += JSON.stringify(data).length;
+            client.queue.push({ data, size });
+            client.bufferedAmount += size;
         }
     }
 
@@ -260,7 +265,7 @@ export class DirectIpClient {
         } else {
             this.consecutiveEmptyPolls++;
             if (this.consecutiveEmptyPolls > 3) {
-                this.pollInterval = Math.min(2000, Math.floor(this.pollInterval * 1.5));
+                this.pollInterval = Math.min(500, Math.floor(this.pollInterval * 1.5));
             }
         }
         

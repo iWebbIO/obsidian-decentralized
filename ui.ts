@@ -679,6 +679,18 @@ export class SyncProgressModal extends Modal {
                 const meta = item.createDiv({ cls: 'od-transfer-meta' });
                 meta.createSpan({ text: `${this.plugin.syncState.filesTransferred} / ${this.plugin.syncState.filesTotal} files` });
                 meta.createSpan({ text: `${formatBytes(this.plugin.syncState.bytesTransferred)} / ${formatBytes(this.plugin.syncState.bytesTotal)}` });
+                
+                const elapsedSeconds = (Date.now() - (this.plugin.syncState.syncStartTime || Date.now())) / 1000;
+                const speedBytesPerSec = elapsedSeconds > 0 ? this.plugin.syncState.bytesTransferred / elapsedSeconds : 0;
+                meta.createSpan({ text: `${formatBytes(speedBytesPerSec)}/s` });
+
+                if (this.plugin.syncState.currentFile) {
+                    const currentFileMeta = item.createDiv({ cls: 'od-transfer-meta', attr: { style: 'margin-top: 5px; color: var(--text-muted); font-size: 0.85em;' } });
+                    currentFileMeta.createSpan({ text: `Syncing: ${this.plugin.syncState.currentFile}` });
+                    if (this.plugin.syncState.currentFileSize != null) {
+                        currentFileMeta.createSpan({ text: ` (${formatBytes(this.plugin.syncState.currentFileSize)})` });
+                    }
+                }
             } else {
                 item.createDiv({ text: 'Analyzing differences...', cls: 'od-transfer-meta' });
             }

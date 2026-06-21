@@ -50,8 +50,10 @@ export interface SyncState {
     currentPhase: SyncPhase;
     peerId: string | null;
     pendingPulls: Set<string>;
+    inFlightPulls: Set<string>;
     allowedPulls: Set<string>;
     activeBatches: Map<string, BatchState>;
+    activePullBatches: Set<string>;
     phaseStartTime: number;
     phaseTimeoutHandle: number | null;
     missedPings: number;
@@ -59,6 +61,9 @@ export interface SyncState {
     filesTransferred: number;
     bytesTotal: number;
     bytesTransferred: number;
+    syncStartTime: number;
+    currentFile: string | null;
+    currentFileSize: number | null;
 }
 
 // --- Type Definitions ---

@@ -110,7 +110,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         filesTotal: 0,
         filesTransferred: 0,
         bytesTotal: 0,
-        bytesTransferred: 0
+        bytesTransferred: 0,
+        syncStartTime: 0,
+        currentFile: null,
+        currentFileSize: null,
+        inFlightPulls: new Set(),
+        activePullBatches: new Set()
     };
     private pendingSyncAcks: Map<string, { resolve: () => void, reject: (e: Error) => void }> = new Map();
     private lastSuccessfulMessageTime: Map<string, number> = new Map();
@@ -919,6 +924,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (task.taskType === 'send-file') {
                     const file = this.app.vault.getAbstractFileByPath(task.path);
                     if (file instanceof TFile) {
+                        if (this.syncState.isSyncing) {
+                            this.syncState.currentFile = file.path;
+                            this.syncState.currentFileSize = file.stat.size;
+                        }
                         const now = Date.now();
                         const MAX_SENT_CONTENT_CACHE = 200;
                         for (const [p, cacheData] of this.lastSentContent.entries()) {
@@ -2606,6 +2615,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.syncState.filesTransferred = 0;
         this.syncState.bytesTotal = 0;
         this.syncState.bytesTransferred = 0;
+        this.syncState.syncStartTime = Date.now();
+        this.syncState.currentFile = null;
+        this.syncState.currentFileSize = null;
+        this.syncState.inFlightPulls = new Set();
+        this.syncState.activePullBatches = new Set();
         this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
         this.localSyncComplete.set(peerId, false);
         this.peerSyncComplete.set(peerId, false);
@@ -2720,6 +2734,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.syncState.filesTransferred = 0;
             this.syncState.bytesTotal = 0;
             this.syncState.bytesTransferred = 0;
+            this.syncState.syncStartTime = Date.now();
+            this.syncState.currentFile = null;
+            this.syncState.currentFileSize = null;
+            this.syncState.inFlightPulls = new Set();
+            this.syncState.activePullBatches = new Set();
             this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
             this.localSyncComplete.set(conn.peer, false);
             this.peerSyncComplete.set(conn.peer, false);
@@ -2996,26 +3015,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         try {
             if (!data.receivedPaths || !data.failedPaths) throw new SyncError(SyncErrorCategory.PROTOCOL_ERROR, "Invalid batch complete payload.", false, "Update plugin.");
             const pending = this.syncState.pendingPulls;
+            if (this.syncState.activePullBatches) this.syncState.activePullBatches.delete(data.batchId);
             
             for (const path of data.receivedPaths) {
                 pending.delete(path);
+                if (this.syncState.inFlightPulls) this.syncState.inFlightPulls.delete(path);
                 this.syncState.filesTransferred++;
                 this.syncState.bytesTransferred += this.peerFileSizes[path] || 0;
-            this.pullRetries.delete(path);
-        }
-        
-        for (const path of data.failedPaths) {
-            const retries = this.pullRetries.get(path) || 0;
-            if (retries < 3) {
-                this.pullRetries.set(path, retries + 1);
-            } else {
-                pending.delete(path);
                 this.pullRetries.delete(path);
-                this.log(`Failed to pull ${path} after 3 attempts. Giving up on this file.`);
             }
-        }
-        
-        this.requestNextBatch(conn.peer);
+            
+            for (const path of data.failedPaths) {
+                if (this.syncState.inFlightPulls) this.syncState.inFlightPulls.delete(path);
+                const retries = this.pullRetries.get(path) || 0;
+                if (retries < 3) {
+                    this.pullRetries.set(path, retries + 1);
+                } else {
+                    pending.delete(path);
+                    this.pullRetries.delete(path);
+                    this.log(`Failed to pull ${path} after 3 attempts. Giving up on this file.`);
+                }
+            }
+            
+            this.requestNextBatch(conn.peer);
         } catch (e) {
             this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check logs."));
         }
@@ -3028,25 +3050,45 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.checkFullSyncCompletion(peerId);
             return;
         }
-        this.transitionToPhase(SyncPhase.TRANSFERRING);        
-        const paths: string[] = [];
-        let totalSize = 0;
         
-        const sortedPending = Array.from(pending).sort((a, b) => (this.peerFileSizes[a] || 0) - (this.peerFileSizes[b] || 0));
+        if (!this.syncState.activePullBatches) this.syncState.activePullBatches = new Set();
+        if (!this.syncState.inFlightPulls) this.syncState.inFlightPulls = new Set();
         
-        for (const path of sortedPending) {
-            const size = this.peerFileSizes[path] || 0;
-            if (paths.length >= 10 || (totalSize + size > 50 * 1024 * 1024 && paths.length > 0)) {
+        while (this.syncState.activePullBatches.size < 3) {
+            const availablePending = Array.from(pending).filter(p => !this.syncState.inFlightPulls.has(p));
+            if (availablePending.length === 0) {
+                if (this.syncState.activePullBatches.size === 0) {
+                    this.checkFullSyncCompletion(peerId);
+                }
                 break;
             }
-            paths.push(path);
-            totalSize += size;
+
+            this.transitionToPhase(SyncPhase.TRANSFERRING);        
+            const paths: string[] = [];
+            let totalSize = 0;
+            
+            const sortedPending = availablePending.sort((a, b) => (this.peerFileSizes[a] || 0) - (this.peerFileSizes[b] || 0));
+            
+            for (const path of sortedPending) {
+                const size = this.peerFileSizes[path] || 0;
+                if (paths.length >= 200 || (totalSize + size > 50 * 1024 * 1024 && paths.length > 0)) {
+                    break;
+                }
+                paths.push(path);
+                totalSize += size;
+                this.syncState.inFlightPulls.add(path);
+            }
+            
+            this.log(`Requesting batch of ${paths.length} files (${formatBytes(totalSize)}).`);
+            const batchId = this.generateTransferId('batch');
+            this.syncState.activePullBatches.add(batchId);
+            this.sendSyncMessage(peerId, { type: 'request-batch', paths, batchId }).catch(e => {
+                this.syncState.activePullBatches?.delete(batchId);
+                for (const p of paths) this.syncState.inFlightPulls?.delete(p);
+                this.abortSync(e);
+            });
+            this.resetIdleTimeout();
         }
-        
-        this.log(`Requesting batch of ${paths.length} files (${formatBytes(totalSize)}).`);
-        const batchId = this.generateTransferId('batch');
-        this.sendSyncMessage(peerId, { type: 'request-batch', paths, batchId }).catch(e => this.abortSync(e));
-        this.resetIdleTimeout();
     }
     
     checkFullSyncCompletion(peerId: string) {
@@ -3081,9 +3123,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.syncState.currentPhase = SyncPhase.IDLE;
         this.currentSyncIsTwoDeviceMode = null;
         this.syncState.pendingPulls.clear();
+        this.syncState.inFlightPulls?.clear();
         this.syncState.allowedPulls.clear();
         this.pullRetries.clear();
         this.syncState.activeBatches.clear();
+        this.syncState.activePullBatches?.clear();
         this.localSyncComplete.clear();
         this.peerSyncComplete.clear();
         this.syncState.peerId = null;
