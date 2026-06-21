@@ -197,10 +197,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.conflictCenter.registerRibbon();
         this.addRibbonIcon('users', 'Connect to a Peer', () => new ConnectionModal(this.app, this).open());
         this.addRibbonIcon('refresh-cw', 'Force Full Sync with Peer', () => {
-            if (this.getConnectionMode() === 'direct-ip') {
-                this.showNotice("Full Sync is not yet supported in Offline mode.", 'info');
-                return;
-            }
             if (this.connections.size === 0) { this.showNotice("No peers connected.", 'info'); return; }
             new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
         });
@@ -727,6 +723,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public isConnectionHealthy(peerId: string): boolean {
+        if (this.getConnectionMode() === 'direct-ip') {
+            if (this.directIpClient) {
+                return this.directIpClient.isOpen && peerId === 'direct-ip-host';
+            }
+            if (this.directIpServer) {
+                return this.directIpServer.hasClient(peerId);
+            }
+            return false;
+        }
         const conn = this.connections.get(peerId);
         if (!conn || !conn.open) return false;
         const lastSuccess = this.lastSuccessfulMessageTime.get(peerId);
@@ -1672,8 +1677,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
         this.saveKnownPeers();
         const existingPeers = Array.from(this.clusterPeers.values());
-        this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers });
-        this.broadcastData({ type: 'cluster-gossip', peers: [this.getMyPeerInfo(), data.peerInfo] });
+        
+        if (this.getConnectionMode() === 'direct-ip') {
+            if (!data.isResponse) {
+                this.sendData(conn.peer, { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: data.pin, isResponse: true } as any);
+            }
+        } else {
+            this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers });
+            this.broadcastData({ type: 'cluster-gossip', peers: [this.getMyPeerInfo(), data.peerInfo] });
+        }
         
         if (this.isTwoDeviceMode()) {
             this.currentRole = this.getMyRole(conn.peer);
@@ -3159,7 +3171,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }; 
     }
     public startDirectIpHost() { if (Platform.isMobile) return; this.reinitializeConnectionManager(); const pin = Array.from(window.crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join(''); this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin); this.updateStatus(); return pin; }
-    public async connectToDirectIpHost(config: DirectIpConfig) { this.reinitializeConnectionManager(); this.directIpClient = new DirectIpClient(this, config); this.clusterPeers.set(config.host, { deviceId: config.host, friendlyName: `Host (${config.host})`, ip: config.host }); this.updateStatus(); }
+    public async connectToDirectIpHost(config: DirectIpConfig) {
+        this.reinitializeConnectionManager();
+        this.directIpClient = new DirectIpClient(this, config);
+        this.clusterPeers.set('direct-ip-host', { deviceId: 'direct-ip-host', friendlyName: `Host (${config.host})`, ip: config.host });
+        
+        const mockConn = {
+            send: (data: any) => this.directIpClient?.send(data),
+            peer: 'direct-ip-host',
+            open: true
+        } as any;
+        this.connections.set('direct-ip-host', mockConn);
+        this.updateStatus();
+
+        // Initiate handshake
+        await this.directIpClient.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: config.pin });
+    }
     
     injectStatusBarStyles() {
         const styleId = 'obsidian-decentralized-status-styles';

@@ -103,6 +103,7 @@ export type HandshakePayload = {
     type: 'handshake';
     peerInfo: PeerInfo;
     pin?: string;
+    isResponse?: boolean;
 };
 
 export type RoleAnnouncementPayload = {
