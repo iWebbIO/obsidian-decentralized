@@ -30,3 +30,85 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
     }
     return bytes.buffer;
 }
+
+export interface PackedFile {
+    path: string;
+    mtime: number;
+    isCompressed: boolean;
+    encoding: 'utf8' | 'binary' | 'base64';
+    content: ArrayBuffer | Uint8Array;
+}
+
+export function packFilesToTLV(files: PackedFile[]): ArrayBuffer {
+    const encoder = new TextEncoder();
+    let totalSize = 0;
+    
+    // Calculate total size first to avoid reallocations
+    const encodedPaths: Uint8Array[] = [];
+    for (const file of files) {
+        const pathEncoded = encoder.encode(file.path);
+        encodedPaths.push(pathEncoded);
+        // 2 (path len) + pathBytes + 8 (mtime) + 1 (isCompressed) + 1 (encoding) + 4 (content len) + contentBytes
+        totalSize += 2 + pathEncoded.byteLength + 8 + 1 + 1 + 4 + file.content.byteLength;
+    }
+    
+    const buffer = new ArrayBuffer(totalSize);
+    const view = new DataView(buffer);
+    const bytes = new Uint8Array(buffer);
+    let offset = 0;
+    
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const pathEncoded = encodedPaths[i];
+        
+        view.setUint16(offset, pathEncoded.byteLength, true); offset += 2;
+        bytes.set(pathEncoded, offset); offset += pathEncoded.byteLength;
+        
+        view.setFloat64(offset, file.mtime, true); offset += 8;
+        
+        view.setUint8(offset, file.isCompressed ? 1 : 0); offset += 1;
+        
+        let encFlag = 0;
+        if (file.encoding === 'binary') encFlag = 1;
+        else if (file.encoding === 'base64') encFlag = 2;
+        view.setUint8(offset, encFlag); offset += 1;
+        
+        view.setUint32(offset, file.content.byteLength, true); offset += 4;
+        bytes.set(new Uint8Array(file.content), offset); offset += file.content.byteLength;
+    }
+    
+    return buffer;
+}
+
+export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
+    const decoder = new TextDecoder();
+    const view = new DataView(buffer);
+    const files: PackedFile[] = [];
+    let offset = 0;
+    
+    while (offset < buffer.byteLength) {
+        const pathLen = view.getUint16(offset, true); offset += 2;
+        
+        // Zero-copy view for decoding
+        const pathBytes = new Uint8Array(buffer, offset, pathLen);
+        const path = decoder.decode(pathBytes); offset += pathLen;
+        
+        const mtime = view.getFloat64(offset, true); offset += 8;
+        const isCompressed = view.getUint8(offset) === 1; offset += 1;
+        
+        const encFlag = view.getUint8(offset); offset += 1;
+        let encoding: 'utf8' | 'binary' | 'base64' = 'utf8';
+        if (encFlag === 1) encoding = 'binary';
+        else if (encFlag === 2) encoding = 'base64';
+        
+        const contentLen = view.getUint32(offset, true); offset += 4;
+        
+        // Zero-copy sub-array for content, prevents memory explosion
+        const content = new Uint8Array(buffer, offset, contentLen);
+        offset += contentLen;
+        
+        files.push({ path, mtime, isCompressed, encoding, content });
+    }
+    
+    return files;
+}

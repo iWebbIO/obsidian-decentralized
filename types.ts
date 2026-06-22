@@ -254,6 +254,12 @@ export type FileChunkDataPayload = {
     data: ArrayBuffer;
 };
 
+export type FileBatchBinaryPayload = {
+    type: 'file-batch-binary';
+    batchId: string;
+    data: ArrayBuffer | Uint8Array;
+};
+
 export type PingPayload = {
     type: 'ping';
 };
@@ -382,6 +388,7 @@ export interface SyncStatusState {
 
 export type SyncTask =
     | { taskType: 'send-file'; path: string; mtime: number; forceFull: boolean; batchId?: string }
+    | { taskType: 'send-file-batch'; paths: string[]; batchId: string }
     | { taskType: 'send-folder-create'; path: string; batchId?: string }
     | { taskType: 'send-delete'; path: string }
     | { taskType: 'send-rename'; oldPath: string; newPath: string };

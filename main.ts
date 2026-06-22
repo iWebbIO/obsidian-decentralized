@@ -76,7 +76,8 @@ import {
     ObsidianDecentralizedSettings,
     TwoDeviceState,
     DEFAULT_SETTINGS,
-    ILANDiscovery
+    ILANDiscovery,
+    FileBatchBinaryPayload
 } from './types';
 
 // Utils imports
@@ -84,7 +85,10 @@ import {
     compressText,
     decompressText,
     arrayBufferToBase64,
-    base64ToArrayBuffer
+    base64ToArrayBuffer,
+    packFilesToTLV,
+    unpackTLVToFiles,
+    PackedFile
 } from './utils';
 
 
@@ -1016,6 +1020,47 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } else if (task.taskType === 'send-rename') {
                     let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[task.newPath] : undefined;
                     item.data = { type: 'file-rename', oldPath: task.oldPath, newPath: task.newPath, transferId: this.generateTransferId(task.newPath), versionVector: vv };
+                } else if (task.taskType === 'send-file-batch') {
+                    const packedFiles: PackedFile[] = [];
+                    for (const path of task.paths) {
+                        const file = this.app.vault.getAbstractFileByPath(path);
+                        if (file instanceof TFile) {
+                            let content: string | ArrayBuffer = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
+                            let encoding: 'utf8' | 'binary' | 'base64' = this.isBinary(file.extension) ? 'binary' : 'utf8';
+                            let isCompressedText = false;
+                            
+                            if (!this.isBinary(file.extension) && this.settings.enableCompression) {
+                                content = compressText(content as string);
+                                encoding = 'binary';
+                                isCompressedText = true;
+                            }
+                            
+                            if (typeof content === 'string') {
+                                const encoded = new TextEncoder().encode(content);
+                                content = encoded.buffer;
+                                encoding = 'binary';
+                            }
+                            
+                            packedFiles.push({
+                                path: file.path,
+                                mtime: file.stat.mtime,
+                                isCompressed: isCompressedText,
+                                encoding,
+                                content: content as ArrayBuffer
+                            });
+                        }
+                    }
+                    if (packedFiles.length > 0) {
+                        item.data = {
+                            type: 'file-batch-binary',
+                            batchId: task.batchId,
+                            transferId: this.generateTransferId('batch-' + task.batchId),
+                            data: packFilesToTLV(packedFiles)
+                        };
+                    } else {
+                        success = true;
+                        return;
+                    }
                 }
             }
             
@@ -1078,7 +1123,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const isBatchItem = item.task && (item.task as any).batchId;
                 const isSmallFile = (data.type === 'file-update' || data.type === 'file-delta');
                 const isDirectIp = this.getConnectionMode() === 'direct-ip';
-                const skipAck = isBatchItem && isSmallFile && isDirectIp;
+                const skipAck = (isBatchItem && isSmallFile && isDirectIp) || data.type === 'file-batch-binary';
 
                 if (isSmallFile && peerId && !skipAck) {
                     const ackPromise = new Promise<void>((resolve, reject) => {
@@ -1096,15 +1141,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     } else {
                         const conn = this.connections.get(peerId);
                         if (conn?.open) {
-                            // Backpressure: wait if WebRTC buffer is too full
                             const dc = (conn as any)?.dataChannel || (conn as any)?._dc;
-                            if (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
+                            if (dc && dc.bufferedAmount > 2 * 1024 * 1024) {
                                 await new Promise<void>(resolve => {
-                                    const check = () => {
-                                        if (!dc || dc.bufferedAmount < 2 * 1024 * 1024) resolve();
-                                        else setTimeout(check, 50);
+                                    if (dc.bufferedAmount <= 1 * 1024 * 1024) return resolve();
+                                    const oldHandler = dc.onbufferedamountlow;
+                                    dc.bufferedAmountLowThreshold = 1 * 1024 * 1024;
+                                    dc.onbufferedamountlow = () => {
+                                        dc.onbufferedamountlow = oldHandler;
+                                        resolve();
                                     };
-                                    setTimeout(check, 50);
                                 });
                             }
                             conn.send(finalPayload);
@@ -1118,12 +1164,32 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         item.data = null as any;
                     }
                 } else if (skipAck && peerId) {
-                    // DirectIP batch transfer: fire-and-forget, batch-complete handles reliability
-                    if (this.directIpClient) this.directIpClient.send(finalPayload);
-                    else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
+                    // Batch transfer: fire-and-forget, batch-complete handles reliability
+                    if (isDirectIp) {
+                        if (this.directIpClient) this.directIpClient.send(finalPayload);
+                        else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
+                    } else {
+                        const conn = this.connections.get(peerId);
+                        if (conn?.open) {
+                            const dc = (conn as any)?.dataChannel || (conn as any)?._dc;
+                            if (dc && dc.bufferedAmount > 2 * 1024 * 1024) {
+                                await new Promise<void>(resolve => {
+                                    if (dc.bufferedAmount <= 1 * 1024 * 1024) return resolve();
+                                    const oldHandler = dc.onbufferedamountlow;
+                                    dc.bufferedAmountLowThreshold = 1 * 1024 * 1024;
+                                    dc.onbufferedamountlow = () => {
+                                        dc.onbufferedamountlow = oldHandler;
+                                        resolve();
+                                    };
+                                });
+                            }
+                            conn.send(finalPayload);
+                        } else throw new Error("Connection closed");
+                    }
                     
-                    if (data.type === 'file-update') {
-                        (data as FileUpdatePayload).content = null as any;
+                    if (data.type === 'file-update' || data.type === 'file-batch-binary') {
+                        (data as any).content = null;
+                        (data as any).data = null;
                         item.data = null as any;
                     }
                 } else 
@@ -1200,7 +1266,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.processQueue();
                 }, 5000);
             } else if (item) {
-                const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : item.task.path) : undefined;
+                const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : (item.task.taskType === 'send-file-batch' ? item.task.paths[0] : item.task.path)) : undefined;
                 const path = item.data?.path || taskPath || 'an item';
                 this.showNotice(`File transfer failed permanently for ${path}.`, 'error', 8000);
                 if (this.syncState.isSyncing) this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, "Transfer failed permanently.", false, "Check peer connection."));
@@ -1238,7 +1304,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.reportTransferResult(success);
                 
                 if (success) {
-                    const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : item.task.path) : undefined;
+                    const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : (item.task.taskType === 'send-file-batch' ? item.task.paths[0] : item.task.path)) : undefined;
                     const path = item.data?.path || taskPath;
                     if (path) {
                         for (let i = this.failedSyncs.length - 1; i >= 0; i--) {
@@ -1264,7 +1330,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
 
             if (isFinal) {
-                const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : item.task.path) : undefined;
+                const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : (item.task.taskType === 'send-file-batch' ? item.task.paths[0] : item.task.path)) : undefined;
                 const path = item.data?.path || taskPath;
                 if (item.task && (item.task as any).batchId) {
                     this.recordBatchTaskCompletion((item.task as any).batchId, path, success);
@@ -1635,15 +1701,32 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     break;
                 case 'file-update': 
                     this.applyFileUpdate(data).then(() => {
-                        if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
+                        if (conn && data.transferId && !data.skipAck) conn.send({ type: 'ack', transferId: data.transferId });
                         this.resetIdleTimeout();
                     }).catch(e => {
                         this.log(`Failed to apply file update: ${data.path}`, e);
-                        if (conn && data.transferId) {
+                        if (conn && data.transferId && !data.skipAck) {
                             const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
                             conn.send({ type: 'nack', transferId: data.transferId, reason });
                         }
                     }); 
+                    break;
+                case 'file-batch-binary':
+                    this.applyFileBatchBinary(data).then((results) => {
+                        this.resetIdleTimeout();
+                        if (conn && data.batchId) {
+                            // If DirectIP is used, it uses HTTP so connection is handled differently, 
+                            // but sendSyncMessage handles routing.
+                            this.sendSyncMessage(conn.peer, { 
+                                type: 'batch-complete', 
+                                batchId: data.batchId, 
+                                receivedPaths: results.succeeded, 
+                                failedPaths: results.failed 
+                            }).catch(e => this.log("Failed to send batch-complete", e));
+                        }
+                    }).catch(e => {
+                        this.log(`Critical failure unpacking file batch`, e);
+                    });
                     break;
                 case 'file-delta':
                     this.applyFileDelta(data).then(() => {
@@ -2504,6 +2587,97 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
+    async applyFileBatchBinary(data: FileBatchBinaryPayload): Promise<{ succeeded: string[], failed: string[] }> {
+        const results = { succeeded: [] as string[], failed: [] as string[] };
+        let buffer: ArrayBuffer;
+        
+        if (data.data instanceof Uint8Array) {
+            buffer = data.data.buffer.slice(data.data.byteOffset, data.data.byteOffset + data.data.byteLength);
+        } else if (typeof data.data === 'string') {
+            buffer = base64ToArrayBuffer(data.data);
+        } else {
+            buffer = data.data;
+        }
+
+        let unpacked: PackedFile[];
+        try {
+            unpacked = unpackTLVToFiles(buffer);
+        } catch (e) {
+            this.log("Failed to unpack TLV binary batch", e);
+            throw e;
+        }
+
+        const writePromises = unpacked.map(async (fileData) => {
+            try {
+                let contentStr = '';
+                let contentBuf: ArrayBuffer | null = null;
+                
+                if (fileData.encoding === 'binary') {
+                    if (fileData.isCompressed) {
+                        contentStr = decompressText(fileData.content);
+                    } else {
+                        contentBuf = fileData.content instanceof Uint8Array ? 
+                            fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) : 
+                            fileData.content;
+                    }
+                } else if (fileData.encoding === 'base64') {
+                    // For Base64 encoded ArrayBuffers (fallback/DirectIP)
+                    contentBuf = fileData.content instanceof Uint8Array ? 
+                        fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) : 
+                        fileData.content;
+                } else {
+                    const decoder = new TextDecoder();
+                    contentStr = decoder.decode(fileData.content);
+                }
+
+                await this.runLocked(fileData.path, async () => {
+                    const existingFile = this.app.vault.getAbstractFileByPath(fileData.path);
+                    if (existingFile instanceof TFile) {
+                        if (contentBuf) {
+                            await this.app.vault.modifyBinary(existingFile, contentBuf);
+                        } else {
+                            await this.app.vault.modify(existingFile, contentStr);
+                        }
+                    } else {
+                        // Create parent folders if missing
+                        const pathParts = fileData.path.split('/');
+                        let currentPath = '';
+                        for (let i = 0; i < pathParts.length - 1; i++) {
+                            currentPath += (i > 0 ? '/' : '') + pathParts[i];
+                            const folder = this.app.vault.getAbstractFileByPath(currentPath);
+                            if (!folder) {
+                                await this.app.vault.createFolder(currentPath);
+                            }
+                        }
+                        if (contentBuf) {
+                            await this.app.vault.createBinary(fileData.path, contentBuf);
+                        } else {
+                            await this.app.vault.create(fileData.path, contentStr);
+                        }
+                    }
+                    this.syncState.filesTransferred++;
+                    this.syncState.bytesTransferred += fileData.content.byteLength;
+                });
+                
+                return fileData.path;
+            } catch (e) {
+                this.log(`Failed to write batched file ${fileData.path}`, e);
+                throw fileData.path; // throw path on failure to track it
+            }
+        });
+
+        const settled = await Promise.allSettled(writePromises);
+        for (const result of settled) {
+            if (result.status === 'fulfilled') {
+                results.succeeded.push(result.value);
+            } else {
+                results.failed.push(result.reason);
+            }
+        }
+
+        return results;
+    }
+
     async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); this.ignoreNextEventForPath(conflictPath); if (data.encoding === 'binary' || data.encoding === 'base64') { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
 
     async applyFileDelete(data: FileDeletePayload) {
@@ -3025,12 +3199,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             };
             this.syncState.activeBatches.set(batchId, batchState);
             
+            let currentBatchPaths: string[] = [];
+            let currentBatchSize = 0;
+            const MAX_BATCH_BYTES = 60 * 1024; // 60KB safe limit for WebRTC
+
             for (const path of data.paths) {
                 if (allowed.has(path)) {
                     allowed.delete(path);
                     const file = this.app.vault.getAbstractFileByPath(path);
                     if (file instanceof TFile) {
-                        this.addToQueueTask(conn.peer, { taskType: 'send-file', path, mtime: file.stat.mtime, forceFull: true, batchId });
+                        const estimatedOverhead = 16 + path.length * 3; // Approx 3 bytes per char for UTF8 safety
+                        const estimatedSize = file.stat.size + estimatedOverhead;
+
+                        if (estimatedSize >= MAX_BATCH_BYTES) {
+                            // Too large for binary batch, send normally (will chunk if needed)
+                            this.addToQueueTask(conn.peer, { taskType: 'send-file', path, mtime: file.stat.mtime, forceFull: true, batchId });
+                        } else {
+                            if (currentBatchSize + estimatedSize >= MAX_BATCH_BYTES) {
+                                // Flush current batch
+                                this.addToQueueTask(conn.peer, { taskType: 'send-file-batch', paths: currentBatchPaths, batchId });
+                                currentBatchPaths = [];
+                                currentBatchSize = 0;
+                            }
+                            currentBatchPaths.push(path);
+                            currentBatchSize += estimatedSize;
+                        }
                     } else if (file instanceof TFolder) {
                         this.addToQueueTask(conn.peer, { taskType: 'send-folder-create', path, batchId });
                     } else {
@@ -3041,6 +3234,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.log(`Peer requested unauthorized path ${path}. Marking failed.`);
                     this.recordBatchTaskCompletion(batchId, path, false);
                 }
+            }
+
+            if (currentBatchPaths.length > 0) {
+                this.addToQueueTask(conn.peer, { taskType: 'send-file-batch', paths: currentBatchPaths, batchId });
             }
             
             if (data.paths.length === 0) {
