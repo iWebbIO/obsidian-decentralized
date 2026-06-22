@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting, setIcon } from 'obsidian';
 import type ObsidianDecentralizedPlugin from './main';
-import { PeerInfo, DEFAULT_SETTINGS } from './types';
+import { PeerInfo, DEFAULT_SETTINGS, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE } from './types';
 import { ConnectionModal } from './ui';
 
 export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
@@ -262,7 +262,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.idleTimeoutMs?.toString() || "30000")
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.idleTimeoutMs = isNaN(num) ? 30000 : num;
+                    this.plugin.settings.idleTimeoutMs = isNaN(num) ? 30000 : Math.max(5000, num);
                     await this.plugin.saveSettings();
                 }));
 
@@ -285,7 +285,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.maximumConcurrentTransfers?.toString() || "")
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.maximumConcurrentTransfers = isNaN(num) ? null : num;
+                    this.plugin.settings.maximumConcurrentTransfers = isNaN(num) ? null : Math.max(1, Math.min(num, 100));
                     await this.plugin.saveSettings();
                 }));
 
@@ -297,7 +297,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.chunkSize?.toString() || "")
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.chunkSize = isNaN(num) ? null : num;
+                    this.plugin.settings.chunkSize = isNaN(num) ? null : Math.max(MIN_CHUNK_SIZE, Math.min(num, MAX_CHUNK_SIZE));
                     await this.plugin.saveSettings();
                 }));
 
@@ -438,6 +438,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Kick Device').onClick(() => {
                         this.plugin.broadcastData({ type: 'cluster-kick', targetDeviceId: peer.deviceId });
                         if (this.plugin.connections.has(peer.deviceId)) this.plugin.connections.get(peer.deviceId)?.close();
+                        setTimeout(() => this.updateStatus(), 100);
                     }));
                     settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
                         this.plugin.manualPingStart.set(peer.deviceId, Date.now());
@@ -462,6 +463,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                             this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
                             this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
                             this.plugin.saveKnownPeers();
+                            setTimeout(() => this.updateStatus(), 100);
                         }));
                     }
                 }
