@@ -117,6 +117,9 @@ export class DirectIpServer {
                 if (msg.type === 'file-chunk-data' && msg.data instanceof ArrayBuffer) {
                     return { ...msg, data: arrayBufferToBase64(msg.data) };
                 }
+                if (msg.type === 'file-batch-binary' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
+                    return { ...msg, data: arrayBufferToBase64(msg.data) };
+                }
                 return msg;
             });
             res.end(JSON.stringify(messages));
@@ -149,6 +152,9 @@ export class DirectIpServer {
                             data = { ...data, content: base64ToArrayBuffer(data.content), encoding: 'binary' };
                         }
                         if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
+                            (data as any).data = base64ToArrayBuffer((data as any).data);
+                        }
+                        if (data.type === 'file-batch-binary' && typeof (data as any).data === 'string') {
                             (data as any).data = base64ToArrayBuffer((data as any).data);
                         }
                         const mockConn = {
@@ -191,6 +197,9 @@ export class DirectIpServer {
                          data = { ...data, content: base64ToArrayBuffer(data.content), encoding: 'binary' };
                     }
                     if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
+                        (data as any).data = base64ToArrayBuffer((data as any).data);
+                    }
+                    if (data.type === 'file-batch-binary' && typeof (data as any).data === 'string') {
                         (data as any).data = base64ToArrayBuffer((data as any).data);
                     }
 
@@ -293,6 +302,9 @@ export class DirectIpClient {
                     if (msg.type === 'file-chunk-data' && typeof (msg as any).data === 'string') {
                         (msg as any).data = base64ToArrayBuffer((msg as any).data);
                     }
+                    if (msg.type === 'file-batch-binary' && typeof (msg as any).data === 'string') {
+                        (msg as any).data = base64ToArrayBuffer((msg as any).data);
+                    }
 
                     const mockConn = {
                         send: (data: any) => this.send(data),
@@ -331,6 +343,9 @@ export class DirectIpClient {
             payloadToSend = { ...data, content: arrayBufferToBase64(data.content), encoding: 'base64' };
         }
         if (data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer) {
+            payloadToSend = { ...data, data: arrayBufferToBase64(data.data) } as any;
+        }
+        if (data.type === 'file-batch-binary' && (data.data instanceof ArrayBuffer || data.data instanceof Uint8Array)) {
             payloadToSend = { ...data, data: arrayBufferToBase64(data.data) } as any;
         }
 

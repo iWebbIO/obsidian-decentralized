@@ -1037,7 +1037,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             
                             if (typeof content === 'string') {
                                 const encoded = new TextEncoder().encode(content);
-                                content = encoded.buffer;
+                                content = encoded;
                                 encoding = 'binary';
                             }
                             

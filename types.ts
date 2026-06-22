@@ -425,6 +425,7 @@ export type SyncData =
     | RequestFilePayload
     | FileChunkStartPayload
     | FileChunkDataPayload
+    | FileBatchBinaryPayload
     | PingPayload
     | PongPayload
     | SyncPingPayload
