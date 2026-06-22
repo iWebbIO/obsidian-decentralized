@@ -143,7 +143,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private activeQueueTransfers: number = 0;
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
-    private currentConcurrency = 8;
+    private currentConcurrency = 50;
     private processingQueue = false;
     private currentChunkSize = 512 * 1024;
     private targetChunkSize = 512 * 1024;
@@ -1073,7 +1073,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     finalPayload = await this.encryptPayload(data, this.settings.peerKeys[peerId]);
                 }
 
-                if ((data.type === 'file-update' || data.type === 'file-delta') && peerId) {
+                const isBatchItem = item.task && (item.task as any).batchId;
+                const isSmallFile = (data.type === 'file-update' || data.type === 'file-delta');
+                const skipAck = isBatchItem && isSmallFile;
+
+                if (isSmallFile && peerId && !skipAck) {
                     const ackPromise = new Promise<void>((resolve, reject) => {
                         const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
                         this.pendingAcks.set(transferId!, {
@@ -1092,6 +1096,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         else throw new Error("Connection closed");
                     }
                     await ackPromise;
+                    
+                    if (data.type === 'file-update') {
+                        (data as FileUpdatePayload).content = null as any;
+                        item.data = null as any;
+                    }
+                } else if (skipAck && peerId) {
+                    // Batch transfer: fire-and-forget, batch-complete handles reliability
+                    if (this.getConnectionMode() === 'direct-ip') {
+                        if (this.directIpClient) this.directIpClient.send(finalPayload);
+                        else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
+                    } else {
+                        const conn = this.connections.get(peerId);
+                        if (conn?.open) conn.send(finalPayload);
+                        else throw new Error("Connection closed");
+                    }
                     
                     if (data.type === 'file-update') {
                         (data as FileUpdatePayload).content = null as any;

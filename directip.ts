@@ -100,7 +100,7 @@ export class DirectIpServer {
             
             if (deviceId !== 'unknown' && this.clients.has(deviceId)) {
                 const client = this.clients.get(deviceId)!;
-                messagesToSend = client.queue.splice(0, 200);
+                messagesToSend = client.queue.splice(0, 500);
                 if (client.queue.length === 0) {
                     client.bufferedAmount = 0;
                 } else {
@@ -120,6 +120,51 @@ export class DirectIpServer {
                 return msg;
             });
             res.end(JSON.stringify(messages));
+        } else if (req.url === '/push-batch' && req.method === 'POST') {
+            let body = '';
+            let totalSize = 0;
+            const MAX_BODY_SIZE = 100 * 1024 * 1024;
+            let destroyed = false;
+
+            req.on('data', (chunk: any) => {
+                if (destroyed) return;
+                totalSize += chunk.length;
+                if (totalSize > MAX_BODY_SIZE) {
+                    destroyed = true;
+                    res.writeHead(413, CORS_HEADERS);
+                    res.end(JSON.stringify({ error: 'Payload too large' }));
+                    req.destroy();
+                    return;
+                }
+                body += chunk.toString();
+            });
+            req.on('end', () => {
+                if (destroyed) return;
+                try {
+                    const messages: any[] = JSON.parse(body);
+                    if (!Array.isArray(messages)) throw new Error('Expected array');
+                    
+                    for (let data of messages) {
+                        if (data.type === 'file-update' && data.encoding === 'base64' && typeof data.content === 'string') {
+                            data = { ...data, content: base64ToArrayBuffer(data.content), encoding: 'binary' };
+                        }
+                        if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
+                            (data as any).data = base64ToArrayBuffer((data as any).data);
+                        }
+                        const mockConn = {
+                            send: (msg: any) => this.sendTo(deviceId, msg),
+                            peer: deviceId !== 'unknown' ? deviceId : 'direct-ip-client',
+                            open: true,
+                        } as any;
+                        this.plugin.handleRawIncomingData(data, mockConn);
+                    }
+                    res.writeHead(200, CORS_HEADERS);
+                    res.end(JSON.stringify({ status: 'ok', count: messages.length }));
+                } catch (e) {
+                    res.writeHead(400, CORS_HEADERS);
+                    res.end(JSON.stringify({ error: 'Invalid data format' }));
+                }
+            });
         } else if (req.url === '/push' && req.method === 'POST') {
             let body = '';
             let totalSize = 0;
@@ -204,7 +249,14 @@ export class DirectIpClient {
     private pendingBytes: number = 0;
     private pollInterval: number = 1000;
     private consecutiveEmptyPolls: number = 0;
-    private isStopped = false; // Fix: Flag to prevent async polling restarts after stopping client.
+    private isStopped = false;
+    private sendBuffer: any[] = [];
+    private sendBufferBytes: number = 0;
+    private flushTimeout: number | null = null;
+    private isFlushing: boolean = false;
+    private readonly FLUSH_INTERVAL_MS = 50;
+    private readonly MAX_BUFFER_COUNT = 50;
+    private readonly MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, config: DirectIpConfig) {
         this.baseUrl = `http://${config.host}:${config.port}`;
@@ -218,11 +270,11 @@ export class DirectIpClient {
     }
     
     getBufferedAmount(): number {
-        return this.pendingBytes;
+        return this.pendingBytes + this.sendBufferBytes;
     }
 
     private async poll() {
-        if (this.isStopped) return; // Fix: Stop executing if stopped
+        if (this.isStopped) return;
         let hasMessages = false;
         try {
             const response = await requestUrl({
@@ -257,7 +309,7 @@ export class DirectIpClient {
             this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
         }
         
-        if (this.isStopped) return; // Fix: Ensure we don't schedule next poll if stopped during the request wait time.
+        if (this.isStopped) return;
 
         if (hasMessages) {
             this.consecutiveEmptyPolls = 0;
@@ -282,22 +334,64 @@ export class DirectIpClient {
             payloadToSend = { ...data, data: arrayBufferToBase64(data.data) } as any;
         }
 
-        const bodyStr = JSON.stringify(payloadToSend);
-        this.pendingBytes += bodyStr.length;
+        const itemStr = JSON.stringify(payloadToSend);
+        this.sendBufferBytes += itemStr.length;
+        this.sendBuffer.push(payloadToSend);
+
+        if (this.sendBuffer.length >= this.MAX_BUFFER_COUNT || this.sendBufferBytes >= this.MAX_BUFFER_BYTES) {
+            await this.flushSendBuffer();
+        } else if (!this.flushTimeout) {
+            this.flushTimeout = window.setTimeout(() => {
+                this.flushTimeout = null;
+                this.flushSendBuffer();
+            }, this.FLUSH_INTERVAL_MS);
+        }
+    }
+
+    private async flushSendBuffer() {
+        if (this.flushTimeout) {
+            clearTimeout(this.flushTimeout);
+            this.flushTimeout = null;
+        }
+        if (this.sendBuffer.length === 0 || this.isFlushing) return;
+        
+        this.isFlushing = true;
+        const batch = this.sendBuffer.splice(0);
+        const batchBytes = this.sendBufferBytes;
+        this.sendBufferBytes = 0;
+        this.pendingBytes += batchBytes;
 
         try {
-            await requestUrl({
-                url: `${this.baseUrl}/push`,
-                method: 'POST',
-                headers: this.headers,
-                body: bodyStr,
-            });
+            if (batch.length === 1) {
+                // Single message: use regular /push for compatibility
+                const bodyStr = JSON.stringify(batch[0]);
+                await requestUrl({
+                    url: `${this.baseUrl}/push`,
+                    method: 'POST',
+                    headers: this.headers,
+                    body: bodyStr,
+                });
+            } else {
+                // Multiple messages: use /push-batch
+                const bodyStr = JSON.stringify(batch);
+                await requestUrl({
+                    url: `${this.baseUrl}/push-batch`,
+                    method: 'POST',
+                    headers: this.headers,
+                    body: bodyStr,
+                });
+            }
         } catch (e) {
             this.plugin.showNotice('Failed to send data to host.', 'error');
             this.plugin.log('Offline Push Error:', e);
             this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
         } finally {
-            this.pendingBytes = Math.max(0, this.pendingBytes - bodyStr.length);
+            this.pendingBytes = Math.max(0, this.pendingBytes - batchBytes);
+            this.isFlushing = false;
+            // If more messages accumulated while flushing, flush again
+            if (this.sendBuffer.length > 0) {
+                this.flushSendBuffer();
+            }
         }
     }
 
@@ -308,10 +402,16 @@ export class DirectIpClient {
     }
 
     stop() {
-        this.isStopped = true; // Fix: Set stop flag to abort future polling runs
+        this.isStopped = true;
         this.isOpen = false;
         if (this.pollTimeout) clearTimeout(this.pollTimeout);
         this.pollTimeout = null;
+        if (this.flushTimeout) clearTimeout(this.flushTimeout);
+        this.flushTimeout = null;
+        // Flush remaining messages before stopping
+        if (this.sendBuffer.length > 0) {
+            this.flushSendBuffer();
+        }
         this.plugin.showNotice("Disconnected from Offline Host.", 'important', 3000);
     }
 }
