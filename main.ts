@@ -567,10 +567,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.syncedHashes.delete(oldPath);
                     this.debouncedSaveState();
                 }
-                const vector = this.vectorCache.get(oldPath);
+                const vector = this.twoDeviceState.fileVersions[oldPath];
                 if (vector) {
-                    this.vectorCache.set(file.path, vector);
-                    this.vectorCache.delete(oldPath);
+                    this.twoDeviceState.fileVersions[file.path] = vector;
+                    delete this.twoDeviceState.fileVersions[oldPath];
                     this.debouncedSaveState();
                 }
                 

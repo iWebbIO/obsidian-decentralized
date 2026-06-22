@@ -12,7 +12,6 @@ export class DummyLANDiscovery implements ILANDiscovery {
 
 export class DesktopLANDiscovery implements ILANDiscovery {
     private socket: any | null = null;
-    private broadcastInterval: number | null = null;
     private discoveredPeers: Map<string, PeerInfo> = new Map();
     private peerTimeouts: Map<string, number> = new Map();
     private discoveryTimeoutMs: number = 15000; // Increased to 15s to tolerate packet loss
@@ -151,8 +150,9 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         this.currentBroadcastIntervalMs = 2000;
         this.consecutiveErrors = 0;
 
+        const beaconBuffer = Buffer.from(beaconMessage);
         const sendBeacon = () => {
-            this.socket?.send(beaconMessage, 0, beaconMessage.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
+            this.socket?.send(beaconBuffer, 0, beaconBuffer.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
                 if (err) {
                     this.consecutiveErrors++;
                     if (this.consecutiveErrors <= 3) console.error("Beacon send error:", err);
