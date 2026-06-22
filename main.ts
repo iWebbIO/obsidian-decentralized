@@ -143,7 +143,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private activeQueueTransfers: number = 0;
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
-    private currentConcurrency = 50;
+    private currentConcurrency = 16;
     private processingQueue = false;
     private currentChunkSize = 512 * 1024;
     private targetChunkSize = 512 * 1024;
@@ -821,6 +821,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     public getConcurrencyLimit() { 
         if (this.settings.maximumConcurrentTransfers) return this.settings.maximumConcurrentTransfers;
+        if (this.getConnectionMode() === 'direct-ip') return Math.max(this.currentConcurrency, 50);
         return this.currentConcurrency; 
     }
     
@@ -859,8 +860,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (success) {
             this.successfulTransfersSinceLastIncrease++;
             if (this.successfulTransfersSinceLastIncrease >= this.currentConcurrency) {
-                if (this.currentConcurrency < 200) {
-                    this.currentConcurrency = Math.min(200, this.currentConcurrency + Math.max(1, Math.floor(this.currentConcurrency * 0.1)));
+                const maxConcurrency = this.getConnectionMode() === 'direct-ip' ? 200 : 32;
+                if (this.currentConcurrency < maxConcurrency) {
+                    this.currentConcurrency = Math.min(maxConcurrency, this.currentConcurrency + Math.max(1, Math.floor(this.currentConcurrency * 0.1)));
                     this.log(`Network stable. Increasing concurrency to ${this.currentConcurrency}`);
                 }
                 if (this.currentChunkSize < this.targetChunkSize && this.getConnectionMode() !== 'direct-ip') {
@@ -1075,7 +1077,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
                 const isBatchItem = item.task && (item.task as any).batchId;
                 const isSmallFile = (data.type === 'file-update' || data.type === 'file-delta');
-                const skipAck = isBatchItem && isSmallFile;
+                const isDirectIp = this.getConnectionMode() === 'direct-ip';
+                const skipAck = isBatchItem && isSmallFile && isDirectIp;
 
                 if (isSmallFile && peerId && !skipAck) {
                     const ackPromise = new Promise<void>((resolve, reject) => {
@@ -1087,12 +1090,25 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         });
                     });
 
-                    if (this.getConnectionMode() === 'direct-ip') {
+                    if (isDirectIp) {
                         if (this.directIpClient) this.directIpClient.send(finalPayload);
                         else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
                     } else {
                         const conn = this.connections.get(peerId);
-                        if (conn?.open) conn.send(finalPayload);
+                        if (conn?.open) {
+                            // Backpressure: wait if WebRTC buffer is too full
+                            const dc = (conn as any)?.dataChannel || (conn as any)?._dc;
+                            if (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
+                                await new Promise<void>(resolve => {
+                                    const check = () => {
+                                        if (!dc || dc.bufferedAmount < 2 * 1024 * 1024) resolve();
+                                        else setTimeout(check, 50);
+                                    };
+                                    setTimeout(check, 50);
+                                });
+                            }
+                            conn.send(finalPayload);
+                        }
                         else throw new Error("Connection closed");
                     }
                     await ackPromise;
@@ -1102,15 +1118,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         item.data = null as any;
                     }
                 } else if (skipAck && peerId) {
-                    // Batch transfer: fire-and-forget, batch-complete handles reliability
-                    if (this.getConnectionMode() === 'direct-ip') {
-                        if (this.directIpClient) this.directIpClient.send(finalPayload);
-                        else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
-                    } else {
-                        const conn = this.connections.get(peerId);
-                        if (conn?.open) conn.send(finalPayload);
-                        else throw new Error("Connection closed");
-                    }
+                    // DirectIP batch transfer: fire-and-forget, batch-complete handles reliability
+                    if (this.directIpClient) this.directIpClient.send(finalPayload);
+                    else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
                     
                     if (data.type === 'file-update') {
                         (data as FileUpdatePayload).content = null as any;
