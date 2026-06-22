@@ -11,7 +11,7 @@ export function formatBytes(bytes: number, decimals = 2) {
     const k = 1024;
     const dm = decimals < 0 ? 0 : decimals;
     const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    const i = Math.max(0, Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k))));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
@@ -419,6 +419,8 @@ export class ConnectionModal extends Modal {
                 await this.plugin.saveSettings();
                 this.plugin.connectToDirectIpHost({ host: ipInput.value, port: this.plugin.settings.directIpHostPort, pin: pinInput.value });
                 this.close();
+            } else {
+                new Notice('Please provide both IP and Token');
             }
         };
 
@@ -444,7 +446,7 @@ export class QRScannerModal extends Modal {
         contentEl.createDiv({ attr: { id: readerId } });
         
         this.html5QrCode = new Html5Qrcode(readerId);
-        this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
+        (this.html5QrCode as any)._startPromise = this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
             this.onScan(decodedText);
             this.close();
         }, () => {}).catch(err => {
@@ -453,7 +455,17 @@ export class QRScannerModal extends Modal {
     }
     
     onClose() {
-        if (this.html5QrCode && this.html5QrCode.isScanning) { this.html5QrCode.stop().then(() => this.html5QrCode?.clear()).catch(console.error); }
+        const cleanup = () => {
+            if (this.html5QrCode && this.html5QrCode.isScanning) {
+                this.html5QrCode.stop().then(() => this.html5QrCode?.clear()).catch(console.error);
+            }
+        };
+        const startPromise = (this.html5QrCode as any)?._startPromise;
+        if (startPromise) {
+            startPromise.then(cleanup).catch(console.error);
+        } else {
+            cleanup();
+        }
         this.contentEl.empty();
     }
 }
@@ -472,12 +484,15 @@ export class SelectPeerModal extends Modal {
             new Setting(contentEl).addButton(btn => btn.setButtonText("OK").onClick(() => this.close()));
             return;
         }
+        if (peerList.length > 0) {
+            selectedPeer = peerList[0];
+        }
         new Setting(contentEl).setName('Sync with Device').addDropdown(dropdown => {
             peerList.forEach(peerId => {
                 const peerInfo = this.clusterPeers.get(peerId);
                 dropdown.addOption(peerId, peerInfo?.friendlyName || peerId);
             });
-            selectedPeer = dropdown.getValue();
+            dropdown.setValue(selectedPeer);
             dropdown.onChange(value => selectedPeer = value);
         });
         new Setting(contentEl)
@@ -519,7 +534,22 @@ export class ConflictCenter {
         if (this.conflicts.size > 0) {
             this.ribbonEl.show();
             this.ribbonEl.setAttribute('aria-label', `Resolve ${this.conflicts.size} sync conflicts`);
-            this.ribbonEl.setText(this.conflicts.size.toString());
+            let badge = this.ribbonEl.querySelector('.od-conflict-badge') as HTMLElement;
+            if (!badge) {
+                badge = document.createElement('span');
+                badge.className = 'od-conflict-badge';
+                badge.style.position = 'absolute';
+                badge.style.top = '0';
+                badge.style.right = '0';
+                badge.style.background = 'red';
+                badge.style.color = 'white';
+                badge.style.borderRadius = '50%';
+                badge.style.padding = '2px 6px';
+                badge.style.fontSize = '0.7em';
+                this.ribbonEl.style.position = 'relative';
+                this.ribbonEl.appendChild(badge);
+            }
+            badge.innerText = this.conflicts.size.toString();
         } else {
             this.ribbonEl.hide();
         }
@@ -554,35 +584,40 @@ export class ConflictListModal extends Modal {
         const originalFile = this.app.vault.getAbstractFileByPath(originalPath) as TFile;
         const conflictFile = this.app.vault.getAbstractFileByPath(conflictPath) as TFile;
         if (!originalFile || !conflictFile) {
-            this.plugin.showNotice("One of the conflict files is missing.", 'error');
-            this.conflictCenter.resolveConflict(originalPath);
-            return;
-        }
-        if (this.plugin.isBinary(originalFile.extension)) {
-            new BinaryConflictResolutionModal(this.app, originalFile.name, async (choice) => {
-                this.plugin.ignoreNextEventForPath(originalPath);
-                if (choice === 'remote') {
-                    const remoteData = await this.app.vault.readBinary(conflictFile);
-                    await this.app.vault.modifyBinary(originalFile, remoteData);
+                this.plugin.showNotice("One of the conflict files is missing.", 'error');
+                this.conflictCenter.resolveConflict(originalPath);
+                return;
+            }
+            try {
+                if (this.plugin.isBinary(originalFile.extension)) {
+                    new BinaryConflictResolutionModal(this.app, originalFile.name, async (choice) => {
+                        this.plugin.ignoreNextEventForPath(originalPath);
+                        if (choice === 'remote') {
+                            const remoteData = await this.app.vault.readBinary(conflictFile);
+                            await this.app.vault.modifyBinary(originalFile, remoteData);
+                        }
+                        this.plugin.ignoreNextEventForPath(conflictPath);
+                        await this.app.vault.delete(conflictFile);
+                        this.conflictCenter.resolveConflict(originalPath);
+                        this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
+                    }).open();
+                } else {
+                    const localContent = await this.app.vault.read(originalFile);
+                    const remoteContent = await this.app.vault.read(conflictFile);
+                    new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => {
+                        this.plugin.ignoreNextEventForPath(originalPath);
+                        await this.app.vault.modify(originalFile, chosenContent);
+                        this.plugin.ignoreNextEventForPath(conflictPath);
+                        await this.app.vault.delete(conflictFile);
+                        this.conflictCenter.resolveConflict(originalPath);
+                        this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
+                    }).open();
                 }
-                this.plugin.ignoreNextEventForPath(conflictPath);
-                await this.app.vault.delete(conflictFile);
+            } catch (e) {
+                new Notice('Failed to read conflict files: ' + e.message);
                 this.conflictCenter.resolveConflict(originalPath);
-                this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
-            }).open();
-        } else {
-            const localContent = await this.app.vault.read(originalFile);
-            const remoteContent = await this.app.vault.read(conflictFile);
-            new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => {
-                this.plugin.ignoreNextEventForPath(originalPath);
-                await this.app.vault.modify(originalFile, chosenContent);
-                this.plugin.ignoreNextEventForPath(conflictPath);
-                await this.app.vault.delete(conflictFile);
-                this.conflictCenter.resolveConflict(originalPath);
-                this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
-            }).open();
+            }
         }
-    }
     
     onClose() {
         this.contentEl.empty();
@@ -719,12 +754,16 @@ export class SyncProgressModal extends Modal {
                 const totalBytes = transfer.totalChunks * chunkSize;
                 const speedBytesPerSec = elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0;
                 const remainingBytes = totalBytes - processedBytes;
-                const remainingSeconds = speedBytesPerSec > 0 ? remainingBytes / speedBytesPerSec : 0;
+                const remainingSeconds = speedBytesPerSec > 0 && Number.isFinite(speedBytesPerSec) ? remainingBytes / speedBytesPerSec : 0;
 
                 const meta = item.createDiv({ cls: 'od-transfer-meta' });
                 meta.createSpan({ text: `${formatBytes(speedBytesPerSec)}/s` });
-                meta.createSpan({ text: `${Math.round(remainingSeconds)}s remaining` });
-                meta.createSpan({ text: `${Math.round((transfer.processedChunks / transfer.totalChunks) * 100)}%` });
+                
+                const remText = remainingSeconds > 0 && Number.isFinite(remainingSeconds) ? `${Math.round(remainingSeconds)}s remaining` : 'Unknown time remaining';
+                meta.createSpan({ text: remText });
+                
+                const pct = transfer.totalChunks > 0 ? (transfer.processedChunks / transfer.totalChunks) * 100 : 0;
+                meta.createSpan({ text: `${Math.round(pct)}%` });
             });
         }
 

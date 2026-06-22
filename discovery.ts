@@ -15,9 +15,34 @@ export class DesktopLANDiscovery implements ILANDiscovery {
     private broadcastInterval: number | null = null;
     private discoveredPeers: Map<string, PeerInfo> = new Map();
     private peerTimeouts: Map<string, number> = new Map();
-    private discoveryTimeoutMs: number = 5000;
+    private discoveryTimeoutMs: number = 15000; // Increased to 15s to tolerate packet loss
     private _emitter: any;
     private myDeviceId: string | null = null;
+    private currentBroadcastIntervalMs: number = 2000;
+    private consecutiveErrors: number = 0;
+    private broadcastTimer: number | null = null;
+    private lastPeerInfo: PeerInfo | null = null;
+    private hasNetworkListeners: boolean = false;
+    
+    private onNetworkChange = () => {
+        console.log('Network interface change detected, restarting LAN discovery...');
+        const wasBroadcasting = this.broadcastTimer !== null;
+        this.stop();
+        if (wasBroadcasting && this.lastPeerInfo) {
+            this.startBroadcasting(this.lastPeerInfo);
+            this.startListening();
+        } else {
+            this.startListening();
+        }
+    };
+
+    private setupNetworkChangeListeners() {
+        if (!this.hasNetworkListeners) {
+            window.addEventListener('online', this.onNetworkChange);
+            window.addEventListener('offline', this.onNetworkChange);
+            this.hasNetworkListeners = true;
+        }
+    }
 
     constructor() {
         const { EventEmitter } = require('events');
@@ -40,6 +65,7 @@ export class DesktopLANDiscovery implements ILANDiscovery {
 
     private createSocket() {
         if (this.socket) return;
+        this.setupNetworkChangeListeners();
 
         const dgram = require('dgram');
         this.socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
@@ -112,6 +138,7 @@ export class DesktopLANDiscovery implements ILANDiscovery {
     }
 
     public startBroadcasting(peerInfo: PeerInfo) {
+        this.lastPeerInfo = peerInfo;
         this.myDeviceId = peerInfo.deviceId;
         this.stopBroadcasting();
         this.createSocket();
@@ -121,19 +148,30 @@ export class DesktopLANDiscovery implements ILANDiscovery {
             peerInfo
         });
 
+        this.currentBroadcastIntervalMs = 2000;
+        this.consecutiveErrors = 0;
+
         const sendBeacon = () => {
             this.socket?.send(beaconMessage, 0, beaconMessage.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
-                if (err) console.error("Beacon send error:", err);
+                if (err) {
+                    this.consecutiveErrors++;
+                    if (this.consecutiveErrors <= 3) console.error("Beacon send error:", err);
+                } else {
+                    this.consecutiveErrors = 0;
+                }
             });
+            if (this.currentBroadcastIntervalMs < 15000) {
+                this.currentBroadcastIntervalMs += 1000;
+            }
+            this.broadcastTimer = window.setTimeout(sendBeacon, this.currentBroadcastIntervalMs);
         };
-
-        this.broadcastInterval = window.setInterval(sendBeacon, 2000);
+        sendBeacon();
     }
 
     public stopBroadcasting() {
-        if (this.broadcastInterval) {
-            clearInterval(this.broadcastInterval);
-            this.broadcastInterval = null;
+        if (this.broadcastTimer) {
+            clearTimeout(this.broadcastTimer);
+            this.broadcastTimer = null;
         }
     }
 

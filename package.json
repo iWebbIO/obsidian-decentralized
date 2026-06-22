@@ -22,7 +22,8 @@
     "html5-qrcode": "^2.3.8",
     "pako": "^2.1.0",
     "peerjs": "^1.4.7",
-    "qrcode": "^1.5.3"
+    "qrcode": "^1.5.3",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@rollup/plugin-commonjs": "^24.0.1",
@@ -30,6 +31,7 @@
     "@rollup/plugin-typescript": "^11.0.0",
     "@types/node": "^18.14.6",
     "@types/qrcode": "^1.5.0",
+    "@types/ws": "^8.18.1",
     "obsidian": "latest",
     "rollup": "^3.18.0",
     "tslib": "^2.5.0",

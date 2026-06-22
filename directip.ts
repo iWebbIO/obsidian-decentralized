@@ -1,13 +1,79 @@
-import { Platform, requestUrl } from 'obsidian';
-import { DirectIpConfig, FileUpdatePayload } from './types';
-import { arrayBufferToBase64, base64ToArrayBuffer } from './utils';
+import { Platform } from 'obsidian';
+import { DirectIpConfig } from './types';
 import type ObsidianDecentralizedPlugin from './main';
 
+// Custom Framing Helpers
+function encodeMessage(msg: any): string | ArrayBuffer {
+    if (msg.type === 'file-chunk-data' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
+        const { data, ...header } = msg;
+        const headerStr = JSON.stringify(header);
+        const encoder = new TextEncoder();
+        const headerBytes = encoder.encode(headerStr);
+        const binaryData = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
+        const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
+        new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
+        buffer.set(headerBytes, 4);
+        buffer.set(binaryData, 4 + headerBytes.length);
+        return buffer.buffer;
+    } else if (msg.type === 'file-batch-binary' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
+        const { data, ...header } = msg;
+        const headerStr = JSON.stringify(header);
+        const encoder = new TextEncoder();
+        const headerBytes = encoder.encode(headerStr);
+        const binaryData = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
+        const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
+        new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
+        buffer.set(headerBytes, 4);
+        buffer.set(binaryData, 4 + headerBytes.length);
+        return buffer.buffer;
+    } else if (msg.type === 'file-update' && msg.encoding === 'binary' && (msg.content instanceof ArrayBuffer || msg.content instanceof Uint8Array)) {
+        const { content, ...header } = msg;
+        const headerStr = JSON.stringify(header);
+        const encoder = new TextEncoder();
+        const headerBytes = encoder.encode(headerStr);
+        const binaryData = msg.content instanceof Uint8Array ? msg.content : new Uint8Array(msg.content);
+        const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
+        new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
+        buffer.set(headerBytes, 4);
+        buffer.set(binaryData, 4 + headerBytes.length);
+        return buffer.buffer;
+    }
+    return JSON.stringify(msg);
+}
+
+function decodeMessage(data: string | ArrayBuffer | Uint8Array | Blob): any {
+    if (typeof data === 'string') {
+        return JSON.parse(data);
+    }
+    let buffer: ArrayBuffer;
+    if (data instanceof ArrayBuffer) {
+        buffer = data;
+    } else if (data instanceof Uint8Array || (typeof Buffer !== 'undefined' && Buffer.isBuffer(data))) {
+        buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    } else {
+        throw new Error('Unsupported data type');
+    }
+
+    const view = new DataView(buffer);
+    const headerLen = view.getUint32(0, true);
+    const headerBytes = new Uint8Array(buffer, 4, headerLen);
+    const decoder = new TextDecoder();
+    const headerStr = decoder.decode(headerBytes);
+    const header = JSON.parse(headerStr);
+    const binaryData = new Uint8Array(buffer, 4 + headerLen);
+
+    if (header.type === 'file-chunk-data' || header.type === 'file-batch-binary') {
+        header.data = binaryData.buffer;
+    } else if (header.type === 'file-update') {
+        header.content = binaryData.buffer;
+    }
+    return header;
+}
+
 export class DirectIpServer {
-    private server: any | null = null;
-    private clients: Map<string, { lastSeen: number, queue: { data: any, size: number }[], bufferedAmount: number }> = new Map();
+    private wss: any | null = null;
+    private clients: Map<string, any> = new Map();
     private pin: string;
-    private readonly MAX_QUEUE_SIZE = 2000;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
         if (Platform.isMobile) {
@@ -19,413 +85,193 @@ export class DirectIpServer {
     }
 
     private start(port: number) {
-        const http = require('http');
-        this.server = http.createServer(this.handleRequest.bind(this));
-        this.server.on('error', (err: Error) => {
+        const { WebSocketServer } = require('ws');
+        this.wss = new WebSocketServer({ port });
+        
+        this.wss.on('connection', (socket: any, request: any) => {
+            const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
+            const pin = url.searchParams.get('pin');
+            const deviceId = url.searchParams.get('deviceId') || 'unknown';
+
+            if (pin !== this.pin) {
+                socket.close(1008, 'Invalid PIN');
+                return;
+            }
+
+            this.clients.set(deviceId, socket);
+
+            socket.on('message', (data: any, isBinary: boolean) => {
+                try {
+                    let parsedData: any;
+                    if (isBinary || data instanceof Uint8Array || data instanceof ArrayBuffer) {
+                        parsedData = decodeMessage(data);
+                    } else {
+                        parsedData = JSON.parse(data.toString());
+                    }
+
+                    const mockConn = {
+                        send: (msg: any) => this.sendTo(deviceId, msg),
+                        peer: deviceId,
+                        open: true,
+                    } as any;
+
+                    this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => console.error(e));
+                } catch (e) {
+                    this.plugin.log('Error parsing WS message', e);
+                }
+            });
+
+            socket.on('close', () => {
+                this.clients.delete(deviceId);
+            });
+            
+            socket.on('error', (err: any) => {
+                this.plugin.log(`WS Client Error (${deviceId}):`, err);
+            });
+        });
+
+        this.wss.on('error', (err: Error) => {
             this.plugin.showNotice(`Offline server error: ${err.message}`, 'error');
             this.plugin.log("Offline Server Error:", err);
-            this.server = null;
+            this.wss = null;
         });
-        this.server.listen(port, () => {
-            this.plugin.log(`Offline server listening on port ${port}`);
-        });
+
+        this.plugin.log(`Offline WebSocket server listening on port ${port}`);
     }
 
     getClients(): string[] {
-        const now = Date.now();
-        for (const [id, client] of this.clients.entries()) {
-            if (now - client.lastSeen > 10000) {
-                this.clients.delete(id);
-            }
-        }
         return Array.from(this.clients.keys());
     }
 
     sendTo(peerId: string, data: any) {
         const client = this.clients.get(peerId);
-        if (client) {
-            const dataStr = JSON.stringify(data);
-            const size = dataStr.length;
-            if (client.queue.length >= this.MAX_QUEUE_SIZE) {
-                const evicted = client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
-                const evictedSize = evicted.reduce((sum, item) => sum + item.size, 0);
-                client.bufferedAmount = Math.max(0, client.bufferedAmount - evictedSize);
-            }
-            client.queue.push({ data, size });
-            client.bufferedAmount += size;
+        if (client && client.readyState === 1 /* OPEN */) {
+            const encoded = encodeMessage(data);
+            client.send(encoded);
         }
     }
 
     hasClient(peerId: string): boolean {
-        this.getClients();
         return this.clients.has(peerId);
     }
 
     getBufferedAmount(peerId: string): number {
-        return this.clients.get(peerId)?.bufferedAmount || 0;
-    }
-
-    private handleRequest(req: any, res: any) {
-        const CORS_HEADERS = {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, X-Device-Id, X-Pin'
-        };
-        if (req.method === 'OPTIONS') {
-            res.writeHead(204, CORS_HEADERS);
-            res.end();
-            return;
-        }
-
-        const pin = req.headers['x-pin'];
-        const deviceId = req.headers['x-device-id'] as string || 'unknown';
-
-        if (pin !== this.pin) {
-            res.writeHead(403, CORS_HEADERS);
-            res.end(JSON.stringify({ error: 'Invalid PIN' }));
-            return;
-        }
-
-        if (deviceId !== 'unknown') {
-            if (!this.clients.has(deviceId)) {
-                this.clients.set(deviceId, { lastSeen: Date.now(), queue: [], bufferedAmount: 0 });
-            } else {
-                this.clients.get(deviceId)!.lastSeen = Date.now();
-            }
-        }
-
-        if (req.url === '/poll' && req.method === 'GET') {
-            res.writeHead(200, { ...CORS_HEADERS, 'Content-Type': 'application/json' });
-            let messagesToSend: any[] = [];
-            
-            if (deviceId !== 'unknown' && this.clients.has(deviceId)) {
-                const client = this.clients.get(deviceId)!;
-                messagesToSend = client.queue.splice(0, 500);
-                if (client.queue.length === 0) {
-                    client.bufferedAmount = 0;
-                } else {
-                    const sentSize = messagesToSend.reduce((sum, item) => sum + item.size, 0);
-                    client.bufferedAmount = Math.max(0, client.bufferedAmount - sentSize);
-                }
-            }
-
-            const messages = messagesToSend.map(item => {
-                let msg = item.data;
-                if (msg.type === 'file-update' && msg.encoding === 'binary' && msg.content instanceof ArrayBuffer) {
-                    return { ...msg, content: arrayBufferToBase64(msg.content), encoding: 'base64' };
-                }
-                if (msg.type === 'file-chunk-data' && msg.data instanceof ArrayBuffer) {
-                    return { ...msg, data: arrayBufferToBase64(msg.data) };
-                }
-                if (msg.type === 'file-batch-binary' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
-                    return { ...msg, data: arrayBufferToBase64(msg.data) };
-                }
-                return msg;
-            });
-            res.end(JSON.stringify(messages));
-        } else if (req.url === '/push-batch' && req.method === 'POST') {
-            let body = '';
-            let totalSize = 0;
-            const MAX_BODY_SIZE = 100 * 1024 * 1024;
-            let destroyed = false;
-
-            req.on('data', (chunk: any) => {
-                if (destroyed) return;
-                totalSize += chunk.length;
-                if (totalSize > MAX_BODY_SIZE) {
-                    destroyed = true;
-                    res.writeHead(413, CORS_HEADERS);
-                    res.end(JSON.stringify({ error: 'Payload too large' }));
-                    req.destroy();
-                    return;
-                }
-                body += chunk.toString();
-            });
-            req.on('end', () => {
-                if (destroyed) return;
-                try {
-                    const messages: any[] = JSON.parse(body);
-                    if (!Array.isArray(messages)) throw new Error('Expected array');
-                    
-                    for (let data of messages) {
-                        if (data.type === 'file-update' && data.encoding === 'base64' && typeof data.content === 'string') {
-                            data = { ...data, content: base64ToArrayBuffer(data.content), encoding: 'binary' };
-                        }
-                        if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
-                            (data as any).data = base64ToArrayBuffer((data as any).data);
-                        }
-                        if (data.type === 'file-batch-binary' && typeof (data as any).data === 'string') {
-                            (data as any).data = base64ToArrayBuffer((data as any).data);
-                        }
-                        const mockConn = {
-                            send: (msg: any) => this.sendTo(deviceId, msg),
-                            peer: deviceId !== 'unknown' ? deviceId : 'direct-ip-client',
-                            open: true,
-                        } as any;
-                        this.plugin.handleRawIncomingData(data, mockConn);
-                    }
-                    res.writeHead(200, CORS_HEADERS);
-                    res.end(JSON.stringify({ status: 'ok', count: messages.length }));
-                } catch (e) {
-                    res.writeHead(400, CORS_HEADERS);
-                    res.end(JSON.stringify({ error: 'Invalid data format' }));
-                }
-            });
-        } else if (req.url === '/push' && req.method === 'POST') {
-            let body = '';
-            let totalSize = 0;
-            const MAX_BODY_SIZE = 50 * 1024 * 1024;
-            let destroyed = false;
-
-            req.on('data', (chunk: any) => {
-                if (destroyed) return;
-                totalSize += chunk.length;
-                if (totalSize > MAX_BODY_SIZE) {
-                    destroyed = true;
-                    res.writeHead(413, CORS_HEADERS);
-                    res.end(JSON.stringify({ error: 'Payload too large' }));
-                    req.destroy();
-                    return;
-                }
-                body += chunk.toString();
-            });
-            req.on('end', () => {
-                if (destroyed) return;
-                try {
-                    let data: any = JSON.parse(body);
-                    if (data.type === 'file-update' && data.encoding === 'base64' && typeof data.content === 'string') {
-                         data = { ...data, content: base64ToArrayBuffer(data.content), encoding: 'binary' };
-                    }
-                    if (data.type === 'file-chunk-data' && typeof (data as any).data === 'string') {
-                        (data as any).data = base64ToArrayBuffer((data as any).data);
-                    }
-                    if (data.type === 'file-batch-binary' && typeof (data as any).data === 'string') {
-                        (data as any).data = base64ToArrayBuffer((data as any).data);
-                    }
-
-                    const mockConn = {
-                        send: (msg: any) => this.sendTo(deviceId, msg),
-                        peer: deviceId !== 'unknown' ? deviceId : 'direct-ip-client',
-                        open: true,
-                    } as any;
-
-                    this.plugin.handleRawIncomingData(data, mockConn);
-                    res.writeHead(200, CORS_HEADERS);
-                    res.end(JSON.stringify({ status: 'ok' }));
-                } catch (e) {
-                    res.writeHead(400, CORS_HEADERS);
-                    res.end(JSON.stringify({ error: 'Invalid data format' }));
-                }
-            });
-        } else {
-            res.writeHead(404, CORS_HEADERS);
-            res.end();
-        }
+        const client = this.clients.get(peerId);
+        return client ? client.bufferedAmount : 0;
     }
 
     send(data: any) {
-        const dataStr = JSON.stringify(data);
-        const size = dataStr.length;
+        const encoded = encodeMessage(data);
         for (const client of this.clients.values()) {
-            if (client.queue.length >= this.MAX_QUEUE_SIZE) {
-                const evicted = client.queue.splice(0, client.queue.length - this.MAX_QUEUE_SIZE + 1);
-                const evictedSize = evicted.reduce((sum, item) => sum + item.size, 0);
-                client.bufferedAmount = Math.max(0, client.bufferedAmount - evictedSize);
+            if (client.readyState === 1 /* OPEN */) {
+                client.send(encoded);
             }
-            client.queue.push({ data, size });
-            client.bufferedAmount += size;
         }
     }
 
     stop() {
-        if (this.server) {
-            this.server.close();
-            // Fix: Forcefully close all active client HTTP connections/sockets to prevent port/connection leaks.
-            if (typeof this.server.closeAllConnections === 'function') {
-                this.server.closeAllConnections();
+        if (this.wss) {
+            this.wss.close();
+            for (const client of this.clients.values()) {
+                client.close();
             }
+            this.clients.clear();
         }
-        this.server = null;
+        this.wss = null;
         this.plugin.log("Offline Server stopped.");
     }
 }
 
 export class DirectIpClient {
     public isOpen: boolean = false;
-    private pollTimeout: number | null = null;
-    private baseUrl: string;
-    private headers: Record<string, string>;
-    private pendingBytes: number = 0;
-    private pollInterval: number = 1000;
-    private consecutiveEmptyPolls: number = 0;
-    private isStopped = false;
+    private ws: WebSocket | null = null;
     private sendBuffer: any[] = [];
-    private sendBufferBytes: number = 0;
-    private flushTimeout: number | null = null;
-    private isFlushing: boolean = false;
-    private readonly FLUSH_INTERVAL_MS = 50;
-    private readonly MAX_BUFFER_COUNT = 50;
-    private readonly MAX_BUFFER_BYTES = 10 * 1024 * 1024;
-
-    constructor(private plugin: ObsidianDecentralizedPlugin, config: DirectIpConfig) {
-        this.baseUrl = `http://${config.host}:${config.port}`;
-        this.headers = {
-            'Content-Type': 'application/json',
-            'X-Device-Id': plugin.settings.deviceId,
-            'X-Pin': config.pin,
-        };
-        this.startPolling();
-        this.plugin.showNotice(`Connected to Offline Host at ${config.host}`, 'important', 3000);
+    private isStopped = false;
+    
+    constructor(private plugin: ObsidianDecentralizedPlugin, private config: DirectIpConfig) {
+        this.connect();
     }
     
     getBufferedAmount(): number {
-        return this.pendingBytes + this.sendBufferBytes;
+        return this.ws ? this.ws.bufferedAmount : 0;
     }
 
-    private async poll() {
+    private connect() {
         if (this.isStopped) return;
-        let hasMessages = false;
-        try {
-            const response = await requestUrl({
-                url: `${this.baseUrl}/poll`,
-                method: 'GET',
-                headers: this.headers,
-            });
-            if (response.status === 200) {
-                this.isOpen = true;
-                const messages: any[] = response.json;
-                if (messages && messages.length > 0) hasMessages = true;
-                for (let msg of messages) {
-                    if (msg.type === 'file-update' && msg.encoding === 'base64' && typeof msg.content === 'string') {
-                        msg = { ...msg, content: base64ToArrayBuffer(msg.content), encoding: 'binary' } as FileUpdatePayload;
-                    }
-                    if (msg.type === 'file-chunk-data' && typeof (msg as any).data === 'string') {
-                        (msg as any).data = base64ToArrayBuffer((msg as any).data);
-                    }
-                    if (msg.type === 'file-batch-binary' && typeof (msg as any).data === 'string') {
-                        (msg as any).data = base64ToArrayBuffer((msg as any).data);
-                    }
+        
+        const wsUrl = `ws://${this.config.host}:${this.config.port}/?pin=${encodeURIComponent(this.config.pin)}&deviceId=${encodeURIComponent(this.plugin.settings.deviceId)}`;
+        this.ws = new WebSocket(wsUrl);
+        this.ws.binaryType = 'arraybuffer';
 
-                    const mockConn = {
-                        send: (data: any) => this.send(data),
-                        peer: 'direct-ip-host',
-                        open: true
-                    } as any;
+        this.ws.onopen = () => {
+            this.isOpen = true;
+            this.plugin.showNotice(`Connected to Offline Host at ${this.config.host}`, 'important', 3000);
+            this.flushSendBuffer();
+        };
 
-                    this.plugin.handleRawIncomingData(msg, mockConn);
+        this.ws.onmessage = (event) => {
+            try {
+                let parsedData: any;
+                if (typeof event.data === 'string') {
+                    parsedData = JSON.parse(event.data);
+                } else if (event.data instanceof ArrayBuffer) {
+                    parsedData = decodeMessage(event.data);
                 }
-            }
-        } catch (e) {
-            this.isOpen = false;
-            this.plugin.log('Offline Poll Error:', e);
-            this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
-        }
-        
-        if (this.isStopped) return;
+                
+                const mockConn = {
+                    send: (data: any) => this.send(data),
+                    peer: 'direct-ip-host',
+                    open: true
+                } as any;
 
-        if (hasMessages) {
-            this.consecutiveEmptyPolls = 0;
-            this.pollInterval = 10;
-        } else {
-            this.consecutiveEmptyPolls++;
-            if (this.consecutiveEmptyPolls > 3) {
-                this.pollInterval = Math.min(500, Math.floor(this.pollInterval * 1.5));
+                this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => console.error(e));
+            } catch (e) {
+                this.plugin.log('Offline WS Parse Error:', e);
             }
-        }
+        };
+
+        this.ws.onclose = () => {
+            this.isOpen = false;
+            if (!this.isStopped) {
+                this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
+            }
+        };
         
-        this.pollTimeout = window.setTimeout(() => this.poll(), Math.max(10, this.pollInterval));
+        this.ws.onerror = (err) => {
+            this.plugin.log('Offline WS Error:', err);
+        };
     }
 
     async send(data: any) {
-        let payloadToSend = data;
-        
-        if (data.type === 'file-update' && data.encoding === 'binary' && data.content instanceof ArrayBuffer) {
-            payloadToSend = { ...data, content: arrayBufferToBase64(data.content), encoding: 'base64' };
-        }
-        if (data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer) {
-            payloadToSend = { ...data, data: arrayBufferToBase64(data.data) } as any;
-        }
-        if (data.type === 'file-batch-binary' && (data.data instanceof ArrayBuffer || data.data instanceof Uint8Array)) {
-            payloadToSend = { ...data, data: arrayBufferToBase64(data.data) } as any;
-        }
-
-        const itemStr = JSON.stringify(payloadToSend);
-        this.sendBufferBytes += itemStr.length;
-        this.sendBuffer.push(payloadToSend);
-
-        if (this.sendBuffer.length >= this.MAX_BUFFER_COUNT || this.sendBufferBytes >= this.MAX_BUFFER_BYTES) {
-            await this.flushSendBuffer();
-        } else if (!this.flushTimeout) {
-            this.flushTimeout = window.setTimeout(() => {
-                this.flushTimeout = null;
-                this.flushSendBuffer();
-            }, this.FLUSH_INTERVAL_MS);
-        }
+        this.sendBuffer.push(data);
+        this.flushSendBuffer();
     }
 
-    private async flushSendBuffer() {
-        if (this.flushTimeout) {
-            clearTimeout(this.flushTimeout);
-            this.flushTimeout = null;
-        }
-        if (this.sendBuffer.length === 0 || this.isFlushing) return;
+    private flushSendBuffer() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
         
-        this.isFlushing = true;
-        const batch = this.sendBuffer.splice(0);
-        const batchBytes = this.sendBufferBytes;
-        this.sendBufferBytes = 0;
-        this.pendingBytes += batchBytes;
-
-        try {
-            if (batch.length === 1) {
-                // Single message: use regular /push for compatibility
-                const bodyStr = JSON.stringify(batch[0]);
-                await requestUrl({
-                    url: `${this.baseUrl}/push`,
-                    method: 'POST',
-                    headers: this.headers,
-                    body: bodyStr,
-                });
-            } else {
-                // Multiple messages: use /push-batch
-                const bodyStr = JSON.stringify(batch);
-                await requestUrl({
-                    url: `${this.baseUrl}/push-batch`,
-                    method: 'POST',
-                    headers: this.headers,
-                    body: bodyStr,
-                });
-            }
-        } catch (e) {
-            this.plugin.showNotice('Failed to send data to host.', 'error');
-            this.plugin.log('Offline Push Error:', e);
-            this.plugin.updateStatus({ text: 'Host Unreachable', icon: 'server-off', state: 'error' });
-        } finally {
-            this.pendingBytes = Math.max(0, this.pendingBytes - batchBytes);
-            this.isFlushing = false;
-            // If more messages accumulated while flushing, flush again
-            if (this.sendBuffer.length > 0) {
-                this.flushSendBuffer();
+        while (this.sendBuffer.length > 0) {
+            const data = this.sendBuffer.shift();
+            try {
+                const encoded = encodeMessage(data);
+                this.ws.send(encoded);
+            } catch (e) {
+                this.sendBuffer.unshift(data); // Put it back on failure
+                break;
             }
         }
     }
 
     startPolling() {
-        this.isStopped = false;
-        if (this.pollTimeout) clearTimeout(this.pollTimeout);
-        this.poll();
+        // Legacy compat, no-op for WebSockets
     }
 
     stop() {
         this.isStopped = true;
         this.isOpen = false;
-        if (this.pollTimeout) clearTimeout(this.pollTimeout);
-        this.pollTimeout = null;
-        if (this.flushTimeout) clearTimeout(this.flushTimeout);
-        this.flushTimeout = null;
-        // Flush remaining messages before stopping
-        if (this.sendBuffer.length > 0) {
-            this.flushSendBuffer();
+        if (this.ws) {
+            this.ws.close();
+            this.ws = null;
         }
         this.plugin.showNotice("Disconnected from Offline Host.", 'important', 3000);
     }

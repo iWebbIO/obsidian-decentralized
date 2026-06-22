@@ -15,8 +15,9 @@ export function arrayBufferToBase64(buffer: ArrayBuffer): string {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    const chunkSize = 8192;
+    for (let i = 0; i < len; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)));
     }
     return window.btoa(binary);
 }
@@ -74,7 +75,8 @@ export function packFilesToTLV(files: PackedFile[]): ArrayBuffer {
         view.setUint8(offset, encFlag); offset += 1;
         
         view.setUint32(offset, file.content.byteLength, true); offset += 4;
-        bytes.set(new Uint8Array(file.content), offset); offset += file.content.byteLength;
+        const contentBytes = file.content instanceof Uint8Array ? file.content : new Uint8Array(file.content);
+        bytes.set(contentBytes, offset); offset += file.content.byteLength;
     }
     
     return buffer;
@@ -103,8 +105,8 @@ export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
         
         const contentLen = view.getUint32(offset, true); offset += 4;
         
-        // Zero-copy sub-array for content, prevents memory explosion
-        const content = new Uint8Array(buffer, offset, contentLen);
+        // Use slice to create an independent copy and prevent retaining the entire batch buffer
+        const content = new Uint8Array(buffer.slice(offset, offset + contentLen));
         offset += contentLen;
         
         files.push({ path, mtime, isCompressed, encoding, content });
