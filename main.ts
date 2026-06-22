@@ -611,8 +611,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.isTwoDeviceMode() || !this.settings.enableRealtimeSync) return;
         const path = file.path;
         
-        if (!this.heldLocks.has(path)) return;
-        
         const currentText = editor.getValue();
         const cached = this.lastSentContent.get(path);
         
@@ -1727,13 +1725,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.applyFileBatchBinary(data).then((results) => {
                         this.resetIdleTimeout();
                         if (conn && data.batchId) {
-                            this.handleBatchComplete({
-                                type: 'batch-complete',
-                                batchId: data.batchId,
-                                receivedPaths: results.succeeded,
-                                failedPaths: results.failed
-                            }, conn);
-                            
                             this.sendSyncMessage(conn.peer, { 
                                 type: 'batch-complete', 
                                 batchId: data.batchId, 
