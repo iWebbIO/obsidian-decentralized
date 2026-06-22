@@ -60,12 +60,12 @@ function decodeMessage(data: string | ArrayBuffer | Uint8Array | Blob): any {
     const decoder = new TextDecoder();
     const headerStr = decoder.decode(headerBytes);
     const header = JSON.parse(headerStr);
-    const binaryData = new Uint8Array(buffer, 4 + headerLen);
+    const dataBuffer = buffer.slice(4 + headerLen);
 
     if (header.type === 'file-chunk-data' || header.type === 'file-batch-binary') {
-        header.data = binaryData.buffer;
+        header.data = dataBuffer;
     } else if (header.type === 'file-update') {
-        header.content = binaryData.buffer;
+        header.content = dataBuffer;
     }
     return header;
 }
