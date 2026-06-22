@@ -402,6 +402,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         for (const [path, timestamp] of Object.entries(this.tombstones)) {
             if (now - timestamp > retentionMs) {
                 delete this.tombstones[path];
+                if (this.twoDeviceState.fileVersions) delete this.twoDeviceState.fileVersions[path];
                 pruned = true;
             }
         }
@@ -609,6 +610,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private async handleEditorChangeDebounced(editor: any, file: TFile) {
         if (!this.isTwoDeviceMode() || !this.settings.enableRealtimeSync) return;
         const path = file.path;
+        
+        if (!this.heldLocks.has(path)) return;
         
         const currentText = editor.getValue();
         const cached = this.lastSentContent.get(path);
@@ -1501,7 +1504,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.resumeTransfers(conn.peer);
         });
         conn.on('data', async (raw: any) => {
-            this.handleRawIncomingData(raw, conn);
+            this.handleRawIncomingData(raw, conn).catch(e => {
+                this.log("Unhandled error in incoming data listener", e);
+            });
         });
         conn.on('close', () => {
             this.pendingConnections.delete(conn.peer);
@@ -1722,8 +1727,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.applyFileBatchBinary(data).then((results) => {
                         this.resetIdleTimeout();
                         if (conn && data.batchId) {
-                            // If DirectIP is used, it uses HTTP so connection is handled differently, 
-                            // but sendSyncMessage handles routing.
+                            this.handleBatchComplete({
+                                type: 'batch-complete',
+                                batchId: data.batchId,
+                                receivedPaths: results.succeeded,
+                                failedPaths: results.failed
+                            }, conn);
+                            
                             this.sendSyncMessage(conn.peer, { 
                                 type: 'batch-complete', 
                                 batchId: data.batchId, 
