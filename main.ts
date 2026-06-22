@@ -638,7 +638,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const keyData = base64ToArrayBuffer(pskBase64);
             const key = await window.crypto.subtle.importKey('raw', keyData, { name: 'AES-GCM' }, false, ['encrypt']);
             const iv = window.crypto.getRandomValues(new Uint8Array(12));
-            const encoded = new TextEncoder().encode(JSON.stringify(data));
+            let encoded: Uint8Array;
+            const isFileChunkData = data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer;
+            const isFileUpdate = data.type === 'file-update' && data.content instanceof ArrayBuffer;
+            const isFileBatchBinary = data.type === 'file-batch-binary' && data.data instanceof ArrayBuffer;
+            
+            if (isFileChunkData || isFileUpdate || isFileBatchBinary) {
+                const originalData = isFileChunkData ? data.data : (isFileUpdate ? data.content : data.data);
+                const base64Data = arrayBufferToBase64(originalData);
+                const modifiedData = { ...data };
+                if (isFileChunkData || isFileBatchBinary) modifiedData.data = base64Data;
+                else modifiedData.content = base64Data;
+                modifiedData._wasBinary = true;
+                encoded = new TextEncoder().encode(JSON.stringify(modifiedData));
+            } else {
+                encoded = new TextEncoder().encode(JSON.stringify(data));
+            }
             const encrypted = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
             
             return {
@@ -661,7 +676,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             const decrypted = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, key, data);
             const decoded = new TextDecoder().decode(decrypted);
-            return JSON.parse(decoded);
+            const parsed = JSON.parse(decoded);
+            if (parsed._wasBinary) {
+                if (parsed.type === 'file-chunk-data' || parsed.type === 'file-batch-binary') {
+                    parsed.data = base64ToArrayBuffer(parsed.data);
+                } else if (parsed.type === 'file-update') {
+                    parsed.content = base64ToArrayBuffer(parsed.content);
+                }
+                delete parsed._wasBinary;
+            }
+            return parsed;
         } catch (e) {
             this.log("Decryption failed", e);
             throw new Error("Decryption failed");
@@ -2137,6 +2161,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         const YIELD_THRESHOLD_MS = 100;
         let lastYieldTime = Date.now();
+        const transferStartTime = Date.now();
         
         if (startIndex === 0) {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector };
@@ -2184,16 +2209,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 let encPayload: any = chunkPayload;
                 if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(chunkPayload, this.settings.peerKeys[peerId]);
 
+                this.syncState.bytesTransferred += chunk.byteLength;
+
                 if (isDirectIp) {
                     if (this.directIpClient) this.directIpClient.send(encPayload);
                     else if (this.directIpServer) this.directIpServer.sendTo(peerId, encPayload);
 
                     const getBuffer = () => this.directIpClient ? this.directIpClient.getBufferedAmount() : this.directIpServer!.getBufferedAmount(peerId);
-                    if (getBuffer() > 1024 * 1024 * 16) {
+                    if (getBuffer() > 1024 * 1024 * 32) {
                         await new Promise<void>(resolve => {
                             const check = () => {
-                                if (getBuffer() <= 1024 * 1024 * 8) resolve();
-                                else setTimeout(check, 5);
+                                if (getBuffer() <= 1024 * 1024 * 16) resolve();
+                                else if (typeof setImmediate !== 'undefined') setImmediate(check);
+                                else setTimeout(check, 1);
                             };
                             check();
                         });
@@ -2201,17 +2229,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
                 else {
                     conn!.send(encPayload);
-                    
-                    if ((conn! as any).dataChannel && (conn! as any).dataChannel.bufferedAmount > 1024 * 1024 * 16) {
+                    const dc = (conn! as any).dataChannel || (conn! as any)._dc;
+                    if (dc && dc.bufferedAmount > 1024 * 1024 * 16) {
                         await new Promise<void>(resolve => {
-                            const check = () => {
-                                if (!(conn! as any).dataChannel || (conn! as any).dataChannel.bufferedAmount <= 1024 * 1024 * 8) {
-                                    resolve();
-                                } else {
-                                    setTimeout(check, 5);
-                                }
+                            if (dc.bufferedAmount <= 1024 * 1024 * 8) return resolve();
+                            const oldHandler = dc.onbufferedamountlow;
+                            dc.bufferedAmountLowThreshold = 1024 * 1024 * 8;
+                            dc.onbufferedamountlow = () => {
+                                dc.onbufferedamountlow = oldHandler;
+                                resolve();
                             };
-                            check();
                         });
                     }
                 }
@@ -2236,6 +2263,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 throw e;
             }
         }
+        this.recordTransferSample(fileContent.byteLength, Date.now() - transferStartTime);
         this.log(`Finished sending all chunks for ${path} to ${peerId}. Waiting for ack.`);
     }
 
@@ -2272,6 +2300,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!transfer.chunks[payload.index]) {
             transfer.chunks[payload.index] = payload.data;
             transfer.receivedCount++;
+            this.syncState.bytesTransferred += payload.data.byteLength;
         }
         transfer.lastUpdated = Date.now();
         const active = this.activeTransfers.get(payload.transferId);
