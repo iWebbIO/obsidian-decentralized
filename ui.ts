@@ -31,7 +31,7 @@ export class ConnectionModal extends Modal {
         this.injectStyles();
         this.contentEl.addClass(Platform.isMobile ? 'od-mobile' : 'od-desktop');
         
-        if (this.plugin.connections.size > 0) {
+        if (this.plugin.connections && this.plugin.connections.size > 0) {
             // Direct IP: reflect liveness/reconnect state precisely
             const client = this.plugin.directIpClient;
             if (client) {
@@ -255,6 +255,11 @@ export class ConnectionModal extends Modal {
         contentEl.createDiv({ text: 'Connect devices easily using codes or QR', cls: 'od-dashboard-subtitle' });
 
         const myInfo = this.plugin.getMyPeerInfo();
+        if (!myInfo || !myInfo.deviceId) {
+            contentEl.createEl('h2', { text: 'Quick Pair', cls: 'od-dashboard-header' });
+            contentEl.createDiv({ text: 'Error: This device does not have a valid Device ID. Please check settings.', cls: 'mod-warning' });
+            return;
+        }
 
         // Step 1: Share Your Code
         contentEl.createDiv({ text: 'Step 1: Share Your Code', cls: 'od-step-header' });
@@ -263,7 +268,13 @@ export class ConnectionModal extends Modal {
         const formattedCode = this.formatPairingCodeForDisplay(myInfo.deviceId);
         codeContainer.createDiv({ text: formattedCode, cls: 'od-pairing-code-text' });
         
-        const qrPayload = `${myInfo.deviceId}|${this.activePsk || ''}`;
+        if (!this.activePsk) {
+            contentEl.createDiv({ text: 'Error: Encryption key (PSK) is missing. Pairing is blocked.', cls: 'mod-warning' });
+            new Notice('Pairing blocked: Encryption key (PSK) is missing or not generated.');
+            return;
+        }
+        
+        const qrPayload = `${myInfo.deviceId}|${this.activePsk}`;
         
         const copyBtn = codeContainer.createEl('button', { text: 'Copy' });
         copyBtn.onclick = () => {
@@ -407,7 +418,7 @@ export class ConnectionModal extends Modal {
                         info.createDiv({ text: `${peer.ip || 'Unknown IP'}:${peer.port || '???'}`, cls: 'sub-text' });
                         const btn = item.createEl('button', { text: 'Select' });
                         btn.onclick = async () => {
-                            if (peer.ip) ipInput.value = peer.ip;
+                            ipInput.value = peer.ip || '';
                             if (peer.port) { this.plugin.settings.directIpHostPort = peer.port; await this.plugin.saveSettings(); }
                             new Notice(`Selected ${peer.friendlyName}`);
                         };
@@ -432,7 +443,7 @@ export class ConnectionModal extends Modal {
 
         container.createDiv({ cls: 'od-section-title', text: 'Step 2: Join a Network (Other devices)' });
         const ipInput = container.createEl('input', { type: 'text', placeholder: 'Host IP Address' });
-        ipInput.value = this.plugin.settings.directIpHostAddress;
+        ipInput.value = this.plugin.settings.directIpHostAddress || '';
         if (Platform.isMobile) { ipInput.style.width = '100%'; ipInput.style.marginBottom = '10px'; }
         
         const pinInput = container.createEl('input', { type: 'text', placeholder: 'Security Token' });

@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting, setIcon } from 'obsidian';
+import { App, PluginSettingTab, Setting, setIcon, Notice } from 'obsidian';
 import type ObsidianDecentralizedPlugin from './main';
 import { PeerInfo, DEFAULT_SETTINGS, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE } from './types';
 import { ConnectionModal } from './ui';
@@ -160,7 +160,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         if (this.plugin.settings.useCustomPeerServer) {
             const config = this.plugin.settings.customPeerServerConfig;
             new Setting(containerEl).setName("Host").addText(text => text.setValue(config.host).onChange(async (value) => { config.host = value; await this.plugin.saveSettings(); }));
-            new Setting(containerEl).setName("Port").addText(text => text.setValue(config.port.toString()).onChange(async (value) => { config.port = parseInt(value, 10) || 9000; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Port").addText(text => text.setValue(config.port.toString()).onChange(async (value) => {
+                const parsed = parseInt(value, 10);
+                config.port = isNaN(parsed) ? DEFAULT_SETTINGS.customPeerServerConfig.port : Math.max(1, Math.min(parsed, 65535));
+                await this.plugin.saveSettings();
+            }));
             new Setting(containerEl).setName("Path").addText(text => text.setValue(config.path).onChange(async (value) => { config.path = value; await this.plugin.saveSettings(); }));
             new Setting(containerEl).setName("Secure (SSL)").addToggle(toggle => toggle.setValue(config.secure).onChange(async (value) => { config.secure = value; await this.plugin.saveSettings(); }));
 
@@ -241,7 +245,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.deltaSyncThreshold.toString())
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.deltaSyncThreshold = isNaN(num) ? 50 : num;
+                    this.plugin.settings.deltaSyncThreshold = isNaN(num) ? DEFAULT_SETTINGS.deltaSyncThreshold : Math.max(0, Math.min(num, 100));
                     await this.plugin.saveSettings();
                 }));
 
@@ -262,7 +266,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.idleTimeoutMs?.toString() || "30000")
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.idleTimeoutMs = isNaN(num) ? 30000 : Math.max(5000, num);
+                    this.plugin.settings.idleTimeoutMs = isNaN(num) ? DEFAULT_SETTINGS.idleTimeoutMs : Math.max(5000, Math.min(num, 600000));
                     await this.plugin.saveSettings();
                 }));
 
@@ -273,7 +277,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.tombstoneRetentionDays?.toString() || "30")
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.tombstoneRetentionDays = isNaN(num) ? 30 : num;
+                    this.plugin.settings.tombstoneRetentionDays = isNaN(num) ? DEFAULT_SETTINGS.tombstoneRetentionDays : Math.max(0, Math.min(num, 3650));
                     await this.plugin.saveSettings();
                 }));
 
@@ -308,7 +312,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.debounceDelay.toString())
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.debounceDelay = isNaN(num) ? DEFAULT_SETTINGS.debounceDelay : num;
+                    this.plugin.settings.debounceDelay = isNaN(num) ? DEFAULT_SETTINGS.debounceDelay : Math.max(250, num);
                     this.plugin.updateDebounceDelay();
                     await this.plugin.saveSettings();
                 }));
@@ -352,8 +356,16 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             const save = () => {
                 this.isEditingName = false;
                 const newName = inputEl.value.trim();
-                if (newName && newName !== editValue) onSave(newName);
-                else this.createEditableName(container, displayName, editValue, onSave); 
+                if (newName && newName.length <= 64) {
+                    if (newName !== editValue) {
+                        onSave(newName);
+                    } else {
+                        this.createEditableName(container, displayName, editValue, onSave);
+                    }
+                } else {
+                    new Notice(newName === "" ? "Name cannot be empty." : "Name cannot exceed 64 characters.", 5000);
+                    this.createEditableName(container, displayName, editValue, onSave);
+                }
             };
 
             const submitBtn = wrapper.createSpan({ cls: 'od-editable-name-submit' });

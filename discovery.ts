@@ -22,6 +22,10 @@ export class DesktopLANDiscovery implements ILANDiscovery {
     private broadcastTimer: number | null = null;
     private lastPeerInfo: PeerInfo | null = null;
     private hasNetworkListeners: boolean = false;
+    private isBound: boolean = false;
+    private socketRestartAttempts: number = 0;
+    private maxSocketRestartAttempts: number = 5;
+    private restartTimeout: number | null = null;
     
     private onNetworkChange = () => {
         console.log('Network interface change detected, restarting LAN discovery...');
@@ -73,11 +77,45 @@ export class DesktopLANDiscovery implements ILANDiscovery {
 
         this.socket.on('error', (err: Error) => {
             console.error('LAN Discovery Socket Error:', err);
-            this.stop();
-            new Notice('LAN discovery failed. Your firewall might be blocking it.', 10000);
+            
+            // Clean up the socket immediately but do not completely cease network change listeners
+            if (this.socket) {
+                if (this.isBound) {
+                    try { this.socket.close(); } catch (_) {}
+                }
+                this.socket = null;
+                this.isBound = false;
+            }
+            
+            if (this.socketRestartAttempts < this.maxSocketRestartAttempts) {
+                this.socketRestartAttempts++;
+                const delay = Math.min(10000, this.socketRestartAttempts * 2000);
+                console.log(`LAN Discovery: scheduling socket restart attempt ${this.socketRestartAttempts}/${this.maxSocketRestartAttempts} in ${delay}ms`);
+                
+                if (this.restartTimeout !== null) {
+                    clearTimeout(this.restartTimeout);
+                }
+                this.restartTimeout = window.setTimeout(() => {
+                    this.restartTimeout = null;
+                    if (this.lastPeerInfo) {
+                        this.startBroadcasting(this.lastPeerInfo);
+                    } else {
+                        this.startListening();
+                    }
+                }, delay);
+            } else {
+                new Notice('LAN discovery failed. Your firewall might be blocking it.', 10000);
+                this.stop();
+            }
         });
 
         this.socket.on('listening', () => {
+            this.isBound = true;
+            this.socketRestartAttempts = 0;
+            if (this.restartTimeout !== null) {
+                clearTimeout(this.restartTimeout);
+                this.restartTimeout = null;
+            }
             try {
                 this.socket?.setMulticastTTL(128);
 
@@ -132,7 +170,9 @@ export class DesktopLANDiscovery implements ILANDiscovery {
                     }, this.discoveryTimeoutMs);
                     this.peerTimeouts.set(peerId, timeout);
                 }
-            } catch (e) { /* ignore parse errors */ }
+            } catch (e: any) {
+                console.warn('LAN Discovery: Error parsing incoming message:', e);
+            }
         });
 
         this.socket.bind(DISCOVERY_PORT, '0.0.0.0');
@@ -157,7 +197,11 @@ export class DesktopLANDiscovery implements ILANDiscovery {
             this.socket?.send(beaconBuffer, 0, beaconBuffer.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
                 if (err) {
                     this.consecutiveErrors++;
-                    if (this.consecutiveErrors <= 3) console.error("Beacon send error:", err);
+                    if (this.consecutiveErrors <= 3) {
+                        console.error("Beacon send error:", err);
+                    } else {
+                        console.warn(`LAN Discovery: Beacon send error (consecutive: ${this.consecutiveErrors}): ${err.message || err}`);
+                    }
                 } else {
                     this.consecutiveErrors = 0;
                 }
@@ -183,9 +227,28 @@ export class DesktopLANDiscovery implements ILANDiscovery {
 
     public stop() {
         this.stopBroadcasting();
+        if (this.restartTimeout !== null) {
+            clearTimeout(this.restartTimeout);
+            this.restartTimeout = null;
+        }
+        this.socketRestartAttempts = 0;
+
+        if (this.hasNetworkListeners) {
+            window.removeEventListener('online', this.onNetworkChange);
+            window.removeEventListener('offline', this.onNetworkChange);
+            this.hasNetworkListeners = false;
+        }
+
         if (this.socket) {
-            this.socket.close();
+            if (this.isBound) {
+                try {
+                    this.socket.close();
+                } catch (e) {
+                    console.error('Error closing LAN discovery socket:', e);
+                }
+            }
             this.socket = null;
+            this.isBound = false;
         }
         this.discoveredPeers.clear();
         this.peerTimeouts.forEach(timeout => clearTimeout(timeout));

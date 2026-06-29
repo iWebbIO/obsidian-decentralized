@@ -98,8 +98,15 @@ export class DirectIpServer {
     }
 
     private start(port: number) {
-        const { WebSocketServer } = require('ws');
-        this.wss = new WebSocketServer({ port });
+        try {
+            const { WebSocketServer } = require('ws');
+            this.wss = new WebSocketServer({ port });
+        } catch (err: any) {
+            this.plugin.log("Failed to load/initialize 'ws' module:", err);
+            this.plugin.showNotice(`Failed to start Offline Host server: ${err.message || err}`, 'error');
+            this.wss = null;
+            return;
+        }
         
         this.wss.on('connection', (socket: any, request: any) => {
             const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
@@ -121,19 +128,35 @@ export class DirectIpServer {
 
                 try {
                     let parsedData: any;
+                    let parsedSuccessfully = false;
                     if (isBinary || data instanceof Uint8Array || data instanceof ArrayBuffer) {
-                        parsedData = decodeMessage(data);
+                        try {
+                            parsedData = decodeMessage(data);
+                            parsedSuccessfully = true;
+                        } catch (decodeErr) {
+                            this.plugin.log(`Server: decodeMessage failed for binary message from ${deviceId}:`, decodeErr);
+                        }
                     } else {
-                        parsedData = JSON.parse(data.toString());
+                        try {
+                            parsedData = JSON.parse(data.toString());
+                            parsedSuccessfully = true;
+                        } catch (jsonErr) {
+                            this.plugin.log(`Server: JSON parse failed for string message from ${deviceId}:`, jsonErr);
+                        }
                     }
 
-                    const mockConn = {
-                        send: (msg: any) => this.sendTo(deviceId, msg),
-                        peer: deviceId,
-                        open: true,
-                    } as any;
+                    if (parsedSuccessfully) {
+                        const mockConn = {
+                            send: (msg: any) => this.sendTo(deviceId, msg),
+                            peer: deviceId,
+                            open: true,
+                        } as any;
 
-                    this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => console.error(e));
+                        this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => {
+                            this.plugin.log(`Server: Failed to handle raw incoming data from ${deviceId}:`, e);
+                            this.plugin.showNotice(`Error processing received sync message from ${deviceId}.`, 'error');
+                        });
+                    }
                 } catch (e) {
                     this.plugin.log('Error parsing WS message', e);
                 }
@@ -179,8 +202,12 @@ export class DirectIpServer {
     sendTo(peerId: string, data: any) {
         const entry = this.clients.get(peerId);
         if (entry && entry.socket.readyState === 1 /* OPEN */) {
-            const encoded = encodeMessage(data);
-            entry.socket.send(encoded);
+            try {
+                const encoded = encodeMessage(data);
+                entry.socket.send(encoded);
+            } catch (err) {
+                this.plugin.log(`DirectIpServer: Failed to send message to peer ${peerId}:`, err);
+            }
         }
     }
 
@@ -194,10 +221,20 @@ export class DirectIpServer {
     }
 
     send(data: any) {
-        const encoded = encodeMessage(data);
+        let encoded: any;
+        try {
+            encoded = encodeMessage(data);
+        } catch (err) {
+            this.plugin.log('DirectIpServer: Failed to encode message for broadcast:', err);
+            return;
+        }
         for (const entry of this.clients.values()) {
             if (entry.socket.readyState === 1 /* OPEN */) {
-                entry.socket.send(encoded);
+                try {
+                    entry.socket.send(encoded);
+                } catch (err) {
+                    this.plugin.log('DirectIpServer: Broadcast send failed for client:', err);
+                }
             }
         }
     }
@@ -355,19 +392,38 @@ export class DirectIpClient {
 
             try {
                 let parsedData: any;
+                let parsedSuccessfully = false;
+
                 if (typeof event.data === 'string') {
-                    parsedData = JSON.parse(event.data);
+                    try {
+                        parsedData = JSON.parse(event.data);
+                        parsedSuccessfully = true;
+                    } catch (jsonErr) {
+                        this.plugin.log('DirectIpClient: JSON parse failed for string message:', jsonErr);
+                    }
                 } else if (event.data instanceof ArrayBuffer) {
-                    parsedData = decodeMessage(event.data);
+                    try {
+                        parsedData = decodeMessage(event.data);
+                        parsedSuccessfully = true;
+                    } catch (decodeErr) {
+                        this.plugin.log('DirectIpClient: decodeMessage failed for ArrayBuffer:', decodeErr);
+                    }
+                } else {
+                    this.plugin.log('DirectIpClient: Unsupported WebSocket message type dropped:', typeof event.data);
                 }
                 
-                const mockConn = {
-                    send: (data: any) => this.send(data),
-                    peer: 'direct-ip-host',
-                    open: true
-                } as any;
+                if (parsedSuccessfully) {
+                    const mockConn = {
+                        send: (data: any) => this.send(data),
+                        peer: 'direct-ip-host',
+                        open: true
+                    } as any;
 
-                this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => console.error(e));
+                    this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => {
+                        this.plugin.log('Client: Failed to handle raw incoming data:', e);
+                        this.plugin.showNotice('Error processing received sync message.', 'error');
+                    });
+                }
             } catch (e) {
                 this.plugin.log('Offline WS Parse Error:', e);
             }
