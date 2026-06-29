@@ -33,6 +33,8 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         } else {
             this.startListening();
         }
+        // Forward the event so the plugin can respond (Phase 3.2)
+        this.emit('network-change');
     };
 
     private setupNetworkChangeListeners() {

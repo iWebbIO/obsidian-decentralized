@@ -158,6 +158,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public directIpServer: DirectIpServer | null = null;
     public directIpClient: DirectIpClient | null = null;
     private lastHeard: Map<string, number> = new Map();
+
+    // Network-change handling (Phase 3.2)
+    private networkChangeHandler: (() => void) | null = null;
+    private peerReconnectFallbackTimeout: number | null = null;
     private statePath: string;
     public manualPingStart: Map<string, number> = new Map();
     private debouncedSaveState: () => void;
@@ -228,12 +232,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.registerInterval(window.setInterval(() => this.cleanupPendingChunks(), 60000));
         this.registerInterval(window.setInterval(() => this.retryFailedSyncs(), 60000));
         this.registerInterval(window.setInterval(() => this.cleanupLocks(), 5000));
+
+        // Centralized network-change listeners (Phase 3.2)
+        this.networkChangeHandler = () => this.handleNetworkChange();
+        window.addEventListener('online',  this.networkChangeHandler);
+        window.addEventListener('offline', this.networkChangeHandler);
+        this.lanDiscovery.on('network-change', this.networkChangeHandler);
         
         await this.loadState();
         this.pruneTombstones();
     }
 
     onunload() {
+        // Remove centralized network-change listeners
+        if (this.networkChangeHandler) {
+            window.removeEventListener('online',  this.networkChangeHandler);
+            window.removeEventListener('offline', this.networkChangeHandler);
+            this.lanDiscovery.off('network-change', this.networkChangeHandler);
+            this.networkChangeHandler = null;
+        }
+        if (this.peerReconnectFallbackTimeout !== null) {
+            clearTimeout(this.peerReconnectFallbackTimeout);
+            this.peerReconnectFallbackTimeout = null;
+        }
         this.peer?.destroy();
         this.lanDiscovery.stop();
         this.directIpServer?.stop();
@@ -1478,7 +1499,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         this.peer.on('connection', (conn) => { this.log("Incoming PeerJS connection from:", conn.peer); this.setupConnection(conn); });
         this.peer.on('error', (err) => { clearTimeout(connectionTimeout); this.handlePeerError(err); });
-        this.peer.on('disconnected', () => { this.showNotice('Sync network disconnected. Attempting to reconnect...', 'important'); this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' }); });
+        this.peer.on('disconnected', () => {
+            this.showNotice('Sync network disconnected. Attempting to reconnect...', 'important');
+            this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' });
+            // Attempt lightweight reconnect first (Phase 3.1)
+            if (this.peer && !this.peer.destroyed) {
+                this.peer.reconnect();
+                // Arm a fallback in case peer.reconnect() stalls silently
+                if (this.peerReconnectFallbackTimeout !== null) clearTimeout(this.peerReconnectFallbackTimeout);
+                this.peerReconnectFallbackTimeout = window.setTimeout(() => {
+                    this.peerReconnectFallbackTimeout = null;
+                    // If still disconnected after the window, fall through to full re-init
+                    if (this.peer && this.peer.disconnected) {
+                        this.log('PeerJS reconnect() stalled — falling back to full re-initialization.');
+                        this.handlePeerError(new Error('Reconnect timed out'));
+                    }
+                }, 15000);
+            }
+        });
+        this.peer.on('open', (id) => {
+            // Cancel the reconnect fallback timer if the peer comes back online
+            if (this.peerReconnectFallbackTimeout !== null) {
+                clearTimeout(this.peerReconnectFallbackTimeout);
+                this.peerReconnectFallbackTimeout = null;
+            }
+        });
         this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'important'); this.handlePeerError(new Error("Peer closed.")); });
     }
 
@@ -1922,6 +1967,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.clusterConnectionInterval) {
             this.clusterConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS); 
             // Fix: Do not register this dynamically recreated interval to avoid leaking in Obsidian core's internal list.
+        }
+    }
+
+    /**
+     * Centralized handler for all network-change signals (Phase 3.2).
+     * Triggered by: browser `online`/`offline` events, and the discovery
+     * `network-change` event (emitted after the LAN multicast socket restarts).
+     */
+    private handleNetworkChange() {
+        this.log('Network change detected — checking transports...');
+        const mode = this.getConnectionMode();
+
+        if (mode === 'peerjs') {
+            if (!this.peer || this.peer.destroyed || this.peer.disconnected) {
+                this.log('Network change: re-initializing PeerJS peer.');
+                this.initializePeer();
+            } else {
+                // Peer is alive; just ensure cluster peers are reconnected
+                this.tryToConnectToClusterPeers();
+            }
+        } else if (mode === 'direct-ip') {
+            if (this.directIpClient) {
+                this.log('Network change: triggering DirectIpClient reconnect.');
+                this.directIpClient.triggerReconnect();
+            }
         }
     }
 
@@ -3645,7 +3715,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.getConnectionMode() === 'direct-ip') {
             const isAuto = this.settings.syncMode === 'auto';
             if (this.directIpServer) return { text: isAuto ? "Hosting Offline" : "Host Mode", icon: "server", state: 'success' };
-            if (this.directIpClient) return { text: isAuto ? "Connected Offline" : "Client Mode", icon: "smartphone", state: 'success' };
+            if (this.directIpClient) {
+                const client = this.directIpClient;
+                // Fatal error (e.g. PIN rejection) — non-recoverable
+                if (client.isFatalError) {
+                    return { text: 'Host Rejected PIN', icon: 'shield-off', state: 'error' };
+                }
+                // Backoff-reconnect in progress
+                if (!client.isOpen) {
+                    return { text: 'Reconnecting to host…', icon: 'refresh-cw', spin: true, state: 'loading' };
+                }
+                // Socket open but liveness not yet confirmed (waiting for first message)
+                if (!client.isLive) {
+                    return { text: 'Verifying link…', icon: 'plug', spin: true, state: 'loading' };
+                }
+                // Confirmed live connection
+                return { text: isAuto ? 'Connected Offline' : 'Client Mode', icon: 'smartphone', state: 'success' };
+            }
             return { text: isAuto ? "Offline Mode" : "Offline Mode", icon: "network", state: 'neutral' };
         }
         if (!this.peer || this.peer.disconnected) return { text: "Sync Offline", icon: "wifi-off", state: 'error' };

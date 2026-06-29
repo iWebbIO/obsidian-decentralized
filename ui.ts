@@ -21,7 +21,7 @@ export class ConnectionModal extends Modal {
     private loseListener: ((p: PeerInfo) => void) | null = null;
     
     private activeTab: 'quick-pair' | 'advanced' = 'quick-pair';
-    private statusState: 'idle' | 'connecting' | 'connected' | 'error' = 'idle';
+    private statusState: 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'error' = 'idle';
     private statusMessage: string = 'Not connected';
     private activePsk: string | null = null;
 
@@ -32,8 +32,26 @@ export class ConnectionModal extends Modal {
         this.contentEl.addClass(Platform.isMobile ? 'od-mobile' : 'od-desktop');
         
         if (this.plugin.connections.size > 0) {
-            this.statusState = 'connected';
-            this.statusMessage = `Connected to ${this.plugin.connections.size} device(s)`;
+            // Direct IP: reflect liveness/reconnect state precisely
+            const client = this.plugin.directIpClient;
+            if (client) {
+                if (client.isFatalError) {
+                    this.statusState = 'error';
+                    this.statusMessage = 'Host rejected PIN — cannot reconnect.';
+                } else if (!client.isOpen) {
+                    this.statusState = 'reconnecting';
+                    this.statusMessage = 'Reconnecting to Offline Host…';
+                } else if (!client.isLive) {
+                    this.statusState = 'connecting';
+                    this.statusMessage = 'Verifying link to Offline Host…';
+                } else {
+                    this.statusState = 'connected';
+                    this.statusMessage = `Connected to ${this.plugin.connections.size} device(s)`;
+                }
+            } else {
+                this.statusState = 'connected';
+                this.statusMessage = `Connected to ${this.plugin.connections.size} device(s)`;
+            }
         }
         
         this.activePsk = await this.plugin.generatePSK();
@@ -89,6 +107,7 @@ export class ConnectionModal extends Modal {
             .od-status-banner { padding: 12px; border-radius: var(--radius-m); margin-bottom: 20px; text-align: center; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 8px; }
             .od-status-banner.idle { background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); color: var(--text-muted); }
             .od-status-banner.connecting { background: var(--background-modifier-hover); color: var(--text-normal); }
+            .od-status-banner.reconnecting { background: rgba(255, 160, 0, 0.12); border: 1px solid rgba(255, 160, 0, 0.4); color: #c97d00; }
             .od-status-banner.connected { background: var(--background-modifier-success); color: var(--text-success); border: 1px solid var(--background-modifier-success-hover); }
             .od-status-banner.error { background: var(--background-modifier-error); color: var(--text-error); border: 1px solid var(--background-modifier-error-hover); }
 
@@ -163,10 +182,17 @@ export class ConnectionModal extends Modal {
             const spinner = banner.createSpan();
             setIcon(spinner, 'loader');
             spinner.addClass('lucide-spin');
+        } else if (this.statusState === 'reconnecting') {
+            // Amber spinning indicator — connection was previously established but lost
+            const spinner = banner.createSpan();
+            setIcon(spinner, 'refresh-cw');
+            spinner.addClass('lucide-spin');
         } else if (this.statusState === 'connected') {
+            // Only shown after liveness is confirmed (Phase 4)
             const check = banner.createSpan();
             setIcon(check, 'check-circle');
         } else if (this.statusState === 'error') {
+            // Only shown for non-recoverable failures (e.g. PIN rejection)
             const alert = banner.createSpan();
             setIcon(alert, 'alert-triangle');
         }
