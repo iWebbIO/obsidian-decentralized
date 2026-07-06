@@ -1,11 +1,11 @@
 # Graph Report - obsidian-decentralized  (2026-07-06)
 
 ## Corpus Check
-- 15 files · ~29,105 words
+- 15 files · ~29,076 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 431 nodes · 1119 edges · 27 communities (14 shown, 13 thin omitted)
+- 430 nodes · 1117 edges · 28 communities (15 shown, 13 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS
 - Token cost: 0 input · 0 output
 
@@ -25,12 +25,12 @@
 - [[_COMMUNITY_TypeScript Config|TypeScript Config]]
 - [[_COMMUNITY_File System Operations|File System Operations]]
 - [[_COMMUNITY_Conflict Resolution Logic|Conflict Resolution Logic]]
-- [[_COMMUNITY_Plugin Initialization|Plugin Initialization]]
 - [[_COMMUNITY_Plugin Manifest|Plugin Manifest]]
 - [[_COMMUNITY_Readme Documentation|Readme Documentation]]
 - [[_COMMUNITY_Settings Interface|Settings Interface]]
 - [[_COMMUNITY_Git Analysis|Git Analysis]]
 - [[_COMMUNITY_Graphify Agents|Graphify Agents]]
+- [[_COMMUNITY_Network Queue Priority|Network Queue Priority]]
 - [[_COMMUNITY_GitHub Actions|GitHub Actions]]
 - [[_COMMUNITY_GRAPH_REPORT|GRAPH_REPORT.md]]
 - [[_COMMUNITY_Graphify Usage Rule|Graphify Usage Rule]]
@@ -43,7 +43,7 @@
 - [[_COMMUNITY_WebRTC|WebRTC]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `ObsidianDecentralizedPlugin` - 157 edges
+1. `ObsidianDecentralizedPlugin` - 156 edges
 2. `ConnectionModal` - 17 edges
 3. `compilerOptions` - 16 edges
 4. `DesktopLANDiscovery` - 15 edges
@@ -72,47 +72,43 @@
 ## Hyperedges (group relationships)
 - **Performance Optimizations** — git_log_gethash_optimization, git_log_hash_cache_eviction, git_log_large_file_hashing, git_log_cached_read [INFERRED 0.95]
 
-## Communities (27 total, 13 thin omitted)
+## Communities (28 total, 13 thin omitted)
 
 ### Community 0 - "Core Plugin Logic"
-Cohesion: 0.13
-Nodes (4): FileDeletePayload, FileDeltaPayload, FileUpdatePayload, VersionVector
+Cohesion: 0.09
+Nodes (5): ObsidianDecentralizedPlugin, FileUpdatePayload, SyncTask, VersionVector, compressText()
 
 ### Community 1 - "Types and Utilities"
 Cohesion: 0.05
-Nodes (60): AckPayload, AdaptiveSyncConfig, BasePayload, BatchCompletePayload, BatchState, ClusterGossipPayload, ClusterKickPayload, CompanionPairPayload (+52 more)
+Nodes (57): AckPayload, AdaptiveSyncConfig, BasePayload, BatchCompletePayload, BatchState, ClusterKickPayload, DEFAULT_SETTINGS, DeviceRole (+49 more)
 
 ### Community 2 - "Conflict Resolution UI"
-Cohesion: 0.08
-Nodes (7): BinaryConflictResolutionModal, ConflictCenter, ConflictListModal, formatBytes(), QRScannerModal, SelectPeerModal, SyncProgressModal
+Cohesion: 0.07
+Nodes (8): BinaryConflictResolutionModal, ConflictCenter, ConflictListModal, ConflictResolutionModal, formatBytes(), QRScannerModal, SelectPeerModal, SyncProgressModal
 
 ### Community 3 - "LAN Discovery"
 Cohesion: 0.11
 Nodes (5): DesktopLANDiscovery, DummyLANDiscovery, DiscoveryBeacon, ILANDiscovery, PeerInfo
 
 ### Community 4 - "Package Configuration"
-Cohesion: 0.06
-Nodes (29): author, dependencies, diff-match-patch, html5-qrcode, pako, peerjs, ws, description (+21 more)
+Cohesion: 0.07
+Nodes (27): author, dependencies, html5-qrcode, pako, peerjs, qrcode, ws, description (+19 more)
 
 ### Community 5 - "Direct IP Networking"
-Cohesion: 0.12
-Nodes (8): decodeMessage(), DirectIpClient, DirectIpServer, encodeMessage(), ServerClientEntry, textDecoder, textEncoder, DirectIpConfig
+Cohesion: 0.11
+Nodes (9): decodeMessage(), DirectIpClient, DirectIpServer, encodeMessage(), ServerClientEntry, textDecoder, textEncoder, DirectIpConfig (+1 more)
 
 ### Community 6 - "Connection Manager UI"
-Cohesion: 0.10
-Nodes (6): qrcode, ObsidianDecentralizedSettingTab, ClusterForgetPayload, ClusterRenamePayload, ConnectionModal, arrayBufferToBase64()
+Cohesion: 0.08
+Nodes (8): ObsidianDecentralizedSettingTab, ClusterForgetPayload, ClusterGossipPayload, ClusterRenamePayload, CompanionPairPayload, SyncStatusState, VaultManifest, ConnectionModal
 
 ### Community 7 - "TypeScript Config"
 Cohesion: 0.11
 Nodes (17): compilerOptions, allowJs, baseUrl, esModuleInterop, importHelpers, inlineSourceMap, inlineSources, isolatedModules (+9 more)
 
 ### Community 8 - "File System Operations"
-Cohesion: 0.28
+Cohesion: 0.31
 Nodes (7): assert(), assertEquals(), fs, Module, obsidian, path, runTests()
-
-### Community 10 - "Plugin Initialization"
-Cohesion: 0.08
-Nodes (4): ObsidianDecentralizedPlugin, SyncData, SyncStatusState, SyncTask
 
 ### Community 11 - "Plugin Manifest"
 Cohesion: 0.22
@@ -126,6 +122,10 @@ Nodes (20): ⚙️ Configuration & Advanced Features, ⚔️ Conflict Center, Co
 Cohesion: 0.33
 Nodes (6): Use cachedRead, getHash Optimization, Map Insertion Order Eviction, Large File Stat Hashing, ObsidianDecentralizedPlugin, Rename Vector Cache Transfer
 
+### Community 16 - "Network Queue Priority"
+Cohesion: 0.25
+Nodes (4): diff-match-patch, EditorDeltaPayload, HandshakePayload, SyncData
+
 ## Knowledge Gaps
 - **100 isolated node(s):** `textEncoder`, `textDecoder`, `ServerClientEntry`, `id`, `name` (+95 more)
   These have ≤1 connection - possible missing edges or undocumented components.
@@ -134,17 +134,17 @@ Nodes (6): Use cachedRead, getHash Optimization, Map Insertion Order Eviction, L
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `ObsidianDecentralizedPlugin` connect `Plugin Initialization` to `Core Plugin Logic`, `Types and Utilities`, `Conflict Resolution UI`, `LAN Discovery`, `Package Configuration`, `Direct IP Networking`, `Connection Manager UI`?**
-  _High betweenness centrality (0.347) - this node is a cross-community bridge._
-- **Why does `dependencies` connect `Package Configuration` to `Connection Manager UI`?**
+- **Why does `ObsidianDecentralizedPlugin` connect `Core Plugin Logic` to `Types and Utilities`, `Conflict Resolution UI`, `LAN Discovery`, `Direct IP Networking`, `Connection Manager UI`, `Plugin Initialization`, `Network Queue Priority`?**
+  _High betweenness centrality (0.345) - this node is a cross-community bridge._
+- **Why does `dependencies` connect `Package Configuration` to `Network Queue Priority`?**
   _High betweenness centrality (0.093) - this node is a cross-community bridge._
-- **Why does `diff-match-patch` connect `Package Configuration` to `Core Plugin Logic`, `Plugin Initialization`?**
+- **Why does `diff-match-patch` connect `Network Queue Priority` to `Core Plugin Logic`, `Conflict Resolution UI`, `Package Configuration`?**
   _High betweenness centrality (0.089) - this node is a cross-community bridge._
 - **What connects `textEncoder`, `textDecoder`, `ServerClientEntry` to the rest of the system?**
   _105 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Core Plugin Logic` be split into smaller, more focused modules?**
-  _Cohesion score 0.13224489795918368 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.09413233458177278 - nodes in this community are weakly interconnected._
 - **Should `Types and Utilities` be split into smaller, more focused modules?**
-  _Cohesion score 0.05179982440737489 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.05110809588421529 - nodes in this community are weakly interconnected._
 - **Should `Conflict Resolution UI` be split into smaller, more focused modules?**
-  _Cohesion score 0.07956989247311828 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.06890756302521009 - nodes in this community are weakly interconnected._

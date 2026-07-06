@@ -6,13 +6,15 @@ import type ObsidianDecentralizedPlugin from './main';
 const HEARTBEAT_INTERVAL_MS = 5000;   // ping every 5 s
 const LIVENESS_TIMEOUT_MS   = 20000;  // declare dead after 20 s of silence
 
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 // Custom Framing Helpers
 function encodeMessage(msg: any): string | ArrayBuffer {
     if (msg.type === 'file-chunk-data' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
         const { data, ...header } = msg;
         const headerStr = JSON.stringify(header);
-        const encoder = new TextEncoder();
-        const headerBytes = encoder.encode(headerStr);
+        const headerBytes = textEncoder.encode(headerStr);
         const binaryData = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
         const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
         new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
@@ -22,8 +24,7 @@ function encodeMessage(msg: any): string | ArrayBuffer {
     } else if (msg.type === 'file-batch-binary' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
         const { data, ...header } = msg;
         const headerStr = JSON.stringify(header);
-        const encoder = new TextEncoder();
-        const headerBytes = encoder.encode(headerStr);
+        const headerBytes = textEncoder.encode(headerStr);
         const binaryData = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
         const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
         new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
@@ -33,8 +34,7 @@ function encodeMessage(msg: any): string | ArrayBuffer {
     } else if (msg.type === 'file-update' && msg.encoding === 'binary' && (msg.content instanceof ArrayBuffer || msg.content instanceof Uint8Array)) {
         const { content, ...header } = msg;
         const headerStr = JSON.stringify(header);
-        const encoder = new TextEncoder();
-        const headerBytes = encoder.encode(headerStr);
+        const headerBytes = textEncoder.encode(headerStr);
         const binaryData = msg.content instanceof Uint8Array ? msg.content : new Uint8Array(msg.content);
         const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
         new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
@@ -61,8 +61,7 @@ function decodeMessage(data: string | ArrayBuffer | Uint8Array | Blob): any {
     const view = new DataView(buffer);
     const headerLen = view.getUint32(0, true);
     const headerBytes = new Uint8Array(buffer, 4, headerLen);
-    const decoder = new TextDecoder();
-    const headerStr = decoder.decode(headerBytes);
+    const headerStr = textDecoder.decode(headerBytes);
     const header = JSON.parse(headerStr);
     const dataBuffer = buffer.slice(4 + headerLen);
 
@@ -472,11 +471,21 @@ export class DirectIpClient {
         
         while (this.sendBuffer.length > 0) {
             const data = this.sendBuffer.shift();
+            let encoded;
             try {
-                const encoded = encodeMessage(data);
+                encoded = encodeMessage(data);
+            } catch (e: any) {
+                this.plugin.log('DirectIpClient: Failed to encode message, dropping it.', e);
+                this.plugin.showNotice(`Failed to encode sync message: ${e.message}`, 'important');
+                if (data.transferId) {
+                    this.plugin.rejectPendingAck(data.transferId, `Encode failed: ${e.message}`);
+                }
+                continue;
+            }
+            try {
                 this.ws.send(encoded);
             } catch (e) {
-                this.sendBuffer.unshift(data); // Put it back on failure
+                this.sendBuffer.unshift(data); // Put it back on socket send failure
                 break;
             }
         }

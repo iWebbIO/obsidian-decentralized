@@ -671,9 +671,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (isFileChunkData || isFileBatchBinary) modifiedData.data = base64Data;
                 else modifiedData.content = base64Data;
                 modifiedData._wasBinary = true;
-                encoded = new TextEncoder().encode(JSON.stringify(modifiedData));
+                encoded = ObsidianDecentralizedPlugin.textEncoder.encode(JSON.stringify(modifiedData));
             } else {
-                encoded = new TextEncoder().encode(JSON.stringify(data));
+                encoded = ObsidianDecentralizedPlugin.textEncoder.encode(JSON.stringify(data));
             }
             const encrypted = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
             
@@ -696,7 +696,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const data = base64ToArrayBuffer(encryptedPayload.data);
             
             const decrypted = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, key, data);
-            const decoded = new TextDecoder().decode(decrypted);
+            const decoded = ObsidianDecentralizedPlugin.textDecoder.decode(decrypted);
             const parsed = JSON.parse(decoded);
             if (parsed._wasBinary) {
                 if (parsed.type === 'file-chunk-data' || parsed.type === 'file-batch-binary') {
@@ -1054,7 +1054,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         
                         if (!item.data) {
                             if (typeof content === 'string') {
-                                const encoded = new TextEncoder().encode(content);
+                                const encoded = ObsidianDecentralizedPlugin.textEncoder.encode(content);
                                 if (encoded.byteLength > this.getChunkSize()) {
                                     content = encoded.buffer;
                                     encoding = 'binary';
@@ -1089,7 +1089,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             }
                             
                             if (typeof content === 'string') {
-                                const encoded = new TextEncoder().encode(content);
+                                const encoded = ObsidianDecentralizedPlugin.textEncoder.encode(content);
                                 content = encoded;
                                 encoding = 'binary';
                             }
@@ -1391,6 +1391,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
 
             this.updateStatus();
+        }
+    }
+
+    rejectPendingAck(transferId: string, reason: string) {
+        if (this.pendingAcks.has(transferId)) {
+            this.pendingAcks.get(transferId)!.reject(new Error(reason));
+            this.pendingAcks.delete(transferId);
         }
     }
 
@@ -2041,6 +2048,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     private static textEncoder = new TextEncoder();
+    private static textDecoder = new TextDecoder();
     private static hexTable: string[] = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
 
     private async getHash(buffer: ArrayBuffer | string): Promise<string> {
@@ -2740,8 +2748,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) : 
                         fileData.content;
                 } else {
-                    const decoder = new TextDecoder();
-                    contentStr = decoder.decode(fileData.content);
+                    contentStr = ObsidianDecentralizedPlugin.textDecoder.decode(fileData.content);
                 }
 
                 await this.runLocked(fileData.path, async () => {

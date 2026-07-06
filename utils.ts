@@ -2,6 +2,9 @@
 import * as pako from 'pako';
 import { SyncError, SyncErrorCategory } from './types';
 
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 export function compressText(content: string): ArrayBuffer {
     try {
         const result = pako.deflate(content);
@@ -79,13 +82,12 @@ export interface PackedFile {
 
 export function packFilesToTLV(files: PackedFile[]): ArrayBuffer {
     try {
-        const encoder = new TextEncoder();
         let totalSize = 0;
         
         // Calculate total size first to avoid reallocations
         const encodedPaths: Uint8Array[] = [];
         for (const file of files) {
-            const pathEncoded = encoder.encode(file.path);
+            const pathEncoded = textEncoder.encode(file.path);
             encodedPaths.push(pathEncoded);
             // 2 (path len) + pathBytes + 8 (mtime) + 1 (isCompressed) + 1 (encoding) + 4 (content len) + contentBytes
             totalSize += 2 + pathEncoded.byteLength + 8 + 1 + 1 + 4 + file.content.byteLength;
@@ -130,7 +132,6 @@ export function packFilesToTLV(files: PackedFile[]): ArrayBuffer {
 
 export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
     try {
-        const decoder = new TextDecoder();
         const view = new DataView(buffer);
         const files: PackedFile[] = [];
         let offset = 0;
@@ -157,7 +158,7 @@ export function unpackTLVToFiles(buffer: ArrayBuffer): PackedFile[] {
                 );
             }
             const pathBytes = new Uint8Array(buffer, offset, pathLen);
-            const path = decoder.decode(pathBytes); offset += pathLen;
+            const path = textDecoder.decode(pathBytes); offset += pathLen;
             
             // 3. Check if we can read mtime (8 bytes), isCompressed (1 byte), encFlag (1 byte), and contentLen (4 bytes)
             if (offset + 14 > buffer.byteLength) {
