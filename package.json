@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "dev": "rollup --config rollup.config.mjs -w",
-    "build": "rollup --config rollup.config.mjs --environment BUILD:production"
+    "build": "rollup --config rollup.config.mjs --environment BUILD:production",
+    "test": "jest"
   },
   "keywords": [
     "obsidian-md",
@@ -29,11 +30,14 @@
     "@rollup/plugin-commonjs": "^24.0.1",
     "@rollup/plugin-node-resolve": "^15.0.1",
     "@rollup/plugin-typescript": "^11.0.0",
+    "@types/jest": "^30.0.0",
     "@types/node": "^18.14.6",
     "@types/qrcode": "^1.5.0",
     "@types/ws": "^8.18.1",
+    "jest": "^30.4.2",
     "obsidian": "latest",
     "rollup": "^3.18.0",
+    "ts-jest": "^29.4.11",
     "tslib": "^2.5.0",
     "typescript": "^4.9.5"
   }
