@@ -91,7 +91,11 @@ import {
     PackedFile
 } from './utils';
 
-
+import { TimeoutManager } from './src/utils/Timeouts';
+import { QueueManager } from './src/core/QueueManager';
+import { ConnectionManager } from './src/core/ConnectionManager';
+import { FileManager } from './src/core/FileManager';
+import { SyncEngine } from './src/core/SyncEngine';
 
 export default class ObsidianDecentralizedPlugin extends Plugin {
     settings: ObsidianDecentralizedSettings;
@@ -100,6 +104,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     clusterPeers: Map<string, PeerInfo> = new Map();
     lanDiscovery: ILANDiscovery;
     private fileLocks: Map<string, Promise<void>> = new Map();
+
+    // Architectural Managers
+    public timeoutManager: TimeoutManager;
+    public queueManager: QueueManager;
+    public connectionManager: ConnectionManager;
+    public fileManager: FileManager;
+    public syncEngine: SyncEngine;
+
 
     public syncState: SyncState = {
         isSyncing: false,
@@ -142,13 +154,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // Timeouts and Keep-alives
     private syncIdleTimeout: number | null = null;
     private syncKeepAliveInterval: number | null = null;
-
-    private syncQueue: { peerId: string | null, task?: SyncTask, data?: any, retries: number, priority: number }[] = [];
-    private activeQueueTransfers: number = 0;
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
     private currentConcurrency = 16;
-    private processingQueue = false;
     private currentChunkSize = 512 * 1024;
     private targetChunkSize = 512 * 1024;
     private successfulTransfersSinceLastIncrease = 0;
@@ -197,6 +205,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private debouncedEditorChange: (editor: any, info: any) => void;
 
     async onload() {
+        // Initialize Core Managers
+        this.timeoutManager = new TimeoutManager();
+        this.syncEngine = new SyncEngine(this.timeoutManager);
+        this.fileManager = new FileManager(this.app.vault);
+        this.connectionManager = new ConnectionManager(this.timeoutManager);
+        this.queueManager = new QueueManager(this.timeoutManager, async (item) => {
+            try {
+                await this.processQueueItem(item);
+                return true;
+            } catch (e) {
+                return false;
+            }
+        });
+
         if (Platform.isMobile) {
             this.lanDiscovery = new DummyLANDiscovery();
         } else {
@@ -251,21 +273,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.lanDiscovery.off('network-change', this.networkChangeHandler);
             this.networkChangeHandler = null;
         }
-        if (this.peerReconnectFallbackTimeout !== null) {
-            clearTimeout(this.peerReconnectFallbackTimeout);
-            this.peerReconnectFallbackTimeout = null;
-        }
+
         this.peer?.destroy();
         this.lanDiscovery.stop();
         this.directIpServer?.stop();
         this.directIpClient?.stop();
-        if (this.syncIdleTimeout) clearTimeout(this.syncIdleTimeout);
-        if (this.syncKeepAliveInterval) clearInterval(this.syncKeepAliveInterval);
-        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
-        if (this.clusterConnectionInterval) clearInterval(this.clusterConnectionInterval); // Fix: Clear cluster connection interval on unload
+
         this.activeTransfers.clear();
-        this.connections.clear(); // Fix: Clear connections map references
-        this.saveState(); // Fix: Force immediate save on unload instead of debounced delay
+        this.connections.clear(); 
+        
+        // Safely destroy all background timeouts and queue processes
+        this.queueManager.clear();
+        this.timeoutManager.clearAll();
+
+        this.saveState(); // Force immediate save on unload instead of debounced delay
     }
 
     // --- Core Two-Device Infrastructure ---
@@ -739,35 +760,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private addToQueue(peerId: string | null, data: SyncData) { 
         const priority = this.computePriority(data);
-        const item = { peerId, data, retries: 0, priority };
-        let low = 0, high = this.syncQueue.length;
-        while (low < high) {
-            const mid = (low + high) >>> 1;
-            if (this.syncQueue[mid].priority < priority) {
-                high = mid;
-            } else {
-                low = mid + 1;
-            }
-        }
-        this.syncQueue.splice(low, 0, item);
-        this.processQueue(); 
+        this.queueManager.addToQueue({ peerId, data, retries: 0, priority });
     }
     
     private addToQueueTask(peerId: string | null, task: SyncTask) { 
         const priority = this.computePriorityTask(task);
-        const item = { peerId, task, retries: 0, priority };
-        let low = 0, high = this.syncQueue.length;
-        while (low < high) {
-            const mid = (low + high) >>> 1;
-            if (this.syncQueue[mid].priority < priority) high = mid;
-            else low = mid + 1;
-        }
-        this.syncQueue.splice(low, 0, item);
-        this.processQueue(); 
+        this.queueManager.addToQueue({ peerId, task, retries: 0, priority });
     }
 
     public getQueuePressure(): number {
-        return Math.min(1, (this.syncQueue.length + this.activeQueueTransfers) / MAX_QUEUE_DEPTH);
+        return this.queueManager.getQueuePressure();
     }
 
     public transitionToPhase(newPhase: SyncPhase) {
@@ -844,7 +846,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.syncState.isSyncing = false;
         this.currentSyncIsTwoDeviceMode = null;
         this.syncDrainCallback = null;
-        this.syncQueue = [];
+        this.queueManager.clear();
         this.activeTransfers.clear();
         this.syncState.pendingPulls.clear();
         this.syncState.allowedPulls.clear();
@@ -946,33 +948,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     resetIdleTimeout() {
-        if (this.syncIdleTimeout) clearTimeout(this.syncIdleTimeout);
+        this.timeoutManager.clearTimeout(this.syncIdleTimeout);
         if (this.syncState.isSyncing) {
-            this.syncIdleTimeout = window.setTimeout(() => {
+            this.syncIdleTimeout = this.timeoutManager.setTimeout(() => {
                 this.abortSync(new SyncError(SyncErrorCategory.TIMEOUT_ERROR, "Sync idle timeout reached. Connection may have dropped.", false, "Check network connection."));
             }, this.settings.idleTimeoutMs || 30000);
         }
     }
 
     private processQueue() {
-        if (this.processingQueue) return;
-        this.processingQueue = true;
-        this.updateStatus();
-        while (this.activeQueueTransfers < this.getConcurrencyLimit() && this.syncQueue.length > 0) {
-            const item = this.syncQueue.shift();
-            if (item) {
-                this.activeQueueTransfers++;
-                this.processQueueItem(item).finally(() => {
-                    if (this.activeQueueTransfers > 0) this.activeQueueTransfers--;
-                    this.processQueue();
-                });
-            }
-        }
-        if (this.activeQueueTransfers === 0 && this.syncQueue.length === 0 && this.syncDrainCallback) {
-            this.syncDrainCallback();
+        this.queueManager.setConcurrencyLimit(this.getConcurrencyLimit());
+        if (this.syncDrainCallback) {
+            this.queueManager.setSyncDrainCallback(this.syncDrainCallback);
             this.syncDrainCallback = null;
         }
-        this.processingQueue = false;
+        this.queueManager.resume();
     }
 
     private async processQueueItem(item: { peerId: string | null, task?: SyncTask, data?: any, retries: number, priority: number }) {
@@ -1302,23 +1292,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 console.error(`Error processing queue item ${transferId}:`, e);
             }
             
-            if (item && item.retries < 3) {
-                this.log(`Retrying transfer ${transferId} (Attempt ${item.retries + 1}/3) with backoff`);
-                item.retries++;
-                const priority = item.priority;
-                
-                // Fix: Push back to the queue asynchronously after a 5-second backoff delay
-                setTimeout(() => {
-                    let low = 0, high = this.syncQueue.length;
-                    while (low < high) {
-                        const mid = (low + high) >>> 1;
-                        if (this.syncQueue[mid].priority < priority) high = mid;
-                        else low = mid + 1;
-                    }
-                    this.syncQueue.splice(low, 0, item);
-                    this.processQueue();
-                }, 5000);
-            } else if (item) {
+            // QueueManager handles the retry backoff safely now.
+            // We just need to record permanently failed syncs.
+            if (item && item.retries >= 3) {
                 const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : (item.task.taskType === 'send-file-batch' ? item.task.paths[0] : item.task.path)) : undefined;
                 const path = item.data?.path || taskPath || 'an item';
                 this.showNotice(`File transfer failed permanently for ${path}.`, 'error', 8000);
@@ -3715,8 +3691,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (count === 0 && this.activeTransfers.size > 0) return { text: "Transfers Paused", icon: "pause-circle", state: 'neutral' };
             return { text: `Syncing ${count} file${count > 1 ? 's' : ''}...`, icon: "arrow-up-down", spin: false, state: 'loading' };
         }
-        if (this.activeQueueTransfers > 0 || this.syncQueue.length > 0) {
-            const queueSize = this.syncQueue.length + this.activeQueueTransfers;
+        if (this.queueManager.getActiveTransfers() > 0 || this.queueManager.getQueueSize() > 0) {
+            const queueSize = this.queueManager.getQueueSize() + this.queueManager.getActiveTransfers();
             return { text: `Syncing (${queueSize} item${queueSize > 1 ? 's' : ''})`, icon: "hourglass", state: 'loading' };
         }
         if (this.getConnectionMode() === 'direct-ip') {
@@ -3752,7 +3728,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     updateStatus(customStatus?: SyncStatusState) {
         const now = Date.now();
-        const isIdle = this.activeTransfers.size === 0 && this.activeQueueTransfers === 0 && this.syncQueue.length === 0;
+        const isIdle = this.activeTransfers.size === 0 && this.queueManager.getActiveTransfers() === 0 && this.queueManager.getQueueSize() === 0;
         if (!customStatus && !isIdle && now - this.lastStatusUpdate < 200) return;
         this.lastStatusUpdate = now;
 
