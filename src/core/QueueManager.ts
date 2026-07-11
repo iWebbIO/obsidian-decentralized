@@ -92,9 +92,11 @@ export class QueueManager {
                     if (!success && item.retries < 3) {
                         item.retries++;
                         this.pendingRetries++;
-                        if (item.id) this.inQueueOrProcessing.delete(item.id);
+                        // Keep item.id in inQueueOrProcessing during the retry delay
+                        // to prevent duplicates from entering the queue in the window.
                         this.timeoutManager.setTimeout(() => {
                             this.pendingRetries--;
+                            if (item.id) this.inQueueOrProcessing.delete(item.id);
                             this.addToQueue(item);
                         }, 5000);
                     } else {

@@ -60,8 +60,8 @@ export class ConnectionModal extends Modal {
     }
 
     onClose() {
-        if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
-        if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
+        if (this.discoverListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('discover', this.discoverListener);
+        if (this.loseListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('lose', this.loseListener);
         this.contentEl.empty();
     }
 
@@ -256,7 +256,6 @@ export class ConnectionModal extends Modal {
 
         const myInfo = this.plugin.getMyPeerInfo();
         if (!myInfo || !myInfo.deviceId) {
-            contentEl.createEl('h2', { text: 'Quick Pair', cls: 'od-dashboard-header' });
             contentEl.createDiv({ text: 'Error: This device does not have a valid Device ID. Please check settings.', cls: 'mod-warning' });
             return;
         }
@@ -333,7 +332,7 @@ export class ConnectionModal extends Modal {
                         const card = lanList.createDiv({ cls: 'od-lan-card mod-clickable' });
                         card.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
                         card.createDiv({ text: Platform.isMobile ? 'Tap to connect' : 'Click to connect', cls: 'od-text-muted' });
-                        card.onclick = () => this.attemptConnection(peer.deviceId);
+                        card.onclick = () => this.attemptConnection(peer.deviceId + '|' + (this.activePsk || ''));
                     });
                 }
             };
@@ -495,7 +494,15 @@ export class QRScannerModal extends Modal {
     onClose() {
         const cleanup = () => {
             if (this.html5QrCode && this.html5QrCode.isScanning) {
-                this.html5QrCode.stop().then(() => this.html5QrCode?.clear()).catch(console.error);
+                this.html5QrCode.stop().then(() => {
+                    this.html5QrCode?.clear();
+                    this.contentEl.empty();
+                }).catch((err) => {
+                    console.error(err);
+                    this.contentEl.empty();
+                });
+            } else {
+                this.contentEl.empty();
             }
         };
         if (this.startPromise) {
@@ -503,7 +510,6 @@ export class QRScannerModal extends Modal {
         } else {
             cleanup();
         }
-        this.contentEl.empty();
     }
 }
 

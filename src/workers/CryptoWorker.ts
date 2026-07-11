@@ -6,7 +6,8 @@ self.addEventListener('message', async (event: MessageEvent) => {
 
     try {
         if (type === 'HASH') {
-            if (!data) throw new Error('HASH: data is required and must be a valid BufferSource');
+            if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data))
+                throw new Error('HASH: data must be an ArrayBuffer or TypedArray');
             const hashBuffer = await self.crypto.subtle.digest('SHA-256', data);
             const hashArray = new Uint8Array(hashBuffer);
             let hash = '';

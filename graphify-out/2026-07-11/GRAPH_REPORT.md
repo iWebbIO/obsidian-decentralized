@@ -1,18 +1,13 @@
-# Graph Report - obsidian-decentralized  (2026-07-11)
+# Graph Report - .  (2026-07-11)
 
 ## Corpus Check
-- 30 files · ~32,813 words
+- 22 files · ~32,760 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 521 nodes · 1260 edges · 37 communities (18 shown, 19 thin omitted)
+- 521 nodes · 1115 edges · 33 communities (14 shown, 19 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS
 - Token cost: 0 input · 0 output
-
-## Graph Freshness
-- Built from commit: `b0689961`
-- Run `git rev-parse HEAD` and compare to check if the graph is stale.
-- Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
 - [[_COMMUNITY_Main Plugin Controller|Main Plugin Controller]]
@@ -45,34 +40,30 @@
 - [[_COMMUNITY_Readme PeerJS|Readme PeerJS]]
 - [[_COMMUNITY_Readme Signaling Server|Readme Signaling Server]]
 - [[_COMMUNITY_Readme WebRTC|Readme WebRTC]]
-- [[_COMMUNITY_FileManager|FileManager]]
-- [[_COMMUNITY_.broadcastData|.broadcastData]]
-- [[_COMMUNITY_BinaryConflictResolutionModal|BinaryConflictResolutionModal]]
-- [[_COMMUNITY_QRScannerModal|QRScannerModal]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `ObsidianDecentralizedPlugin` - 161 edges
+1. `ObsidianDecentralizedPlugin` - 152 edges
 2. `TimeoutManager` - 19 edges
-3. `ConnectionModal` - 17 edges
-4. `DesktopLANDiscovery` - 16 edges
-5. `QueueManager` - 16 edges
-6. `compilerOptions` - 16 edges
-7. `DirectIpClient` - 15 edges
-8. `PeerInfo` - 13 edges
+3. `compilerOptions` - 16 edges
+4. `QueueManager` - 16 edges
+5. `ConnectionModal` - 16 edges
+6. `DirectIpClient` - 15 edges
+7. `DesktopLANDiscovery` - 14 edges
+8. `Obsidian Decentralized` - 12 edges
 9. `DirectIpServer` - 12 edges
-10. `ILANDiscovery` - 12 edges
+10. `ObsidianDecentralizedSettingTab` - 10 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `ObsidianDecentralizedPlugin` --references--> `DirectIpServer`  [EXTRACTED]
   main.ts → directip.ts
 - `ObsidianDecentralizedPlugin` --references--> `DirectIpClient`  [EXTRACTED]
   main.ts → directip.ts
-- `DesktopLANDiscovery` --references--> `PeerInfo`  [EXTRACTED]
-  discovery.ts → types.ts
 - `ObsidianDecentralizedPlugin` --references--> `ConnectionManager`  [EXTRACTED]
   main.ts → src/core/ConnectionManager.ts
 - `ObsidianDecentralizedPlugin` --references--> `FileManager`  [EXTRACTED]
   main.ts → src/core/FileManager.ts
+- `ObsidianDecentralizedPlugin` --references--> `QueueManager`  [EXTRACTED]
+  main.ts → src/core/QueueManager.ts
 
 ## Import Cycles
 - None detected.
@@ -80,26 +71,18 @@
 ## Hyperedges (group relationships)
 - **Performance Optimizations** — git_log_gethash_optimization, git_log_hash_cache_eviction, git_log_large_file_hashing, git_log_cached_read [INFERRED 0.95]
 
-## Communities (37 total, 19 thin omitted)
-
-### Community 0 - "Main Plugin Controller"
-Cohesion: 0.08
-Nodes (3): ObsidianDecentralizedPlugin, FileUpdatePayload, VersionVector
+## Communities (33 total, 19 thin omitted)
 
 ### Community 1 - "Type Definitions"
-Cohesion: 0.06
-Nodes (55): NOTE: lastSentContent eviction is handled by the 60-s cleanupPendingChunks inter, AckPayload, AdaptiveSyncConfig, BasePayload, BatchCompletePayload, BatchState, ClusterForgetPayload, ClusterGossipPayload (+47 more)
+Cohesion: 0.03
+Nodes (64): AckPayload, AdaptiveSyncConfig, BasePayload, BatchCompletePayload, BatchState, ClusterForgetPayload, ClusterGossipPayload, ClusterKickPayload (+56 more)
 
 ### Community 2 - "Core Managers and Utilities"
-Cohesion: 0.09
-Nodes (9): ConnectionManager, QueueItem, QueueManager, TODO: implement loadQueueFromDisk() using IndexedDB or vault adapter to survive, TODO: implement saveQueueToDisk() to persist queue state; call it on addToQueue/, TODO: call loadQueueFromDisk() here once IndexedDB persistence is implemented, SyncEngine, TimeoutManager (+1 more)
-
-### Community 3 - "UI and Connection Handling"
-Cohesion: 0.09
-Nodes (3): ObsidianDecentralizedSettingTab, SyncStatusState, ConnectionModal
+Cohesion: 0.06
+Nodes (19): NOTE: lastSentContent eviction is handled by the 60-s cleanupPendingChunks inter, ConnectionManager, FileManager, QueueItem, QueueManager, TODO: implement loadQueueFromDisk() using IndexedDB or vault adapter to survive, TODO: implement saveQueueToDisk() to persist queue state; call it on addToQueue/, TODO: call loadQueueFromDisk() here once IndexedDB persistence is implemented (+11 more)
 
 ### Community 4 - "Direct IP and Websockets"
-Cohesion: 0.09
+Cohesion: 0.08
 Nodes (10): decodeMessage(), DirectIpClient, DirectIpServer, encodeMessage(), ServerClientEntry, textDecoder, textEncoder, MockWebSocket (+2 more)
 
 ### Community 5 - "Package Config and Conflict UI"
@@ -107,12 +90,8 @@ Cohesion: 0.06
 Nodes (31): author, dependencies, diff-match-patch, html5-qrcode, pako, peerjs, qrcode, description (+23 more)
 
 ### Community 6 - "Modals and Conflict Center"
-Cohesion: 0.15
-Nodes (6): DEFAULT_SETTINGS, DiscoveryBeacon, PeerInfo, formatBytes(), SelectPeerModal, SyncProgressModal
-
-### Community 7 - "LAN Discovery"
-Cohesion: 0.11
-Nodes (3): DesktopLANDiscovery, DummyLANDiscovery, ILANDiscovery
+Cohesion: 0.08
+Nodes (7): BinaryConflictResolutionModal, ConflictCenter, ConflictListModal, formatBytes(), QRScannerModal, SelectPeerModal, SyncProgressModal
 
 ### Community 8 - "Documentation"
 Cohesion: 0.10
@@ -138,29 +117,25 @@ Nodes (7): assert(), assertEquals(), fs, Module, obsidian, path, runTests()
 Cohesion: 0.33
 Nodes (6): Use cachedRead, getHash Optimization, Map Insertion Order Eviction, Large File Stat Hashing, ObsidianDecentralizedPlugin, Rename Vector Cache Transfer
 
-### Community 19 - "Sync Error Types"
-Cohesion: 0.20
-Nodes (12): FileBatchBinaryPayload, SyncError, SyncErrorCategory, arrayBufferToBase64(), base64ToArrayBuffer(), compressText(), decompressText(), PackedFile (+4 more)
-
 ## Knowledge Gaps
-- **103 isolated node(s):** `Platform`, `textEncoder`, `textDecoder`, `ServerClientEntry`, `id` (+98 more)
+- **152 isolated node(s):** `id`, `name`, `version`, `minAppVersion`, `description` (+147 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **19 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `ObsidianDecentralizedPlugin` connect `Main Plugin Controller` to `Type Definitions`, `.broadcastData`, `UI and Connection Handling`, `Direct IP and Websockets`, `Package Config and Conflict UI`, `Core Managers and Utilities`, `FileManager`, `LAN Discovery`, `Modals and Conflict Center`, `Discovery Types`, `Sync Error Types`?**
-  _High betweenness centrality (0.347) - this node is a cross-community bridge._
+- **Why does `ObsidianDecentralizedPlugin` connect `Main Plugin Controller` to `Core Managers and Utilities`, `UI and Connection Handling`, `Direct IP and Websockets`, `Modals and Conflict Center`?**
+  _High betweenness centrality (0.285) - this node is a cross-community bridge._
 - **Why does `dependencies` connect `Package Config and Conflict UI` to `Direct IP and Websockets`?**
-  _High betweenness centrality (0.139) - this node is a cross-community bridge._
-- **Why does `diff-match-patch` connect `Package Config and Conflict UI` to `Main Plugin Controller`?**
-  _High betweenness centrality (0.127) - this node is a cross-community bridge._
-- **What connects `Platform`, `textEncoder`, `textDecoder` to the rest of the system?**
-  _112 weakly-connected nodes found - possible documentation gaps or missing edges._
+  _High betweenness centrality (0.112) - this node is a cross-community bridge._
+- **Why does `diff-match-patch` connect `Package Config and Conflict UI` to `Main Plugin Controller`, `UI and Connection Handling`?**
+  _High betweenness centrality (0.101) - this node is a cross-community bridge._
+- **What connects `id`, `name`, `version` to the rest of the system?**
+  _161 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Main Plugin Controller` be split into smaller, more focused modules?**
-  _Cohesion score 0.0822638333683989 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.08464912280701754 - nodes in this community are weakly interconnected._
 - **Should `Type Definitions` be split into smaller, more focused modules?**
-  _Cohesion score 0.05952380952380952 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.03076923076923077 - nodes in this community are weakly interconnected._
 - **Should `Core Managers and Utilities` be split into smaller, more focused modules?**
-  _Cohesion score 0.08858858858858859 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.05902980713033314 - nodes in this community are weakly interconnected._

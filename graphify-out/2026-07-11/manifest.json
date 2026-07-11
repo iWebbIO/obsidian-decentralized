@@ -15,14 +15,14 @@
     "semantic_hash": "3657b1940e228654cf3d5cf30847cce2"
   },
   "manifest.json": {
-    "mtime": 1783791300.3458657,
-    "ast_hash": "8a0c7c7c0beb718a6a903d1d0a87e796",
-    "semantic_hash": ""
+    "mtime": 1782749654.0145237,
+    "ast_hash": "cbc29ff6f26f1c7fea08dc4e3766e6d8",
+    "semantic_hash": "cbc29ff6f26f1c7fea08dc4e3766e6d8"
   },
   "package.json": {
-    "mtime": 1783791300.3598683,
-    "ast_hash": "855db1e2ce50eeabfd7914dffb4e37fd",
-    "semantic_hash": ""
+    "mtime": 1783334608.2958405,
+    "ast_hash": "baf62527dda40e2da1cb44f55bd62b53",
+    "semantic_hash": "baf62527dda40e2da1cb44f55bd62b53"
   },
   "rollup.config.mjs": {
     "mtime": 1781612320.9168494,
@@ -50,9 +50,9 @@
     "semantic_hash": "d8748047c92da283636d90bd1742233e"
   },
   "ui.ts": {
-    "mtime": 1783802952.32023,
-    "ast_hash": "1e31160e6a010339274a604771219ae3",
-    "semantic_hash": ""
+    "mtime": 1783776310.804382,
+    "ast_hash": "0236d7eb4a5cb6d2f8c807a363baed3d",
+    "semantic_hash": "0236d7eb4a5cb6d2f8c807a363baed3d"
   },
   "utils.ts": {
     "mtime": 1783776405.133741,
@@ -115,9 +115,9 @@
     "semantic_hash": "1910b3648e0f809c63c36229c0fa3771"
   },
   "src/core/ConnectionManager.ts": {
-    "mtime": 1783802902.230818,
-    "ast_hash": "76b0ca2038efab4b8c73ad15f47265c1",
-    "semantic_hash": ""
+    "mtime": 1783784606.86618,
+    "ast_hash": "7efaf5f5a49615b71e6f69a87f61d149",
+    "semantic_hash": "7efaf5f5a49615b71e6f69a87f61d149"
   },
   "src/core/FileManager.ts": {
     "mtime": 1783776065.8610566,
@@ -130,9 +130,9 @@
     "semantic_hash": "0a4bdad06ff821f580ef09647fe0f0c2"
   },
   "src/core/QueueManager.ts": {
-    "mtime": 1783802898.2034273,
-    "ast_hash": "4ea3ddfc0a13d286cde397c23706c283",
-    "semantic_hash": ""
+    "mtime": 1783775689.072916,
+    "ast_hash": "0a3ce110b4384f0b16b1e5a149ab4021",
+    "semantic_hash": "0a3ce110b4384f0b16b1e5a149ab4021"
   },
   "src/core/SyncEngine.test.ts": {
     "mtime": 1783777812.9457426,
@@ -150,9 +150,9 @@
     "semantic_hash": "9d60f9bd1177e2b95c481de64d804c91"
   },
   "src/workers/CryptoWorker.ts": {
-    "mtime": 1783802902.3000588,
-    "ast_hash": "b1b491405411b4664f55c7dacae09b35",
-    "semantic_hash": ""
+    "mtime": 1783784730.248381,
+    "ast_hash": "c2f8a3f4639ebfc63c34b9206aab55d9",
+    "semantic_hash": "c2f8a3f4639ebfc63c34b9206aab55d9"
   },
   "utils.test.ts": {
     "mtime": 1783334587.8859103,

@@ -32,6 +32,8 @@ export class ConnectionManager {
                     isResolved = true;
                     this.timeoutManager.clearTimeout(timeoutId);
                     dc.onbufferedamountlow = oldHandler;
+                    // Invoke the old handler so it doesn't miss this drain event
+                    if (typeof oldHandler === 'function') oldHandler();
                     resolve();
                 }
             };
