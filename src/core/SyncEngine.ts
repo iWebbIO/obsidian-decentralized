@@ -1,12 +1,5 @@
 import { TimeoutManager } from '../utils/Timeouts';
-
-export enum SyncPhase {
-    IDLE = 'IDLE',
-    REQUESTING = 'REQUESTING',
-    PLANNING = 'PLANNING',
-    TRANSFERRING = 'TRANSFERRING',
-    COMPLETING = 'COMPLETING'
-}
+import { SyncPhase } from '../../types';
 
 export class SyncEngine {
     private currentPhase: SyncPhase = SyncPhase.IDLE;

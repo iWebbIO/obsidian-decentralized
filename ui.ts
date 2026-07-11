@@ -68,7 +68,7 @@ export class ConnectionModal extends Modal {
     injectStyles() {
         const styleId = 'obsidian-decentralized-styles';
         const existing = document.getElementById(styleId);
-        if (existing) existing.remove();
+        if (existing) return;
         const style = document.createElement('style');
         style.id = styleId;
         style.innerHTML = `
@@ -474,6 +474,7 @@ export class ConnectionModal extends Modal {
 
 export class QRScannerModal extends Modal {
     private html5QrCode: Html5Qrcode | null = null;
+    private startPromise: Promise<any> | null = null;
     constructor(app: App, private onScan: (text: string) => void) { super(app); }
     
     onOpen() {
@@ -483,7 +484,7 @@ export class QRScannerModal extends Modal {
         contentEl.createDiv({ attr: { id: readerId } });
         
         this.html5QrCode = new Html5Qrcode(readerId);
-        (this.html5QrCode as any)._startPromise = this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
+        this.startPromise = this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
             this.onScan(decodedText);
             this.close();
         }, () => {}).catch(err => {
@@ -497,9 +498,8 @@ export class QRScannerModal extends Modal {
                 this.html5QrCode.stop().then(() => this.html5QrCode?.clear()).catch(console.error);
             }
         };
-        const startPromise = (this.html5QrCode as any)?._startPromise;
-        if (startPromise) {
-            startPromise.then(cleanup).catch(console.error);
+        if (this.startPromise) {
+            this.startPromise.then(cleanup).catch(console.error);
         } else {
             cleanup();
         }
@@ -651,7 +651,7 @@ export class ConflictListModal extends Modal {
                     }).open();
                 }
             } catch (e) {
-                new Notice('Failed to read conflict files: ' + e.message);
+                new Notice('Failed to read conflict files: ' + (e instanceof Error ? e.message : String(e)));
                 this.conflictCenter.resolveConflict(originalPath);
             }
         }
@@ -672,7 +672,15 @@ export class ConflictResolutionModal extends Modal {
         const diff = dmp.diff_main(this.localContent, this.remoteContent);
         dmp.diff_cleanupSemantic(diff);
         const diffEl = contentEl.createDiv({ cls: 'obsidian-decentralized-diff-view' });
-        diffEl.innerHTML = dmp.diff_prettyHtml(diff);
+        for (const [op, text] of diff) {
+            const span = diffEl.createSpan();
+            span.setText(text);
+            if (op === 1) span.style.background = '#e6ffed';
+            if (op === -1) {
+                span.style.background = '#ffeef0';
+                span.style.textDecoration = 'line-through';
+            }
+        }
         new Setting(contentEl)
             .addButton(btn => btn.setButtonText('Keep My Version').onClick(() => {
                 this.onResolve(this.localContent);

@@ -21,7 +21,6 @@ import {
     MIN_CHUNK_SIZE,
     MAX_CHUNK_SIZE,
     MAX_BANDWIDTH_SAMPLES,
-    MAX_QUEUE_DEPTH,
     LOCK_EXPIRATION_MS,
     MAX_HASH_CACHE_SIZE,
     REQUESTING_TIMEOUT,
@@ -193,6 +192,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private peerFileSizes: Record<string, number> = {};
     private localSyncComplete: Map<string, boolean> = new Map();
     private peerSyncComplete: Map<string, boolean> = new Map();
+    // Cached parsed folder filters — invalidated on settings change to avoid re-parsing on every vault event
+    private _cachedExcludedFolders: string[] | null = null;
+    private _cachedIncludedFolders: string[] | null = null;
     
     // File Locking State
     public heldLocks: Map<string, { peerId: string, expiresAt: number }> = new Map();
@@ -363,15 +365,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
 
-        const computeHashes = async (node: MerkleNode): Promise<string> => {
-            if (!node.children || Object.keys(node.children).length === 0) return node.hash;
-            const childKeys = Object.keys(node.children).sort();
-            let combined = '';
-            for (const k of childKeys) {
-                combined += await computeHashes(node.children[k]);
+        const computeHashes = async (root: MerkleNode): Promise<string> => {
+            // Iterative post-order traversal — prevents stack overflow on deeply nested vaults
+            const stack: Array<{ node: MerkleNode; phase: 'push' | 'process' }> = [{ node: root, phase: 'push' }];
+            while (stack.length > 0) {
+                const entry = stack.pop()!;
+                if (entry.phase === 'process') {
+                    const node = entry.node;
+                    if (node.children && Object.keys(node.children).length > 0) {
+                        const childKeys = Object.keys(node.children).sort();
+                        let combined = '';
+                        for (const k of childKeys) combined += node.children[k].hash;
+                        node.hash = await this.getHash(combined);
+                    }
+                } else {
+                    stack.push({ node: entry.node, phase: 'process' });
+                    if (entry.node.children) {
+                        for (const child of Object.values(entry.node.children)) {
+                            stack.push({ node: child, phase: 'push' });
+                        }
+                    }
+                }
             }
-            node.hash = await this.getHash(combined);
-            return node.hash;
+            return root.hash;
         };
 
         await computeHashes(tree);
@@ -382,34 +398,41 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     // --- State Management ---
     async loadState() {
-        if (await this.app.vault.adapter.exists(this.statePath)) {
+        const bakPath = this.statePath + '.bak';
+        const tryLoad = async (path: string): Promise<any | null> => {
             try {
-                const stateStr = await this.app.vault.adapter.read(this.statePath);
-                const state = JSON.parse(stateStr);
-                if (state.activeTransfers) {
-                    for (const t of state.activeTransfers) {
-                        this.activeTransfers.set(t.id, { ...t, status: 'paused' });
-                    }
-                    this.updateStatus();
-                }
-                if (state.failedSyncs) {
-                    this.failedSyncs = state.failedSyncs;
-                }
-                if (state.tombstones) {
-                    this.tombstones = state.tombstones;
-                }
-                if (state.twoDeviceState) {
-                    this.twoDeviceState = state.twoDeviceState;
-                    if (!this.twoDeviceState.fileVersions) this.twoDeviceState.fileVersions = {};
-                }
-                if (state.syncedHashes) {
-                    const entries = Object.entries(state.syncedHashes);
-                    for (const [p, d] of entries) {
-                        this.syncedHashes.set(p, d as any);
-                    }
+                if (await this.app.vault.adapter.exists(path)) {
+                    return JSON.parse(await this.app.vault.adapter.read(path));
                 }
             } catch (e) {
-                console.error("Failed to load state", e);
+                console.error(`Failed to parse state from ${path}:`, e);
+            }
+            return null;
+        };
+
+        let state = await tryLoad(this.statePath);
+        if (!state) {
+            console.warn('Primary state.json failed — attempting backup recovery...');
+            state = await tryLoad(bakPath);
+            if (state) this.showNotice('Recovered sync state from backup (state.json.bak).', 'warning');
+        }
+        if (!state) return;
+
+        if (state.activeTransfers) {
+            for (const t of state.activeTransfers) {
+                this.activeTransfers.set(t.id, { ...t, status: 'paused' });
+            }
+            this.updateStatus();
+        }
+        if (state.failedSyncs) this.failedSyncs = state.failedSyncs;
+        if (state.tombstones) this.tombstones = state.tombstones;
+        if (state.twoDeviceState) {
+            this.twoDeviceState = state.twoDeviceState;
+            if (!this.twoDeviceState.fileVersions) this.twoDeviceState.fileVersions = {};
+        }
+        if (state.syncedHashes) {
+            for (const [p, d] of Object.entries(state.syncedHashes)) {
+                this.syncedHashes.set(p, d as any);
             }
         }
     }
@@ -422,7 +445,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             tombstones: this.tombstones,
             syncedHashes: Object.fromEntries(this.syncedHashes)
         };
-        await this.app.vault.adapter.write(this.statePath, JSON.stringify(state, null, 2));
+        const json = JSON.stringify(state, null, 2);
+        const tmpPath = this.statePath + '.tmp';
+        const bakPath = this.statePath + '.bak';
+        try {
+            // Stage into .tmp first so a mid-write crash doesn't corrupt the main file
+            await this.app.vault.adapter.write(tmpPath, json);
+            // Snapshot the last-known-good state before overwriting
+            if (await this.app.vault.adapter.exists(this.statePath)) {
+                const prev = await this.app.vault.adapter.read(this.statePath);
+                await this.app.vault.adapter.write(bakPath, prev);
+            }
+            await this.app.vault.adapter.write(this.statePath, json);
+            if (await this.app.vault.adapter.exists(tmpPath)) {
+                await this.app.vault.adapter.remove(tmpPath);
+            }
+        } catch (e) {
+            console.error('Failed to save state:', e);
+        }
     }
     
     updateHashCache(path: string, hash: string) {
@@ -453,6 +493,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async loadSettings() { 
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); 
+        // Invalidate folder filter caches whenever settings are (re-)loaded
+        this._cachedExcludedFolders = null;
+        this._cachedIncludedFolders = null;
         if (!this.settings.deviceId) {
             this.settings.deviceId = `device-${Array.from(window.crypto.getRandomValues(new Uint8Array(4))).map(b => b.toString(16).padStart(2, '0')).join('')}`;
             await this.saveData(this.settings);
@@ -463,7 +506,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, p));
         }
     }
-    async saveSettings() { await this.saveData(this.settings); }
+    async saveSettings() { 
+        await this.saveData(this.settings);
+        // Invalidate folder filter caches so isPathSyncable picks up the new values immediately
+        this._cachedExcludedFolders = null;
+        this._cachedIncludedFolders = null;
+    }
     async saveKnownPeers() { this.settings.knownPeers = Array.from(this.clusterPeers.values()); await this.saveSettings(); }
 
     public updateDebounceDelay() {
@@ -704,8 +752,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 data: arrayBufferToBase64(encrypted)
             };
         } catch (e) {
-            this.log("Encryption failed, falling back to plaintext", e);
-            return data;
+            // Never fall back to plaintext — throw so the caller can surface the error and halt the send
+            this.log("Encryption failed", e);
+            throw new Error(`Encryption failed: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 
@@ -983,18 +1032,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             this.syncState.currentFile = file.path;
                             this.syncState.currentFileSize = file.stat.size;
                         }
-                        const now = Date.now();
-                        const MAX_SENT_CONTENT_CACHE = 200;
-                        for (const [p, cacheData] of this.lastSentContent.entries()) {
-                            if (now - cacheData.timestamp > 10 * 60 * 1000) this.lastSentContent.delete(p);
-                        }
-                        // Evict oldest entries if cache exceeds size limit
-                        if (this.lastSentContent.size > MAX_SENT_CONTENT_CACHE) {
-                            const sorted = Array.from(this.lastSentContent.entries()).sort((a, b) => a[1].timestamp - b[1].timestamp);
-                            const toEvict = sorted.slice(0, this.lastSentContent.size - MAX_SENT_CONTENT_CACHE);
-                            for (const [p] of toEvict) this.lastSentContent.delete(p);
-                        }
-                        
+                        // NOTE: lastSentContent eviction is handled by the 60-s cleanupPendingChunks interval
                         let content: string | ArrayBuffer = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
                         let encoding: 'utf8' | 'binary' | 'base64' = this.isBinary(file.extension) ? 'binary' : 'utf8';
                         let hash = '';
@@ -2031,11 +2069,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const data = typeof buffer === 'string' ? ObsidianDecentralizedPlugin.textEncoder.encode(buffer) : buffer;
         const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
         const hashArray = new Uint8Array(hashBuffer);
-        let hash = '';
-        for (let i = 0; i < hashArray.length; i++) {
-            hash += ObsidianDecentralizedPlugin.hexTable[hashArray[i]];
-        }
-        return hash;
+        return Array.from(hashArray).map(b => ObsidianDecentralizedPlugin.hexTable[b]).join('');
     }
 
     // --- Locking Handlers ---
@@ -2321,7 +2355,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.log(`Finished sending all chunks for ${path} to ${peerId}. Waiting for ack.`);
     }
 
-    handleFileChunkStart(payload: FileChunkStartPayload, conn: DataConnection | null) { 
+    handleFileChunkStart(payload: FileChunkStartPayload, conn: DataConnection | null) {
+        // Guard: reject transfer if claimed total size exceeds the 512 MB reassembly cap
+        const MAX_REASSEMBLY_SIZE = 512 * 1024 * 1024;
+        if (payload.totalChunks > MAX_REASSEMBLY_SIZE / MAX_CHUNK_SIZE) {
+            this.log(`Rejecting chunked transfer for ${payload.path}: totalChunks (${payload.totalChunks}) would exceed max reassembly size.`);
+            return;
+        }
         this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, receivedCount: 0, lastUpdated: Date.now(), fileHash: payload.fileHash || '', compressed: payload.compressed, versionVector: payload.versionVector }); 
         this.activeTransfers.set(payload.transferId, {
             id: payload.transferId,
@@ -2414,9 +2454,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (now - transfer.lastUpdate > 60000) { 
                 this.log(`Cleaning up stale active transfer: ${id}`);
                 this.activeTransfers.delete(id);
-                // Clean up any associated pending ACK to prevent unhandled rejections
+                // Reject (not resolve) the pending ACK — resolving would falsely signal success to the sender
                 if (this.pendingAcks.has(id)) {
-                    this.pendingAcks.get(id)!.resolve();
+                    this.pendingAcks.get(id)!.reject(new Error('Transfer timed out and was cleaned up'));
                     this.pendingAcks.delete(id);
                 }
                 statusChanged = true;
@@ -2424,6 +2464,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         
         this.pruneTombstones();
+
+        // Evict stale and excess entries from lastSentContent cache (moved here from the per-item hot path)
+        const MAX_SENT_CONTENT_CACHE = 200;
+        const contentCacheTtl = 10 * 60 * 1000; // 10 minutes
+        for (const [p, cacheData] of this.lastSentContent.entries()) {
+            if (now - cacheData.timestamp > contentCacheTtl) this.lastSentContent.delete(p);
+        }
+        if (this.lastSentContent.size > MAX_SENT_CONTENT_CACHE) {
+            const sorted = Array.from(this.lastSentContent.entries()).sort((a, b) => a[1].timestamp - b[1].timestamp);
+            for (const [p] of sorted.slice(0, this.lastSentContent.size - MAX_SENT_CONTENT_CACHE)) {
+                this.lastSentContent.delete(p);
+            }
+        }
+
         if (statusChanged) this.updateStatus();
     }
 
@@ -2720,9 +2774,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                 } else if (fileData.encoding === 'base64') {
                     // For Base64 encoded ArrayBuffers (fallback/DirectIP)
-                    contentBuf = fileData.content instanceof Uint8Array ? 
-                        fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) : 
-                        fileData.content;
+                    contentBuf = typeof fileData.content === 'string' ? base64ToArrayBuffer(fileData.content) : 
+                        (fileData.content instanceof Uint8Array ? 
+                            fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) : 
+                            fileData.content);
                 } else {
                     contentStr = ObsidianDecentralizedPlugin.textDecoder.decode(fileData.content);
                 }
@@ -2730,6 +2785,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await this.runLocked(fileData.path, async () => {
                     const existingFile = this.app.vault.getAbstractFileByPath(fileData.path);
                     if (existingFile instanceof TFile) {
+                        this.ignoreNextEventForPath(fileData.path);
                         if (contentBuf) {
                             await this.app.vault.modifyBinary(existingFile, contentBuf);
                         } else {
@@ -2743,9 +2799,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             currentPath += (i > 0 ? '/' : '') + pathParts[i];
                             const folder = this.app.vault.getAbstractFileByPath(currentPath);
                             if (!folder) {
-                                await this.app.vault.createFolder(currentPath);
+                                try {
+                                    await this.app.vault.createFolder(currentPath);
+                                } catch (e) { /* Ignore if created concurrently */ }
                             }
                         }
+                        this.ignoreNextEventForPath(fileData.path);
                         if (contentBuf) {
                             await this.app.vault.createBinary(fileData.path, contentBuf);
                         } else {
@@ -2775,7 +2834,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return results;
     }
 
-    async createConflictFile(data: FileUpdatePayload) { const conflictPath = this.getConflictPath(data.path); this.ignoreNextEventForPath(conflictPath); if (data.encoding === 'binary' || data.encoding === 'base64') { await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer); } else { await this.app.vault.create(conflictPath, data.content as string); } this.conflictCenter.addConflict(data.path, conflictPath); }
+    async createConflictFile(data: FileUpdatePayload) {
+        const conflictPath = this.getConflictPath(data.path);
+        this.ignoreNextEventForPath(conflictPath);
+        const folderPath = conflictPath.substring(0, conflictPath.lastIndexOf('/'));
+        if (folderPath) await this.ensureFolderExists(folderPath);
+        if (data.encoding === 'binary' || data.encoding === 'base64') {
+            await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer);
+        } else {
+            await this.app.vault.create(conflictPath, data.content as string);
+        }
+        this.conflictCenter.addConflict(data.path, conflictPath);
+    }
 
     async applyFileDelete(data: FileDeletePayload) {
         if (!this.isPathSyncable(data.path)) return;
@@ -3240,9 +3310,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 });
             }
             
+            const receiverWillSendSet = new Set(data.filesReceiverWillSend);
             for (const [path, size] of Object.entries(data.fileSizes)) {
                 this.peerFileSizes[path] = size;
-                if (data.filesReceiverWillSend.includes(path)) this.syncState.bytesTotal += size;
+                if (receiverWillSendSet.has(path)) this.syncState.bytesTotal += size;
             }
             
             this.syncState.allowedPulls = new Set(data.filesInitiatorMustSend);
@@ -3416,7 +3487,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.syncState.inFlightPulls) this.syncState.inFlightPulls = new Set();
         
         while (this.syncState.activePullBatches.size < this.syncState.adaptiveConfig.maxActiveBatches) {
-            const availablePending = Array.from(pending).filter(p => !this.syncState.inFlightPulls.has(p));
+            // Avoid Array.from().filter() intermediate allocations — iterate the Set directly
+            const inFlight = this.syncState.inFlightPulls;
+            const availablePending: string[] = [];
+            for (const p of pending) {
+                if (!inFlight.has(p)) availablePending.push(p);
+            }
             if (availablePending.length === 0) {
                 if (this.syncState.activePullBatches.size === 0) {
                     this.checkFullSyncCompletion(peerId);
@@ -3536,8 +3612,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     private isPathSyncable(path: string): boolean {
-        const excluded = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
-        if (excluded.length > 0 && excluded.some(p => path.startsWith(p))) { return false; }
+        // Use cached arrays to avoid re-parsing on every vault event (invalidated on settings change)
+        if (this._cachedExcludedFolders === null) {
+            this._cachedExcludedFolders = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
+        }
+        if (this._cachedExcludedFolders.length > 0 && this._cachedExcludedFolders.some(p => path.startsWith(p))) { return false; }
 
         if (path.startsWith('.obsidian/')) {
             if (this.settings.syncMode === 'auto') {
@@ -3549,8 +3628,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         if (this.settings.syncMode === 'manual' || this.settings.syncMode === 'advanced') {
-            const included = this.settings.includedFolders.split('\n').map(p => p.trim()).filter(Boolean);
-            if (included.length > 0 && !included.some(p => path.startsWith(p))) { return false; }
+            if (this._cachedIncludedFolders === null) {
+                this._cachedIncludedFolders = this.settings.includedFolders.split('\n').map(p => p.trim()).filter(Boolean);
+            }
+            if (this._cachedIncludedFolders.length > 0 && !this._cachedIncludedFolders.some(p => path.startsWith(p))) { return false; }
         }
         return true;
     }
@@ -3571,7 +3652,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     private shouldIgnoreEvent(path: string): boolean { const ignoreUntil = this.ignoreEvents.get(path); if (ignoreUntil && Date.now() < ignoreUntil) { return true; } this.ignoreEvents.delete(path); return false; }
     public ignoreNextEventForPath(path: string, durationMs = 2000) { this.ignoreEvents.set(path, Date.now() + durationMs); }
-    getConflictPath(originalPath: string): string { const extension = originalPath.split('.').pop() || ''; const base = originalPath.substring(0, originalPath.lastIndexOf('.')); const date = new Date().toISOString().split('T')[0]; return `${base} (conflict on ${date}).${extension}`; }
+    getConflictPath(originalPath: string): string {
+        const date = new Date().toISOString().split('T')[0];
+        const lastDot = originalPath.lastIndexOf('.');
+        const lastSlash = originalPath.lastIndexOf('/');
+        if (lastDot > lastSlash) {
+            // Has a file extension
+            const base = originalPath.substring(0, lastDot);
+            const extension = originalPath.substring(lastDot + 1);
+            return `${base} (conflict on ${date}).${extension}`;
+        }
+        // No extension (e.g. README, Makefile)
+        return `${originalPath} (conflict on ${date})`;
+    }
     getLocalIp(): string | null { if (Platform.isMobile) return null; try { const os = require('os'); const interfaces = os.networkInterfaces(); for (const name in interfaces) { for (const net of interfaces[name]!) { if (net.family === 'IPv4' && !net.internal) return net.address; } } } catch (e) { console.warn("Could not get local IP address.", e); } return null; }
     getMyPeerInfo(): PeerInfo {
         const mode = this.getConnectionMode();

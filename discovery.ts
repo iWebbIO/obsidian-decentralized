@@ -26,8 +26,11 @@ export class DesktopLANDiscovery implements ILANDiscovery {
     private socketRestartAttempts: number = 0;
     private maxSocketRestartAttempts: number = 5;
     private restartTimeout: number | null = null;
+    private isRestarting: boolean = false;
     
     private onNetworkChange = () => {
+        if (this.isRestarting) return;
+        this.isRestarting = true;
         console.log('Network interface change detected, restarting LAN discovery...');
         const wasBroadcasting = this.broadcastTimer !== null;
         this.stop();
@@ -39,10 +42,11 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         }
         // Forward the event so the plugin can respond (Phase 3.2)
         this.emit('network-change');
+        this.isRestarting = false;
     };
 
     private setupNetworkChangeListeners() {
-        if (!this.hasNetworkListeners) {
+        if (!this.hasNetworkListeners && typeof window !== 'undefined') {
             window.addEventListener('online', this.onNetworkChange);
             window.addEventListener('offline', this.onNetworkChange);
             this.hasNetworkListeners = true;
@@ -160,14 +164,15 @@ export class DesktopLANDiscovery implements ILANDiscovery {
                     data.peerInfo.ip = rinfo.address;
                     this.discoveredPeers.set(peerId, data.peerInfo);
                     if (isNew) {
+                        this.currentBroadcastIntervalMs = 2000;
                         this.emit('discover', data.peerInfo);
                     }
 
-                    const timeout = window.setTimeout(() => {
+                    const timeout = setTimeout(() => {
                         this.discoveredPeers.delete(peerId);
                         this.peerTimeouts.delete(peerId);
                         this.emit('lose', data.peerInfo);
-                    }, this.discoveryTimeoutMs);
+                    }, this.discoveryTimeoutMs) as any as number;
                     this.peerTimeouts.set(peerId, timeout);
                 }
             } catch (e: any) {
@@ -184,16 +189,16 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         this.stopBroadcasting();
         this.createSocket();
 
-        const beaconMessage = JSON.stringify({
-            type: 'obsidian-decentralized-beacon',
-            peerInfo
-        });
-
         this.currentBroadcastIntervalMs = 2000;
         this.consecutiveErrors = 0;
 
-        const beaconBuffer = Buffer.from(beaconMessage);
         const sendBeacon = () => {
+            if (!this.lastPeerInfo) return;
+            const beaconMessage = JSON.stringify({
+                type: 'obsidian-decentralized-beacon',
+                peerInfo: this.lastPeerInfo
+            });
+            const beaconBuffer = Buffer.from(beaconMessage);
             this.socket?.send(beaconBuffer, 0, beaconBuffer.length, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS, (err: Error | null) => {
                 if (err) {
                     this.consecutiveErrors++;
@@ -209,7 +214,7 @@ export class DesktopLANDiscovery implements ILANDiscovery {
             if (this.currentBroadcastIntervalMs < 15000) {
                 this.currentBroadcastIntervalMs += 1000;
             }
-            this.broadcastTimer = window.setTimeout(sendBeacon, this.currentBroadcastIntervalMs);
+            this.broadcastTimer = setTimeout(sendBeacon, this.currentBroadcastIntervalMs) as any as number;
         };
         sendBeacon();
     }
@@ -233,7 +238,7 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         }
         this.socketRestartAttempts = 0;
 
-        if (this.hasNetworkListeners) {
+        if (this.hasNetworkListeners && typeof window !== 'undefined') {
             window.removeEventListener('online', this.onNetworkChange);
             window.removeEventListener('offline', this.onNetworkChange);
             this.hasNetworkListeners = false;

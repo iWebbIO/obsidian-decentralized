@@ -1,6 +1,7 @@
 import { TimeoutManager } from '../utils/Timeouts';
 
 export interface QueueItem {
+    id?: string;
     peerId: string | null;
     task?: any;
     data?: any;
@@ -11,7 +12,8 @@ export interface QueueItem {
 export class QueueManager {
     private syncQueue: QueueItem[] = [];
     private activeQueueTransfers: number = 0;
-    private processingQueue: boolean = false;
+    private pendingRetries: number = 0;
+    private inQueueOrProcessing: Set<string> = new Set();
     private maxConcurrency: number = 3;
     private timeoutManager: TimeoutManager;
     private processCallback: (item: QueueItem) => Promise<boolean>;
@@ -24,7 +26,7 @@ export class QueueManager {
     ) {
         this.timeoutManager = timeoutManager;
         this.processCallback = processCallback;
-        this.loadQueueFromDisk(); // Basic persistence stub
+        // TODO: call loadQueueFromDisk() here once IndexedDB persistence is implemented
     }
 
     public setConcurrencyLimit(limit: number) {
@@ -46,11 +48,16 @@ export class QueueManager {
 
     public clear() {
         this.syncQueue = [];
-        this.activeQueueTransfers = 0;
-        this.saveQueueToDisk();
+        this.inQueueOrProcessing.clear();
+        // Do not reset activeQueueTransfers; let in-flight items finish naturally
     }
 
     public addToQueue(item: QueueItem) {
+        if (item.id) {
+            if (this.inQueueOrProcessing.has(item.id)) return;
+            this.inQueueOrProcessing.add(item.id);
+        }
+        
         let low = 0, high = this.syncQueue.length;
         while (low < high) {
             const mid = (low + high) >>> 1;
@@ -61,7 +68,6 @@ export class QueueManager {
             }
         }
         this.syncQueue.splice(low, 0, item);
-        this.saveQueueToDisk();
         this.processQueue();
     }
 
@@ -74,52 +80,45 @@ export class QueueManager {
     public getActiveTransfers(): number { return this.activeQueueTransfers; }
 
     private processQueue() {
-        if (this.processingQueue || this.queueIsPaused) return;
-        this.processingQueue = true;
-
+        if (this.queueIsPaused) return;
+        // Drain the queue up to the concurrency limit. Since JS is single-threaded,
+        // this loop runs atomically — no re-entry can occur before the while exits.
         while (this.activeQueueTransfers < this.maxConcurrency && this.syncQueue.length > 0) {
-            const item = this.syncQueue.shift();
-            if (item) {
-                this.activeQueueTransfers++;
-                this.saveQueueToDisk();
-                
-                this.processCallback(item)
-                    .then((success) => {
-                        this.activeQueueTransfers--;
-                        if (!success && item.retries < 3) {
-                            item.retries++;
-                            // Non-blocking, managed timeout for backoff
-                            this.timeoutManager.setTimeout(() => {
-                                this.addToQueue(item);
-                            }, 5000);
-                        }
-                    })
-                    .catch((e) => {
-                        this.activeQueueTransfers--;
-                        console.error("Queue item processing error", e);
-                    })
-                    .finally(() => {
-                        // Ensure we trigger the next item
-                        this.processingQueue = false;
-                        this.processQueue();
-                    });
-            }
+            const item = this.syncQueue.shift()!;
+            this.activeQueueTransfers++;
+
+            this.processCallback(item)
+                .then((success) => {
+                    if (!success && item.retries < 3) {
+                        item.retries++;
+                        this.pendingRetries++;
+                        if (item.id) this.inQueueOrProcessing.delete(item.id);
+                        this.timeoutManager.setTimeout(() => {
+                            this.pendingRetries--;
+                            this.addToQueue(item);
+                        }, 5000);
+                    } else {
+                        if (item.id) this.inQueueOrProcessing.delete(item.id);
+                    }
+                })
+                .catch((e) => {
+                    console.error("Queue item processing error", e);
+                    if (item.id) this.inQueueOrProcessing.delete(item.id);
+                })
+                .finally(() => {
+                    this.activeQueueTransfers--;
+                    // Re-enter processQueue after each item completes to drain pending work
+                    this.processQueue();
+                });
         }
 
-        if (this.activeQueueTransfers === 0 && this.syncQueue.length === 0 && this.syncDrainCallback) {
-            this.syncDrainCallback();
+        if (this.activeQueueTransfers === 0 && this.syncQueue.length === 0 && this.pendingRetries === 0 && this.syncDrainCallback) {
+            const cb = this.syncDrainCallback;
             this.syncDrainCallback = null;
+            cb();
         }
-
-        this.processingQueue = false;
     }
 
-    private loadQueueFromDisk() {
-        // Implementation to load queue from IndexedDB or file
-        // To prevent data loss across crashes
-    }
-
-    private saveQueueToDisk() {
-        // Implementation to save queue to IndexedDB or file
-    }
+    // TODO: implement loadQueueFromDisk() using IndexedDB or vault adapter to survive crashes
+    // TODO: implement saveQueueToDisk() to persist queue state; call it on addToQueue/clear
 }

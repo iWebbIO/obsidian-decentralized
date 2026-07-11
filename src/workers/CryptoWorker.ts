@@ -2,10 +2,11 @@
 export {};
 
 self.addEventListener('message', async (event: MessageEvent) => {
-    const { id, type, data, patches } = event.data;
+    const { id, type, data } = event.data;
 
     try {
         if (type === 'HASH') {
+            if (!data) throw new Error('HASH: data is required and must be a valid BufferSource');
             const hashBuffer = await self.crypto.subtle.digest('SHA-256', data);
             const hashArray = new Uint8Array(hashBuffer);
             let hash = '';

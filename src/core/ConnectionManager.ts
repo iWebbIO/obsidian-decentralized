@@ -2,9 +2,7 @@ import { TimeoutManager } from '../utils/Timeouts';
 
 export class ConnectionManager {
     private timeoutManager: TimeoutManager;
-    private peerConnections: Map<string, any> = new Map();
-    private directIpClient: any = null;
-    private directIpServer: any = null;
+
 
     constructor(timeoutManager: TimeoutManager) {
         this.timeoutManager = timeoutManager;
@@ -17,14 +15,16 @@ export class ConnectionManager {
         return new Promise<void>((resolve, reject) => {
             let isResolved = false;
             
+            let oldHandler = dc.onbufferedamountlow;
+            
             const timeoutId = this.timeoutManager.setTimeout(() => {
                 if (!isResolved) {
                     isResolved = true;
+                    dc.onbufferedamountlow = oldHandler;
                     reject(new Error("Timeout waiting for WebRTC buffer to drain"));
                 }
             }, maxWaitMs);
 
-            const oldHandler = dc.onbufferedamountlow;
             dc.bufferedAmountLowThreshold = 1 * 1024 * 1024;
             
             dc.onbufferedamountlow = () => {

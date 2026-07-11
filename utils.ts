@@ -61,7 +61,7 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
         for (let i = 0; i < len; i++) {
             bytes[i] = binary_string.charCodeAt(i);
         }
-        return bytes.buffer;
+        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     } catch (err: any) {
         throw new SyncError(
             SyncErrorCategory.INTEGRITY_ERROR,

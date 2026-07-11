@@ -8,12 +8,14 @@ export class FileManager {
         this.vault = vault;
     }
 
+    /**
+     * Note: This method reads the entire file into memory before slicing it.
+     * Obsidian's Vault API does not natively support streaming for File objects.
+     * This simulates chunking for network transfer purposes.
+     */
     public async readChunked(file: TFile, chunkSize: number, onChunk: (data: ArrayBuffer, index: number, total: number) => Promise<void>): Promise<void> {
-        // We simulate chunked reading by reading the file and slicing.
-        // In a true stream API, we would use vault.readRaw or similar streaming APIs if available.
-        // For now, we protect OOM by allowing chunk-by-chunk processing.
         const content = await this.vault.readBinary(file);
-        const totalChunks = Math.ceil(content.byteLength / chunkSize);
+        const totalChunks = Math.max(1, Math.ceil(content.byteLength / chunkSize));
         
         for (let i = 0; i < totalChunks; i++) {
             const start = i * chunkSize;
@@ -24,7 +26,7 @@ export class FileManager {
     }
 
     public async handleIncomingChunk(transferId: string, chunk: ArrayBuffer, index: number, total: number): Promise<void> {
-        // Implement chunk saving logic
+        throw new Error("NotImplementedError: handleIncomingChunk is not yet implemented.");
     }
 
     public acquireLock(path: string, peerId: string, durationMs: number = 30000): boolean {

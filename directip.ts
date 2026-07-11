@@ -1,5 +1,5 @@
 import { Platform } from 'obsidian';
-import { DirectIpConfig } from './types';
+import { DirectIpConfig, SyncData } from './types';
 import type ObsidianDecentralizedPlugin from './main';
 
 // Heartbeat constants (mirror main.ts startHeartbeat)
@@ -10,14 +10,14 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
 // Custom Framing Helpers
-function encodeMessage(msg: any): string | ArrayBuffer {
+function encodeMessage(msg: SyncData | any): string | ArrayBuffer {
     if (msg.type === 'file-chunk-data' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
         const { data, ...header } = msg;
         const headerStr = JSON.stringify(header);
         const headerBytes = textEncoder.encode(headerStr);
         const binaryData = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
         const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
-        new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
+        new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(0, headerBytes.length, true);
         buffer.set(headerBytes, 4);
         buffer.set(binaryData, 4 + headerBytes.length);
         return buffer.buffer;
@@ -27,7 +27,7 @@ function encodeMessage(msg: any): string | ArrayBuffer {
         const headerBytes = textEncoder.encode(headerStr);
         const binaryData = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
         const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
-        new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
+        new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(0, headerBytes.length, true);
         buffer.set(headerBytes, 4);
         buffer.set(binaryData, 4 + headerBytes.length);
         return buffer.buffer;
@@ -37,7 +37,7 @@ function encodeMessage(msg: any): string | ArrayBuffer {
         const headerBytes = textEncoder.encode(headerStr);
         const binaryData = msg.content instanceof Uint8Array ? msg.content : new Uint8Array(msg.content);
         const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
-        new DataView(buffer.buffer).setUint32(0, headerBytes.length, true);
+        new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(0, headerBytes.length, true);
         buffer.set(headerBytes, 4);
         buffer.set(binaryData, 4 + headerBytes.length);
         return buffer.buffer;
@@ -45,7 +45,7 @@ function encodeMessage(msg: any): string | ArrayBuffer {
     return JSON.stringify(msg);
 }
 
-function decodeMessage(data: string | ArrayBuffer | Uint8Array | Blob): any {
+function decodeMessage(data: string | ArrayBuffer | Uint8Array): any {
     if (typeof data === 'string') {
         return JSON.parse(data);
     }
@@ -60,6 +60,9 @@ function decodeMessage(data: string | ArrayBuffer | Uint8Array | Blob): any {
 
     const view = new DataView(buffer);
     const headerLen = view.getUint32(0, true);
+    if (buffer.byteLength < 4 + headerLen) {
+        throw new Error(`Malformed message: header length (${headerLen}) exceeds buffer size (${buffer.byteLength})`);
+    }
     const headerBytes = new Uint8Array(buffer, 4, headerLen);
     const headerStr = textDecoder.decode(headerBytes);
     const header = JSON.parse(headerStr);
@@ -174,22 +177,29 @@ export class DirectIpServer {
         this.wss.on('error', (err: Error) => {
             this.plugin.showNotice(`Offline server error: ${err.message}`, 'error');
             this.plugin.log("Offline Server Error:", err);
-            this.wss = null;
+            this.stop();
         });
 
         // Stale-client reaper: terminate clients that haven't sent anything
         // within the liveness window (mirrors client-side heartbeat timeout).
-        this.reapInterval = window.setInterval(() => {
+        this.reapInterval = setInterval(() => {
             const now = Date.now();
+            const toReap: string[] = [];
             for (const [deviceId, entry] of this.clients.entries()) {
                 if (now - entry.lastHeard > LIVENESS_TIMEOUT_MS) {
+                    toReap.push(deviceId);
+                }
+            }
+            for (const deviceId of toReap) {
+                const entry = this.clients.get(deviceId);
+                if (entry) {
                     this.plugin.log(`Server: reaping stale client ${deviceId} (silent for ${Math.round((now - entry.lastHeard) / 1000)}s)`);
                     try { entry.socket.close(); } catch (_) { /* ignore */ }
                     this.clients.delete(deviceId);
                     this.plugin.updateStatus();
                 }
             }
-        }, LIVENESS_TIMEOUT_MS);
+        }, LIVENESS_TIMEOUT_MS) as any as number;
 
         this.plugin.log(`Offline WebSocket server listening on port ${port}`);
     }
@@ -243,12 +253,12 @@ export class DirectIpServer {
             clearInterval(this.reapInterval);
             this.reapInterval = null;
         }
+        for (const entry of this.clients.values()) {
+            try { entry.socket.close(); } catch (_) { /* ignore */ }
+        }
+        this.clients.clear();
         if (this.wss) {
             this.wss.close();
-            for (const entry of this.clients.values()) {
-                try { entry.socket.close(); } catch (_) { /* ignore */ }
-            }
-            this.clients.clear();
         }
         this.wss = null;
         this.plugin.log("Offline Server stopped.");
@@ -266,7 +276,7 @@ export class DirectIpClient {
     public isFatalError: boolean = false;
 
     private ws: WebSocket | null = null;
-    private sendBuffer: any[] = [];
+    private sendBuffer: { data: any, retries: number }[] = [];
     private isStopped = false;
 
     // Reconnect backoff state
@@ -298,7 +308,7 @@ export class DirectIpClient {
         this.stopHeartbeat();
         this.lastHeardAt = Date.now(); // socket just opened — reset the clock
         this.heartbeatInterval = window.setInterval(() => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            if (!this.ws || this.ws.readyState !== 1 /* WebSocket.OPEN */) {
                 this.stopHeartbeat();
                 return;
             }
@@ -461,16 +471,20 @@ export class DirectIpClient {
 
     // ── Public API ─────────────────────────────────────────────────────────────
 
-    async send(data: any) {
-        this.sendBuffer.push(data);
+    send(data: any) {
+        if (this.sendBuffer.length >= 100) {
+            this.sendBuffer.shift(); // Drop oldest message
+        }
+        this.sendBuffer.push({ data, retries: 0 });
         this.flushSendBuffer();
     }
 
     private flushSendBuffer() {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (!this.ws || this.ws.readyState !== 1 /* WebSocket.OPEN */) return;
         
         while (this.sendBuffer.length > 0) {
-            const data = this.sendBuffer.shift();
+            const item = this.sendBuffer.shift()!;
+            const data = item.data;
             let encoded;
             try {
                 encoded = encodeMessage(data);
@@ -485,7 +499,12 @@ export class DirectIpClient {
             try {
                 this.ws.send(encoded);
             } catch (e) {
-                this.sendBuffer.unshift(data); // Put it back on socket send failure
+                item.retries++;
+                if (item.retries < 3) {
+                    this.sendBuffer.unshift(item); // Put it back on socket send failure
+                } else {
+                    this.plugin.log('DirectIpClient: Dropping message after max retries on send failure');
+                }
                 break;
             }
         }

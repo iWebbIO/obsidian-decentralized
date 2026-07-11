@@ -3,40 +3,40 @@ export class TimeoutManager {
     private intervals: Set<number> = new Set();
 
     public setTimeout(callback: () => void, ms: number): number {
-        const id = window.setTimeout(() => {
+        const id = setTimeout(() => {
             this.timeouts.delete(id);
             callback();
-        }, ms);
+        }, ms) as any as number;
         this.timeouts.add(id);
         return id;
     }
 
     public clearTimeout(id: number | null | undefined): void {
         if (id == null) return;
-        window.clearTimeout(id);
+        clearTimeout(id);
         this.timeouts.delete(id);
     }
 
     public setInterval(callback: () => void, ms: number): number {
-        const id = window.setInterval(callback, ms);
+        const id = setInterval(callback, ms) as any as number;
         this.intervals.add(id);
         return id;
     }
 
     public clearInterval(id: number | null | undefined): void {
         if (id == null) return;
-        window.clearInterval(id);
+        clearInterval(id);
         this.intervals.delete(id);
     }
 
     public clearAll(): void {
         for (const id of this.timeouts) {
-            window.clearTimeout(id);
+            clearTimeout(id);
         }
         this.timeouts.clear();
 
         for (const id of this.intervals) {
-            window.clearInterval(id);
+            clearInterval(id);
         }
         this.intervals.clear();
     }

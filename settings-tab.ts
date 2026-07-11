@@ -324,7 +324,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.mtimeTolerance.toString())
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.mtimeTolerance = isNaN(num) ? DEFAULT_SETTINGS.mtimeTolerance : num;
+                    this.plugin.settings.mtimeTolerance = isNaN(num) ? DEFAULT_SETTINGS.mtimeTolerance : Math.max(0, num);
                     await this.plugin.saveSettings();
                 }));
     }
