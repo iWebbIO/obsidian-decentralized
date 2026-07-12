@@ -138,3 +138,6 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 main.js
+.agents/
+ORIGINAL_REQUEST.md
+PROJECT.md

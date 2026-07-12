@@ -24,7 +24,6 @@ export class DesktopLANDiscovery implements ILANDiscovery {
     private hasNetworkListeners: boolean = false;
     private isBound: boolean = false;
     private socketRestartAttempts: number = 0;
-    private maxSocketRestartAttempts: number = 5;
     private restartTimeout: number | null = null;
     private isRestarting: boolean = false;
     
@@ -99,26 +98,22 @@ export class DesktopLANDiscovery implements ILANDiscovery {
                 this.isBound = false;
             }
             
-            if (this.socketRestartAttempts < this.maxSocketRestartAttempts) {
-                this.socketRestartAttempts++;
-                const delay = Math.min(10000, this.socketRestartAttempts * 2000);
-                console.log(`LAN Discovery: scheduling socket restart attempt ${this.socketRestartAttempts}/${this.maxSocketRestartAttempts} in ${delay}ms`);
-                
-                if (this.restartTimeout !== null) {
-                    clearTimeout(this.restartTimeout);
-                }
-                this.restartTimeout = window.setTimeout(() => {
-                    this.restartTimeout = null;
-                    if (this.lastPeerInfo) {
-                        this.startBroadcasting(this.lastPeerInfo);
-                    } else {
-                        this.startListening();
-                    }
-                }, delay);
-            } else {
-                new Notice('LAN discovery failed. Your firewall might be blocking it.', 10000);
-                this.stop();
+            this.socketRestartAttempts++;
+            // Infinite backoff capping at 10000ms ensures it's fully self-healing and plug-and-play
+            const delay = Math.min(10000, this.socketRestartAttempts * 2000);
+            console.log(`LAN Discovery: scheduling socket restart attempt in ${delay}ms`);
+            
+            if (this.restartTimeout !== null) {
+                clearTimeout(this.restartTimeout);
             }
+            this.restartTimeout = window.setTimeout(() => {
+                this.restartTimeout = null;
+                if (this.lastPeerInfo) {
+                    this.startBroadcasting(this.lastPeerInfo);
+                } else {
+                    this.startListening();
+                }
+            }, delay);
         });
 
         this.socket.on('listening', () => {
@@ -220,7 +215,7 @@ export class DesktopLANDiscovery implements ILANDiscovery {
                     this.consecutiveErrors = 0;
                 }
             });
-            if (this.currentBroadcastIntervalMs < 15000) {
+            if (this.currentBroadcastIntervalMs < 5000) {
                 this.currentBroadcastIntervalMs += 1000;
             }
             this.broadcastTimer = setTimeout(sendBeacon, this.currentBroadcastIntervalMs) as any as number;

@@ -533,7 +533,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private async runLocked(path: string, callback: () => Promise<void>) {
         const existingLock = this.fileLocks.get(path) || Promise.resolve();
-        const newLock = existingLock.then(async () => {
+        const newLock = existingLock.catch(() => {}).then(async () => {
             await callback();
         }).catch(err => {
             this.log(`Lock error for ${path}:`, err);
