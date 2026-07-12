@@ -286,6 +286,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         
         // Safely destroy all background timeouts and queue processes
         this.queueManager.clear();
+        this.debouncedSaveState();
         this.timeoutManager.clearAll();
 
         this.saveState(); // Force immediate save on unload instead of debounced delay
@@ -435,6 +436,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.syncedHashes.set(p, d as any);
             }
         }
+        await this.loadQueueState();
     }
 
     async saveState() {
@@ -463,6 +465,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         } catch (e) {
             console.error('Failed to save state:', e);
         }
+        await this.saveQueueState();
     }
     
     updateHashCache(path: string, hash: string) {
@@ -810,11 +813,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private addToQueue(peerId: string | null, data: SyncData) { 
         const priority = this.computePriority(data);
         this.queueManager.addToQueue({ peerId, data, retries: 0, priority });
+        this.debouncedSaveState();
     }
     
     private addToQueueTask(peerId: string | null, task: SyncTask) { 
         const priority = this.computePriorityTask(task);
         this.queueManager.addToQueue({ peerId, task, retries: 0, priority });
+        this.debouncedSaveState();
     }
 
     public getQueuePressure(): number {
@@ -896,6 +901,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.currentSyncIsTwoDeviceMode = null;
         this.syncDrainCallback = null;
         this.queueManager.clear();
+        this.debouncedSaveState();
         this.activeTransfers.clear();
         this.syncState.pendingPulls.clear();
         this.syncState.allowedPulls.clear();
@@ -2197,6 +2203,36 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 
                 setTimeout(() => this.isApplyingRemoteEdit = false, 50);
             }
+        }
+    }
+
+    async loadQueueState() {
+        const queuePath = `${this.manifest.dir}/queue.json`;
+        try {
+            if (await this.app.vault.adapter.exists(queuePath)) {
+                const data = await this.app.vault.adapter.read(queuePath);
+                const items = JSON.parse(data);
+                if (this.queueManager && Array.isArray(items)) {
+                    this.queueManager.loadQueue(items);
+                }
+            }
+        } catch (e) {
+            console.error('Failed to load queue state:', e);
+        }
+    }
+
+    async saveQueueState() {
+        if (!this.queueManager) return;
+        const queuePath = `${this.manifest.dir}/queue.json`;
+        const tmpPath = queuePath + '.tmp';
+        try {
+            const queueState = this.queueManager.getQueue();
+            const json = JSON.stringify(queueState);
+            await this.app.vault.adapter.write(tmpPath, json);
+            await this.app.vault.adapter.write(queuePath, json);
+            await this.app.vault.adapter.remove(tmpPath);
+        } catch (e) {
+            console.error('Failed to save queue state:', e);
         }
     }
 

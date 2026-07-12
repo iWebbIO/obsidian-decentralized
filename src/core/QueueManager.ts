@@ -26,7 +26,6 @@ export class QueueManager {
     ) {
         this.timeoutManager = timeoutManager;
         this.processCallback = processCallback;
-        // TODO: call loadQueueFromDisk() here once IndexedDB persistence is implemented
     }
 
     public setConcurrencyLimit(limit: number) {
@@ -130,6 +129,17 @@ export class QueueManager {
         }
     }
 
-    // TODO: implement loadQueueFromDisk() using IndexedDB or vault adapter to survive crashes
-    // TODO: implement saveQueueToDisk() to persist queue state; call it on addToQueue/clear
+    public getQueue(): QueueItem[] {
+        return this.syncQueue;
+    }
+
+    public loadQueue(items: QueueItem[]) {
+        if (!Array.isArray(items)) return;
+        this.syncQueue = items;
+        this.inQueueOrProcessing.clear();
+        for (const item of items) {
+            if (item.id) this.inQueueOrProcessing.add(item.id);
+        }
+        this.processQueue();
+    }
 }
