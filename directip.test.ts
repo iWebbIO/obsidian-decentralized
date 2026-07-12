@@ -11,6 +11,7 @@ Object.defineProperty(global, 'window', {
 
 import { DirectIpServer, DirectIpClient } from './directip';
 import MockWebSocket from './__mocks__/ws';
+(global as any).WebSocket = MockWebSocket;
 
 describe('DirectIpServer', () => {
     let server: DirectIpServer;
