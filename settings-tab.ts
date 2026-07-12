@@ -457,7 +457,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                         conn.send({ type: 'ping' });
                     }));
                 } else {
-                    settingItem.setDesc(settingItem.descEl.textContent + ' (Disconnected)');
+                    settingItem.setDesc((settingItem.descEl.textContent ?? '') + ' (Disconnected)');
                     settingItem.nameEl.style.color = 'var(--text-muted)';
                     
                     settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {

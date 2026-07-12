@@ -60,8 +60,11 @@ export class ConnectionModal extends Modal {
     }
 
     onClose() {
-        if (this.discoverListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('discover', this.discoverListener);
-        if (this.loseListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('lose', this.loseListener);
+        if (this.plugin.lanDiscovery) {
+            if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
+            if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
+            this.plugin.lanDiscovery.stopBroadcasting();
+        }
         this.contentEl.empty();
     }
 
@@ -71,6 +74,12 @@ export class ConnectionModal extends Modal {
         if (existing) return;
         const style = document.createElement('style');
         style.id = styleId;
+        
+        // Ensure it is removed when plugin unloads
+        this.plugin.register(() => {
+            const s = document.getElementById(styleId);
+            if (s) s.remove();
+        });
         style.innerHTML = `
             .od-dashboard-header { text-align: center; margin-bottom: 5px; font-weight: 600; color: var(--text-normal); }
             .od-dashboard-subtitle { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 20px; }
@@ -143,9 +152,12 @@ export class ConnectionModal extends Modal {
     }
 
     formatPairingCodeForDisplay(deviceId: string): string {
-        if (deviceId.startsWith('device-') && deviceId.length === 15) {
+        if (deviceId.startsWith('device-')) {
             const hex = deviceId.substring(7);
-            return `device-${hex.substring(0, 4)}-${hex.substring(4)}`;
+            if (hex.length >= 8) {
+                const mid = Math.floor(hex.length / 2);
+                return `device-${hex.substring(0, mid)}-${hex.substring(mid)}`;
+            }
         }
         return deviceId;
     }
@@ -291,6 +303,7 @@ export class ConnectionModal extends Modal {
         QRCode.toDataURL(qrPayload, { width: 150, margin: 2 }).then(url => {
             imgEl.src = url;
         }).catch(err => {
+            imgEl.remove();
             qrSection.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
         });
         
@@ -332,21 +345,23 @@ export class ConnectionModal extends Modal {
                         const card = lanList.createDiv({ cls: 'od-lan-card mod-clickable' });
                         card.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
                         card.createDiv({ text: Platform.isMobile ? 'Tap to connect' : 'Click to connect', cls: 'od-text-muted' });
-                        card.onclick = () => this.attemptConnection(peer.deviceId + '|' + (this.activePsk || ''));
+                        card.onclick = () => this.attemptConnection(peer.deviceId);
                     });
                 }
             };
             
-            if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
-            if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
+            if (this.discoverListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('discover', this.discoverListener);
+            if (this.loseListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('lose', this.loseListener);
 
             this.discoverListener = (p: PeerInfo) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); };
             this.loseListener = (p: PeerInfo) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); };
 
-            this.plugin.lanDiscovery.on('discover', this.discoverListener);
-            this.plugin.lanDiscovery.on('lose', this.loseListener);
-            this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
-            this.plugin.lanDiscovery.startListening();
+            if (this.plugin.lanDiscovery) {
+                this.plugin.lanDiscovery.on('discover', this.discoverListener);
+                this.plugin.lanDiscovery.on('lose', this.loseListener);
+                this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
+                this.plugin.lanDiscovery.startListening();
+            }
             renderLanList();
         }
     }
@@ -425,16 +440,18 @@ export class ConnectionModal extends Modal {
                 }
             };
             
-            if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
-            if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
+            if (this.discoverListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('discover', this.discoverListener);
+            if (this.loseListener && this.plugin.lanDiscovery) this.plugin.lanDiscovery.off('lose', this.loseListener);
 
             this.discoverListener = (p: PeerInfo) => { this.discoveredPeers.set(p.deviceId, p); renderLanList(); };
             this.loseListener = (p: PeerInfo) => { this.discoveredPeers.delete(p.deviceId); renderLanList(); };
 
-            this.plugin.lanDiscovery.on('discover', this.discoverListener);
-            this.plugin.lanDiscovery.on('lose', this.loseListener);
-            this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
-            this.plugin.lanDiscovery.startListening();
+            if (this.plugin.lanDiscovery) {
+                this.plugin.lanDiscovery.on('discover', this.discoverListener);
+                this.plugin.lanDiscovery.on('lose', this.loseListener);
+                this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
+                this.plugin.lanDiscovery.startListening();
+            }
             renderLanList();
         }
 

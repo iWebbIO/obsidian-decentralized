@@ -1,16 +1,16 @@
-# Graph Report - obsidian-decentralized  (2026-07-12)
+# Graph Report - obsidian-decentralized  (2026-07-11)
 
 ## Corpus Check
-- 30 files · ~32,992 words
+- 30 files · ~32,813 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 521 nodes · 1264 edges · 37 communities (17 shown, 20 thin omitted)
+- 521 nodes · 1260 edges · 37 communities (18 shown, 19 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `d1d52bc2`
+- Built from commit: `b0689961`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -51,7 +51,7 @@
 - [[_COMMUNITY_QRScannerModal|QRScannerModal]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `ObsidianDecentralizedPlugin` - 162 edges
+1. `ObsidianDecentralizedPlugin` - 161 edges
 2. `TimeoutManager` - 19 edges
 3. `ConnectionModal` - 17 edges
 4. `DesktopLANDiscovery` - 16 edges
@@ -80,11 +80,11 @@
 ## Hyperedges (group relationships)
 - **Performance Optimizations** — git_log_gethash_optimization, git_log_hash_cache_eviction, git_log_large_file_hashing, git_log_cached_read [INFERRED 0.95]
 
-## Communities (37 total, 20 thin omitted)
+## Communities (37 total, 19 thin omitted)
 
 ### Community 0 - "Main Plugin Controller"
 Cohesion: 0.08
-Nodes (4): ObsidianDecentralizedPlugin, diff-match-patch, FileUpdatePayload, VersionVector
+Nodes (3): ObsidianDecentralizedPlugin, FileUpdatePayload, VersionVector
 
 ### Community 1 - "Type Definitions"
 Cohesion: 0.06
@@ -99,12 +99,12 @@ Cohesion: 0.09
 Nodes (3): ObsidianDecentralizedSettingTab, SyncStatusState, ConnectionModal
 
 ### Community 4 - "Direct IP and Websockets"
-Cohesion: 0.08
-Nodes (15): decodeMessage(), DirectIpClient, DirectIpServer, encodeMessage(), ServerClientEntry, textDecoder, textEncoder, MockWebSocket (+7 more)
+Cohesion: 0.09
+Nodes (10): decodeMessage(), DirectIpClient, DirectIpServer, encodeMessage(), ServerClientEntry, textDecoder, textEncoder, MockWebSocket (+2 more)
 
 ### Community 5 - "Package Config and Conflict UI"
-Cohesion: 0.04
-Nodes (30): Modal, Notice, Platform, Setting, TFile, author, description, devDependencies (+22 more)
+Cohesion: 0.06
+Nodes (31): author, dependencies, diff-match-patch, html5-qrcode, pako, peerjs, qrcode, description (+23 more)
 
 ### Community 6 - "Modals and Conflict Center"
 Cohesion: 0.15
@@ -117,6 +117,10 @@ Nodes (3): DesktopLANDiscovery, DummyLANDiscovery, ILANDiscovery
 ### Community 8 - "Documentation"
 Cohesion: 0.10
 Nodes (20): ⚙️ Configuration & Advanced Features, ⚔️ Conflict Center, Conflict Resolution, 🤝 Contributing, ✨ Core Features, Experimental: Direct IP Mode, 🚀 Getting Started: Connecting Your First Devices, 🤔 How It Works (+12 more)
+
+### Community 9 - "Obsidian API Mocks"
+Cohesion: 0.10
+Nodes (6): Modal, Notice, Platform, Setting, TFile, obsidian
 
 ### Community 10 - "TypeScript Configuration"
 Cohesion: 0.11
@@ -141,21 +145,21 @@ Nodes (12): FileBatchBinaryPayload, SyncError, SyncErrorCategory, arrayBufferToB
 ## Knowledge Gaps
 - **103 isolated node(s):** `Platform`, `textEncoder`, `textDecoder`, `ServerClientEntry`, `id` (+98 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **19 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `ObsidianDecentralizedPlugin` connect `Main Plugin Controller` to `Type Definitions`, `.broadcastData`, `UI and Connection Handling`, `Direct IP and Websockets`, `Core Managers and Utilities`, `FileManager`, `LAN Discovery`, `Modals and Conflict Center`, `Discovery Types`, `Sync Error Types`?**
-  _High betweenness centrality (0.349) - this node is a cross-community bridge._
-- **Why does `dependencies` connect `Direct IP and Websockets` to `Main Plugin Controller`, `Package Config and Conflict UI`?**
+- **Why does `ObsidianDecentralizedPlugin` connect `Main Plugin Controller` to `Type Definitions`, `.broadcastData`, `UI and Connection Handling`, `Direct IP and Websockets`, `Package Config and Conflict UI`, `Core Managers and Utilities`, `FileManager`, `LAN Discovery`, `Modals and Conflict Center`, `Discovery Types`, `Sync Error Types`?**
+  _High betweenness centrality (0.347) - this node is a cross-community bridge._
+- **Why does `dependencies` connect `Package Config and Conflict UI` to `Direct IP and Websockets`?**
   _High betweenness centrality (0.139) - this node is a cross-community bridge._
-- **Why does `diff-match-patch` connect `Main Plugin Controller` to `Obsidian API Mocks`, `Direct IP and Websockets`?**
+- **Why does `diff-match-patch` connect `Package Config and Conflict UI` to `Main Plugin Controller`?**
   _High betweenness centrality (0.127) - this node is a cross-community bridge._
 - **What connects `Platform`, `textEncoder`, `textDecoder` to the rest of the system?**
   _112 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Main Plugin Controller` be split into smaller, more focused modules?**
-  _Cohesion score 0.08040404040404041 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.0822638333683989 - nodes in this community are weakly interconnected._
 - **Should `Type Definitions` be split into smaller, more focused modules?**
   _Cohesion score 0.05952380952380952 - nodes in this community are weakly interconnected._
 - **Should `Core Managers and Utilities` be split into smaller, more focused modules?**

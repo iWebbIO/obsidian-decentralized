@@ -10,7 +10,7 @@ export class SyncEngine {
         this.timeoutManager = timeoutManager;
     }
 
-    public transitionTo(newPhase: SyncPhase, maxDurationMs: number = 0, onTimeout?: () => void): void {
+    public transitionTo(newPhase: SyncPhase, maxDurationMs: number = 0, onTimeout?: (phase?: SyncPhase) => void): void {
         this.currentPhase = newPhase;
         
         if (this.phaseTimeoutId !== null) {
@@ -18,11 +18,12 @@ export class SyncEngine {
             this.phaseTimeoutId = null;
         }
 
-        if (maxDurationMs > 0 && onTimeout) {
+        if (maxDurationMs > 0) {
             this.phaseTimeoutId = this.timeoutManager.setTimeout(() => {
                 this.phaseTimeoutId = null;
+                const timedOutPhase = this.currentPhase;
                 this.currentPhase = SyncPhase.IDLE;
-                onTimeout();
+                if (onTimeout) onTimeout(timedOutPhase);
             }, maxDurationMs);
         }
     }

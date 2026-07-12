@@ -15,28 +15,31 @@ export class ConnectionManager {
         return new Promise<void>((resolve, reject) => {
             let isResolved = false;
             
-            let oldHandler = dc.onbufferedamountlow;
-            
             const timeoutId = this.timeoutManager.setTimeout(() => {
                 if (!isResolved) {
                     isResolved = true;
-                    dc.onbufferedamountlow = oldHandler;
+                    dc.removeEventListener?.('bufferedamountlow', handler);
                     reject(new Error("Timeout waiting for WebRTC buffer to drain"));
                 }
             }, maxWaitMs);
 
             dc.bufferedAmountLowThreshold = 1 * 1024 * 1024;
             
-            dc.onbufferedamountlow = () => {
+            const handler = () => {
                 if (!isResolved) {
                     isResolved = true;
                     this.timeoutManager.clearTimeout(timeoutId);
-                    dc.onbufferedamountlow = oldHandler;
-                    // Invoke the old handler so it doesn't miss this drain event
-                    if (typeof oldHandler === 'function') oldHandler();
+                    dc.removeEventListener?.('bufferedamountlow', handler);
                     resolve();
                 }
             };
+            
+            if (dc.addEventListener) {
+                dc.addEventListener('bufferedamountlow', handler);
+            } else {
+                // Fallback if addEventListener is somehow not available (e.g. mock objects)
+                dc.onbufferedamountlow = handler;
+            }
         });
     }
 

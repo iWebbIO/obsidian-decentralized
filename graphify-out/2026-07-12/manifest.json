@@ -1,13 +1,13 @@
 {
   "directip.ts": {
-    "mtime": 1783844834.1911826,
-    "ast_hash": "c586cd2c6fb31bc897478bf216a16dfd",
-    "semantic_hash": ""
+    "mtime": 1783784509.0329127,
+    "ast_hash": "21717cb4ee575e7f5fd8e5e91d68f231",
+    "semantic_hash": "21717cb4ee575e7f5fd8e5e91d68f231"
   },
   "discovery.ts": {
-    "mtime": 1783844909.6216972,
-    "ast_hash": "f798225dcf69afcb66589a8e779b053c",
-    "semantic_hash": ""
+    "mtime": 1783778601.0887158,
+    "ast_hash": "733c92628c97f7e4a1b4f26cb1cd32fe",
+    "semantic_hash": "733c92628c97f7e4a1b4f26cb1cd32fe"
   },
   "main.ts": {
     "mtime": 1783784916.9403117,
@@ -30,9 +30,9 @@
     "semantic_hash": "a1e13d41b0f9becb26826f30e4d04c3d"
   },
   "settings-tab.ts": {
-    "mtime": 1783844909.6902256,
-    "ast_hash": "a83a71e49b75990c9d0bfe72e0f0d3cd",
-    "semantic_hash": ""
+    "mtime": 1783776508.7023506,
+    "ast_hash": "e3bea3b6455f9aeae7b122388672c937",
+    "semantic_hash": "e3bea3b6455f9aeae7b122388672c937"
   },
   "test.js": {
     "mtime": 1782738390.5829544,
@@ -50,8 +50,8 @@
     "semantic_hash": "d8748047c92da283636d90bd1742233e"
   },
   "ui.ts": {
-    "mtime": 1783844909.6275847,
-    "ast_hash": "7a669fc2b18f8f3f5c5ce529c6d91d75",
+    "mtime": 1783802952.32023,
+    "ast_hash": "1e31160e6a010339274a604771219ae3",
     "semantic_hash": ""
   },
   "utils.ts": {
@@ -100,14 +100,14 @@
     "semantic_hash": "9c596712d9aa246ee7cd3818faf643ec"
   },
   "directip.test.ts": {
-    "mtime": 1783845034.890942,
-    "ast_hash": "061ade96f147969434ddf4d772cde3d4",
-    "semantic_hash": ""
+    "mtime": 1783785095.8370407,
+    "ast_hash": "463baa858f6ef7de8912a6709e4e9031",
+    "semantic_hash": "463baa858f6ef7de8912a6709e4e9031"
   },
   "discovery.test.ts": {
-    "mtime": 1783845081.0763273,
-    "ast_hash": "141be41f5d29b38a0cdadd6671e8e70a",
-    "semantic_hash": ""
+    "mtime": 1783784551.0936267,
+    "ast_hash": "500e631393d04f91e00261d57e37b29d",
+    "semantic_hash": "500e631393d04f91e00261d57e37b29d"
   },
   "jest.config.js": {
     "mtime": 1783334574.4844122,
@@ -115,14 +115,14 @@
     "semantic_hash": "1910b3648e0f809c63c36229c0fa3771"
   },
   "src/core/ConnectionManager.ts": {
-    "mtime": 1783844785.0456865,
-    "ast_hash": "92f13cf0901b0179e822bd1aa77dd71b",
+    "mtime": 1783802902.230818,
+    "ast_hash": "76b0ca2038efab4b8c73ad15f47265c1",
     "semantic_hash": ""
   },
   "src/core/FileManager.ts": {
-    "mtime": 1783844785.025927,
-    "ast_hash": "ac6be126b7b9866af1e52e52c72ab894",
-    "semantic_hash": ""
+    "mtime": 1783776065.8610566,
+    "ast_hash": "5768fbc3f55bd6f55c618936b749c667",
+    "semantic_hash": "5768fbc3f55bd6f55c618936b749c667"
   },
   "src/core/QueueManager.test.ts": {
     "mtime": 1783779042.793136,
@@ -130,8 +130,8 @@
     "semantic_hash": "0a4bdad06ff821f580ef09647fe0f0c2"
   },
   "src/core/QueueManager.ts": {
-    "mtime": 1783844781.133742,
-    "ast_hash": "15a8427804b6172f3bca1121d7a035fa",
+    "mtime": 1783802898.2034273,
+    "ast_hash": "4ea3ddfc0a13d286cde397c23706c283",
     "semantic_hash": ""
   },
   "src/core/SyncEngine.test.ts": {
@@ -140,9 +140,9 @@
     "semantic_hash": "bf2b5dff48bdfacf089271ab48f9cce9"
   },
   "src/core/SyncEngine.ts": {
-    "mtime": 1783844785.0410433,
-    "ast_hash": "4f01411b20ace2c70bc3fd8c31946358",
-    "semantic_hash": ""
+    "mtime": 1783776152.0428283,
+    "ast_hash": "9e389871a18b3e43fb62e6962de3c11d",
+    "semantic_hash": "9e389871a18b3e43fb62e6962de3c11d"
   },
   "src/utils/Timeouts.ts": {
     "mtime": 1783778090.1996017,

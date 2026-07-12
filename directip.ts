@@ -58,6 +58,9 @@ function decodeMessage(data: string | ArrayBuffer | Uint8Array): any {
         throw new Error('Unsupported data type');
     }
 
+    if (buffer.byteLength < 4) {
+        throw new Error('Message too short');
+    }
     const view = new DataView(buffer);
     const headerLen = view.getUint32(0, true);
     if (buffer.byteLength < 4 + headerLen) {
@@ -91,11 +94,11 @@ export class DirectIpServer {
     private reapInterval: number | null = null;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
+        this.pin = pin;
         if (Platform.isMobile) {
             this.plugin.showNotice("Offline Host mode is only available on Desktop.", 'important');
             return;
         }
-        this.pin = pin;
         this.start(port);
     }
 
@@ -226,10 +229,11 @@ export class DirectIpServer {
 
     getBufferedAmount(peerId: string): number {
         const entry = this.clients.get(peerId);
-        return entry ? entry.socket.bufferedAmount : 0;
+        if (!entry) return 0;
+        return entry.socket._socket ? entry.socket._socket.bufferSize : entry.socket.bufferedAmount;
     }
 
-    send(data: any) {
+    send(data: any, excludePeerId?: string) {
         let encoded: any;
         try {
             encoded = encodeMessage(data);
@@ -237,10 +241,12 @@ export class DirectIpServer {
             this.plugin.log('DirectIpServer: Failed to encode message for broadcast:', err);
             return;
         }
-        for (const entry of this.clients.values()) {
+        for (const [deviceId, entry] of this.clients.entries()) {
+            if (deviceId === excludePeerId) continue;
             if (entry.socket.readyState === 1 /* OPEN */) {
                 try {
-                    entry.socket.send(encoded);
+                    const finalEncoded = encoded instanceof ArrayBuffer ? encoded.slice(0) : encoded;
+                    entry.socket.send(finalEncoded);
                 } catch (err) {
                     this.plugin.log('DirectIpServer: Broadcast send failed for client:', err);
                 }
@@ -276,7 +282,7 @@ export class DirectIpClient {
     public isFatalError: boolean = false;
 
     private ws: WebSocket | null = null;
-    private sendBuffer: { data: any, retries: number }[] = [];
+    private sendBuffer: { data: any, retries: number, resolve?: () => void, reject?: (e: any) => void }[] = [];
     private isStopped = false;
 
     // Reconnect backoff state
@@ -358,6 +364,7 @@ export class DirectIpClient {
 
     private connect() {
         if (this.isStopped) return;
+        this.isFatalError = false;
         
         const wsUrl = `ws://${this.config.host}:${this.config.port}/?pin=${encodeURIComponent(this.config.pin)}&deviceId=${encodeURIComponent(this.plugin.settings.deviceId)}`;
         this.ws = new WebSocket(wsUrl);
@@ -471,19 +478,25 @@ export class DirectIpClient {
 
     // ── Public API ─────────────────────────────────────────────────────────────
 
-    send(data: any) {
-        if (this.sendBuffer.length >= 100) {
-            this.sendBuffer.shift(); // Drop oldest message
-        }
-        this.sendBuffer.push({ data, retries: 0 });
-        this.flushSendBuffer();
+    send(data: any): Promise<void> {
+        return new Promise((resolve, reject) => {
+            if (this.sendBuffer.length >= 100) {
+                const dropped = this.sendBuffer.shift(); // Drop oldest message
+                if (dropped?.data?.transferId) {
+                    this.plugin.rejectPendingAck(dropped.data.transferId, 'Buffer overflow');
+                }
+                dropped?.reject?.(new Error('Buffer overflow'));
+            }
+            this.sendBuffer.push({ data, retries: 0, resolve, reject });
+            this.flushSendBuffer();
+        });
     }
 
     private flushSendBuffer() {
         if (!this.ws || this.ws.readyState !== 1 /* WebSocket.OPEN */) return;
         
         while (this.sendBuffer.length > 0) {
-            const item = this.sendBuffer.shift()!;
+            const item = this.sendBuffer[0];
             const data = item.data;
             let encoded;
             try {
@@ -494,16 +507,22 @@ export class DirectIpClient {
                 if (data.transferId) {
                     this.plugin.rejectPendingAck(data.transferId, `Encode failed: ${e.message}`);
                 }
+                item.reject?.(e);
+                this.sendBuffer.shift();
                 continue;
             }
             try {
                 this.ws.send(encoded);
+                item.resolve?.();
+                this.sendBuffer.shift();
             } catch (e) {
                 item.retries++;
                 if (item.retries < 3) {
-                    this.sendBuffer.unshift(item); // Put it back on socket send failure
+                    setTimeout(() => this.flushSendBuffer(), 1000);
                 } else {
                     this.plugin.log('DirectIpClient: Dropping message after max retries on send failure');
+                    item.reject?.(e);
+                    this.sendBuffer.shift();
                 }
                 break;
             }
@@ -515,18 +534,13 @@ export class DirectIpClient {
      * cycle.  Called by the network-change handler in main.ts (Phase 3.2).
      */
     public triggerReconnect() {
-        if (this.isStopped) return;
+        if (this.isStopped || this.isFatalError) return;
         this.stopHeartbeat();
-        if (this.ws) {
-            // Remove handlers before force-closing so onclose doesn't double-schedule
-            this.ws.onclose = null;
-            this.ws.onerror = null;
-            this.ws.close();
-            this.ws = null;
+        if (this.ws && this.ws.readyState !== 3) {
+            this.ws.close(); // let onclose trigger scheduleReconnect
+        } else {
+            this.scheduleReconnect();
         }
-        this.isOpen = false;
-        this.isLive = false;
-        this.scheduleReconnect();
     }
 
     startPolling() {

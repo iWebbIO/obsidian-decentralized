@@ -53,10 +53,11 @@ export class QueueManager {
     }
 
     public addToQueue(item: QueueItem) {
-        if (item.id) {
-            if (this.inQueueOrProcessing.has(item.id)) return;
-            this.inQueueOrProcessing.add(item.id);
+        if (!item.id) {
+            item.id = 'gen_' + Math.random().toString(36).substring(2, 11);
         }
+        if (this.inQueueOrProcessing.has(item.id)) return;
+        this.inQueueOrProcessing.add(item.id);
         
         let low = 0, high = this.syncQueue.length;
         while (low < high) {
@@ -105,7 +106,17 @@ export class QueueManager {
                 })
                 .catch((e) => {
                     console.error("Queue item processing error", e);
-                    if (item.id) this.inQueueOrProcessing.delete(item.id);
+                    if (item.retries < 3) {
+                        item.retries++;
+                        this.pendingRetries++;
+                        this.timeoutManager.setTimeout(() => {
+                            this.pendingRetries--;
+                            if (item.id) this.inQueueOrProcessing.delete(item.id);
+                            this.addToQueue(item);
+                        }, 5000);
+                    } else {
+                        if (item.id) this.inQueueOrProcessing.delete(item.id);
+                    }
                 })
                 .finally(() => {
                     this.activeQueueTransfers--;
@@ -115,9 +126,7 @@ export class QueueManager {
         }
 
         if (this.activeQueueTransfers === 0 && this.syncQueue.length === 0 && this.pendingRetries === 0 && this.syncDrainCallback) {
-            const cb = this.syncDrainCallback;
-            this.syncDrainCallback = null;
-            cb();
+            this.syncDrainCallback();
         }
     }
 

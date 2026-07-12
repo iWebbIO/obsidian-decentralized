@@ -6,6 +6,7 @@ export class FileManager {
 
     constructor(vault: Vault) {
         this.vault = vault;
+        setInterval(() => this.cleanupExpiredLocks(), 60000);
     }
 
     /**
@@ -56,10 +57,10 @@ export class FileManager {
 
     public cleanupExpiredLocks(): void {
         const now = Date.now();
+        const expired: string[] = [];
         for (const [path, lock] of this.fileLocks.entries()) {
-            if (now > lock.expiresAt) {
-                this.fileLocks.delete(path);
-            }
+            if (now > lock.expiresAt) expired.push(path);
         }
+        for (const path of expired) this.fileLocks.delete(path);
     }
 }

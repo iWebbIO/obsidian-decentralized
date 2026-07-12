@@ -122,7 +122,7 @@ describe('DirectIpClient', () => {
 
     test('send() should cap the buffer at 100 items', () => {
         for (let i = 0; i < 150; i++) {
-            client.send({ type: 'test', index: i });
+            client.send({ type: 'test', index: i }).catch(() => {});
         }
 
         const buffer = (client as any).sendBuffer;
@@ -139,7 +139,7 @@ describe('DirectIpClient', () => {
         mockSocket.readyState = 1;
         (client as any).ws = mockSocket;
 
-        client.send({ type: 'test', data: 'hello' });
+        client.send({ type: 'test', data: 'hello' }).catch(() => {});
         
         const buffer = (client as any).sendBuffer;
         expect(buffer.length).toBe(1);

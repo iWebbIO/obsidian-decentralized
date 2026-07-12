@@ -103,7 +103,7 @@ describe('DesktopLANDiscovery', () => {
     });
 
     test('should guard onNetworkChange re-entry', () => {
-        const spyStop = jest.spyOn(discovery, 'stop');
+        const spyStopBroadcasting = jest.spyOn(discovery, 'stopBroadcasting');
         const spyStart = jest.spyOn(discovery, 'startListening');
         
         discovery.startListening();
@@ -113,7 +113,7 @@ describe('DesktopLANDiscovery', () => {
         // Call it directly
         onNetworkChange();
         
-        expect(spyStop).toHaveBeenCalledTimes(1);
+        expect(spyStopBroadcasting).toHaveBeenCalledTimes(1);
         expect(spyStart).toHaveBeenCalledTimes(2); // 1 initial + 1 on restart
         
         // To test re-entry, we'd need it to call itself. 
@@ -121,6 +121,6 @@ describe('DesktopLANDiscovery', () => {
         (discovery as any).isRestarting = true;
         onNetworkChange();
         // Should not have incremented calls
-        expect(spyStop).toHaveBeenCalledTimes(1);
+        expect(spyStopBroadcasting).toHaveBeenCalledTimes(1);
     });
 });

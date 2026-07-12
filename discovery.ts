@@ -33,7 +33,15 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         this.isRestarting = true;
         console.log('Network interface change detected, restarting LAN discovery...');
         const wasBroadcasting = this.broadcastTimer !== null;
-        this.stop();
+        this.stopBroadcasting();
+        if (this.socket) {
+            if (this.isBound) {
+                try { this.socket.close(); } catch (_) {}
+            }
+            this.socket = null;
+            this.isBound = false;
+        }
+        this.socketRestartAttempts = 0;
         if (wasBroadcasting && this.lastPeerInfo) {
             this.startBroadcasting(this.lastPeerInfo);
             this.startListening();
@@ -169,9 +177,10 @@ export class DesktopLANDiscovery implements ILANDiscovery {
                     }
 
                     const timeout = setTimeout(() => {
+                        const info = this.discoveredPeers.get(peerId);
                         this.discoveredPeers.delete(peerId);
                         this.peerTimeouts.delete(peerId);
-                        this.emit('lose', data.peerInfo);
+                        if (info) this.emit('lose', info);
                     }, this.discoveryTimeoutMs) as any as number;
                     this.peerTimeouts.set(peerId, timeout);
                 }
@@ -255,6 +264,9 @@ export class DesktopLANDiscovery implements ILANDiscovery {
             this.socket = null;
             this.isBound = false;
         }
+        this.discoveredPeers.forEach((peerInfo, peerId) => {
+            this.emit('lose', peerInfo);
+        });
         this.discoveredPeers.clear();
         this.peerTimeouts.forEach(timeout => clearTimeout(timeout));
         this.peerTimeouts.clear();
