@@ -54,7 +54,10 @@ export class ConnectionModal extends Modal {
             }
         }
         
-        this.activePsk = await this.plugin.generatePSK();
+        if (!this.plugin.activePsk) {
+            this.plugin.activePsk = await this.plugin.generatePSK();
+        }
+        this.activePsk = this.plugin.activePsk;
         
         this.render();
     }

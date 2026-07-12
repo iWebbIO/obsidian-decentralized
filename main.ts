@@ -146,6 +146,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private conflictCenter: ConflictCenter;
     public activeTransfers: Map<string, TransferStatus> = new Map();
     public joinPin: string | null = null;
+    public activePsk: string | null = null;
     private clusterConnectionInterval: number | null = null;
     public pendingConnections: Set<string> = new Set();
     private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, receivedCount: number, lastUpdated: number, fileHash: string, compressed?: boolean, versionVector?: VersionVector }> = new Map();
@@ -1589,10 +1590,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     setupConnection(conn: DataConnection, pin?: string) {
         this.pendingConnections.add(conn.peer);
-        conn.on('open', () => {
+        conn.on('open', async () => {
             this.pendingConnections.delete(conn.peer);
             this.log("DataConnection open with:", conn.peer);
-            conn.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin });
+            
+            const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin };
+            if (this.settings.peerKeys[conn.peer]) {
+                try {
+                    const encrypted = await this.encryptPayload(payload, this.settings.peerKeys[conn.peer]);
+                    conn.send({ type: 'encrypted', payload: encrypted });
+                } catch(e) {
+                    this.log("Failed to encrypt handshake", e);
+                    conn.send(payload);
+                }
+            } else {
+                conn.send(payload);
+            }
             // Role announcement is deferred to handleHandshake (after conn is in this.connections)
             // to avoid isTwoDeviceMode() seeing wrong connections.size
             this.resumeTransfers(conn.peer);
@@ -1660,8 +1673,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     return;
                 }
             } else {
-                this.log("Received encrypted message but no PSK found for peer", conn.peer);
-                return;
+                if (this.activePsk) {
+                    try {
+                        data = await this.decryptPayload(raw, this.activePsk);
+                        // Decryption succeeded! This peer used the active QR code PSK.
+                        this.settings.peerKeys[conn.peer] = this.activePsk;
+                        await this.saveSettings();
+                        this.log(`Successfully authenticated new peer ${conn.peer} via active PSK`);
+                    } catch(e) {
+                        this.log("Received encrypted message but no PSK found for peer, and active PSK failed", conn.peer);
+                        return;
+                    }
+                } else {
+                    this.log("Received encrypted message but no PSK found for peer", conn.peer);
+                    return;
+                }
             }
         }
         this.processIncomingData(data, conn);
