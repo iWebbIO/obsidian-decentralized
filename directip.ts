@@ -134,7 +134,12 @@ export class DirectIpServer {
                 try {
                     let parsedData: any;
                     let parsedSuccessfully = false;
-                    if (isBinary || data instanceof Uint8Array || data instanceof ArrayBuffer) {
+                    // IMPORTANT: 'ws' delivers TEXT frames as a Node Buffer too, and Buffer IS
+                    // an instanceof Uint8Array — so the frame kind must be decided by the
+                    // isBinary flag alone. Checking `data instanceof Uint8Array` here routed
+                    // every JSON text message into the binary decoder, which always threw,
+                    // silently dropping ALL client→server traffic (handshakes included).
+                    if (isBinary) {
                         try {
                             parsedData = decodeMessage(data);
                             parsedSuccessfully = true;
@@ -155,6 +160,16 @@ export class DirectIpServer {
                             send: (msg: any) => this.sendTo(deviceId, msg),
                             peer: deviceId,
                             open: true,
+                            // main.ts (heartbeat, PIN rejection) calls conn.close(); without
+                            // this method those call sites threw TypeError every tick.
+                            close: () => {
+                                try { socket.close(); } catch (_) { /* ignore */ }
+                                if (this.clients.get(deviceId)?.socket === socket) {
+                                    this.clients.delete(deviceId);
+                                }
+                                this.plugin.connections?.delete(deviceId);
+                                this.plugin.updateStatus();
+                            },
                         } as any;
 
                         this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => {
@@ -168,7 +183,13 @@ export class DirectIpServer {
             });
 
             socket.on('close', () => {
-                this.clients.delete(deviceId);
+                // Only remove the registration if it still belongs to THIS socket.
+                // A stale socket's late close event must not evict a client that
+                // has already reconnected with a fresh socket under the same deviceId.
+                if (this.clients.get(deviceId)?.socket === socket) {
+                    this.clients.delete(deviceId);
+                    this.plugin.connections?.delete(deviceId);
+                }
                 this.plugin.updateStatus();
             });
             
@@ -199,6 +220,7 @@ export class DirectIpServer {
                     this.plugin.log(`Server: reaping stale client ${deviceId} (silent for ${Math.round((now - entry.lastHeard) / 1000)}s)`);
                     try { entry.socket.close(); } catch (_) { /* ignore */ }
                     this.clients.delete(deviceId);
+                    this.plugin.connections?.delete(deviceId);
                     this.plugin.updateStatus();
                 }
             }
@@ -307,6 +329,19 @@ export class DirectIpClient {
         if (this.heartbeatInterval !== null) {
             clearInterval(this.heartbeatInterval);
             this.heartbeatInterval = null;
+        }
+    }
+
+    /** Reject and drop every queued send. Without this, callers awaiting send()
+     *  hang forever when the connection never (re)opens. */
+    private drainSendBuffer(reason: string) {
+        const pending = this.sendBuffer;
+        this.sendBuffer = [];
+        for (const item of pending) {
+            if (item.data?.transferId) {
+                this.plugin.rejectPendingAck(item.data.transferId, reason);
+            }
+            item.reject?.(new Error(reason));
         }
     }
 
@@ -432,7 +467,10 @@ export class DirectIpClient {
                     const mockConn = {
                         send: (data: any) => this.send(data),
                         peer: 'direct-ip-host',
-                        open: true
+                        open: true,
+                        // main.ts heartbeat calls conn.close() on silent peers; map it to a
+                        // reconnect cycle instead of throwing TypeError.
+                        close: () => this.triggerReconnect()
                     } as any;
 
                     this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => {
@@ -456,6 +494,7 @@ export class DirectIpClient {
             // Fatal: PIN / auth rejection → no retry, surface error
             if (event.code === 1008) {
                 this.isFatalError = true;
+                this.drainSendBuffer('Connection rejected by host (invalid PIN)');
                 this.plugin.log(`DirectIpClient: fatal close (1008 PIN/auth rejection)`);
                 this.plugin.showNotice('Connection rejected by host: invalid PIN.', 'error');
                 this.plugin.updateStatus({
@@ -552,6 +591,7 @@ export class DirectIpClient {
         this.isOpen = false;
         this.isLive = false;
         this.stopHeartbeat();
+        this.drainSendBuffer('Client stopped');
 
         if (this.reconnectTimeout !== null) {
             clearTimeout(this.reconnectTimeout);

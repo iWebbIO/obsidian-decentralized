@@ -66,7 +66,9 @@ export class ConnectionModal extends Modal {
         if (this.plugin.lanDiscovery) {
             if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
             if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
-            this.plugin.lanDiscovery.stopBroadcasting();
+            // Do NOT stopBroadcasting() here: the beacon is global (started at plugin
+            // load) — stopping it on modal close made this device undiscoverable on
+            // the LAN until the plugin was reloaded.
         }
         this.contentEl.empty();
     }
@@ -241,7 +243,9 @@ export class ConnectionModal extends Modal {
         this.statusMessage = `Connecting to ${peerId}...`;
         this.render();
 
-        const conn = this.plugin.peer?.connect(peerId);
+        // reliable:true is required — an unordered channel lets file-chunk-data
+        // overtake file-chunk-start, permanently breaking large-file transfers.
+        const conn = this.plugin.peer?.connect(peerId, { reliable: true });
         if (!conn) {
             this.statusState = 'error';
             this.statusMessage = 'Failed to initiate connection. Are you online?';
@@ -249,15 +253,32 @@ export class ConnectionModal extends Modal {
             return;
         }
 
+        // Register the plugin's handlers BEFORE 'open' fires. setupConnection attaches
+        // its own 'open' listener (which sends the handshake); registering it lazily
+        // inside our own open handler missed the event, so the handshake was never
+        // sent and pairing produced a half-open one-way connection.
+        this.plugin.setupConnection(conn);
+
+        // PeerJS reports "peer unavailable" on the Peer object, not this connection —
+        // without a timeout a typo'd code left the modal spinning forever.
+        const connectTimeout = window.setTimeout(() => {
+            if (this.statusState === 'connecting') {
+                this.statusState = 'error';
+                this.statusMessage = 'Connection timed out. Check the code and make sure the other device is online.';
+                this.render();
+            }
+        }, 20000);
+
         conn.on('open', () => {
+            window.clearTimeout(connectTimeout);
             this.statusState = 'connected';
             this.statusMessage = `Connected to ${conn.peer}`;
-            this.plugin.setupConnection(conn);
             this.render();
             setTimeout(() => this.close(), 1500);
         });
 
         conn.on('error', (err) => {
+            window.clearTimeout(connectTimeout);
             this.statusState = 'error';
             this.statusMessage = `Connection failed. Try again.`;
             this.render();
@@ -364,6 +385,11 @@ export class ConnectionModal extends Modal {
                 this.plugin.lanDiscovery.on('lose', this.loseListener);
                 this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
                 this.plugin.lanDiscovery.startListening();
+                // Seed with peers discovered BEFORE this modal opened — their
+                // 'discover' events fired long ago and won't fire again.
+                for (const p of this.plugin.lanDiscovery.getDiscoveredPeers()) {
+                    this.discoveredPeers.set(p.deviceId, p);
+                }
             }
             renderLanList();
         }
@@ -454,6 +480,10 @@ export class ConnectionModal extends Modal {
                 this.plugin.lanDiscovery.on('lose', this.loseListener);
                 this.plugin.lanDiscovery.startBroadcasting(this.plugin.getMyPeerInfo());
                 this.plugin.lanDiscovery.startListening();
+                // Seed with peers discovered BEFORE this view opened
+                for (const p of this.plugin.lanDiscovery.getDiscoveredPeers()) {
+                    this.discoveredPeers.set(p.deviceId, p);
+                }
             }
             renderLanList();
         }

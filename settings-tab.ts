@@ -434,6 +434,9 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     .onClick(async () => {
                         this.plugin.settings.companionPeerId = peer.deviceId;
                         await this.plugin.saveSettings();
+                        // Tell the other device it is now paired with us — without this
+                        // message the pairing was one-sided and the peer never knew.
+                        this.plugin.sendData(peer.deviceId, { type: 'companion-pair', peerInfo: this.plugin.getMyPeerInfo() });
                         this.plugin.tryToConnectToClusterPeers();
                         this.updateStatus();
                     })
@@ -463,7 +466,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
                         if (this.plugin.peer && !this.plugin.peer.disconnected) {
                             this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`, 'important');
-                            const newConn = this.plugin.peer.connect(peer.deviceId);
+                            const newConn = this.plugin.peer.connect(peer.deviceId, { reliable: true });
                             this.plugin.setupConnection(newConn);
                         } else {
                             this.plugin.showNotice("Cannot reconnect: Your sync is offline.", 'error');
@@ -493,7 +496,9 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             if (this.plugin.directIpServer) {
                 list.createEl('p', { text: 'Hosting on Offline Mode. Other devices can connect to you.' });
             } else if (this.plugin.directIpClient) {
-                const hostInfo = this.plugin.clusterPeers.values().next().value;
+                // Look up the actual host entry — taking the FIRST clusterPeers value
+                // showed a stale, unrelated known peer as the connected host.
+                const hostInfo = this.plugin.clusterPeers.get('direct-ip-host');
                 if (hostInfo) createEntry(hostInfo, 'host');
             } else {
                 list.createEl('p', { text: 'Offline Mode is idle. Use the "Connect" button to start.' });

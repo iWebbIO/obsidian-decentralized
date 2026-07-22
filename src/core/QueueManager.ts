@@ -19,6 +19,8 @@ export class QueueManager {
     private processCallback: (item: QueueItem) => Promise<boolean>;
     private syncDrainCallback: (() => void) | null = null;
     private queueIsPaused: boolean = false;
+    // Incremented on clear(); pending retry timers from an older epoch must not re-add their items
+    private epoch: number = 0;
 
     constructor(
         timeoutManager: TimeoutManager, 
@@ -46,6 +48,7 @@ export class QueueManager {
     }
 
     public clear() {
+        this.epoch++;
         this.syncQueue = [];
         this.inQueueOrProcessing.clear();
         // Do not reset activeQueueTransfers; let in-flight items finish naturally
@@ -87,18 +90,25 @@ export class QueueManager {
             const item = this.syncQueue.shift()!;
             this.activeQueueTransfers++;
 
+            const scheduleRetry = () => {
+                item.retries++;
+                this.pendingRetries++;
+                const scheduledEpoch = this.epoch;
+                // Keep item.id in inQueueOrProcessing during the retry delay
+                // to prevent duplicates from entering the queue in the window.
+                this.timeoutManager.setTimeout(() => {
+                    this.pendingRetries--;
+                    if (item.id) this.inQueueOrProcessing.delete(item.id);
+                    // If clear() ran while we were waiting, the item belongs to an
+                    // aborted sync — don't resurrect it into the fresh queue.
+                    if (scheduledEpoch === this.epoch) this.addToQueue(item);
+                }, 5000);
+            };
+
             this.processCallback(item)
                 .then((success) => {
                     if (!success && item.retries < 3) {
-                        item.retries++;
-                        this.pendingRetries++;
-                        // Keep item.id in inQueueOrProcessing during the retry delay
-                        // to prevent duplicates from entering the queue in the window.
-                        this.timeoutManager.setTimeout(() => {
-                            this.pendingRetries--;
-                            if (item.id) this.inQueueOrProcessing.delete(item.id);
-                            this.addToQueue(item);
-                        }, 5000);
+                        scheduleRetry();
                     } else {
                         if (item.id) this.inQueueOrProcessing.delete(item.id);
                     }
@@ -106,13 +116,7 @@ export class QueueManager {
                 .catch((e) => {
                     console.error("Queue item processing error", e);
                     if (item.retries < 3) {
-                        item.retries++;
-                        this.pendingRetries++;
-                        this.timeoutManager.setTimeout(() => {
-                            this.pendingRetries--;
-                            if (item.id) this.inQueueOrProcessing.delete(item.id);
-                            this.addToQueue(item);
-                        }, 5000);
+                        scheduleRetry();
                     } else {
                         if (item.id) this.inQueueOrProcessing.delete(item.id);
                     }

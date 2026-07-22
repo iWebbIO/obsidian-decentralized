@@ -8,6 +8,7 @@ export class DummyLANDiscovery implements ILANDiscovery {
     stopBroadcasting(): void { }
     startListening(): void { }
     stop(): void { }
+    getDiscoveredPeers(): PeerInfo[] { return []; }
 }
 
 export class DesktopLANDiscovery implements ILANDiscovery {
@@ -22,7 +23,6 @@ export class DesktopLANDiscovery implements ILANDiscovery {
     private broadcastTimer: number | null = null;
     private lastPeerInfo: PeerInfo | null = null;
     private hasNetworkListeners: boolean = false;
-    private isBound: boolean = false;
     private socketRestartAttempts: number = 0;
     private restartTimeout: number | null = null;
     private isRestarting: boolean = false;
@@ -34,11 +34,11 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         const wasBroadcasting = this.broadcastTimer !== null;
         this.stopBroadcasting();
         if (this.socket) {
-            if (this.isBound) {
-                try { this.socket.close(); } catch (_) {}
-            }
+            // Close unconditionally: a socket that is still binding must be closed too,
+            // otherwise it leaks — it finishes binding later and keeps emitting
+            // discover/lose events forever alongside its replacement.
+            try { this.socket.close(); } catch (_) {}
             this.socket = null;
-            this.isBound = false;
         }
         this.socketRestartAttempts = 0;
         if (wasBroadcasting && this.lastPeerInfo) {
@@ -91,11 +91,8 @@ export class DesktopLANDiscovery implements ILANDiscovery {
             
             // Clean up the socket immediately but do not completely cease network change listeners
             if (this.socket) {
-                if (this.isBound) {
-                    try { this.socket.close(); } catch (_) {}
-                }
+                try { this.socket.close(); } catch (_) {}
                 this.socket = null;
-                this.isBound = false;
             }
             
             this.socketRestartAttempts++;
@@ -117,7 +114,6 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         });
 
         this.socket.on('listening', () => {
-            this.isBound = true;
             this.socketRestartAttempts = 0;
             if (this.restartTimeout !== null) {
                 clearTimeout(this.restartTimeout);
@@ -234,6 +230,12 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         this.createSocket();
     }
 
+    /** Peers currently known to discovery. Lets late-attaching listeners (e.g. a
+     *  freshly opened pairing modal) see peers whose 'discover' event already fired. */
+    public getDiscoveredPeers(): PeerInfo[] {
+        return Array.from(this.discoveredPeers.values());
+    }
+
     public stop() {
         this.stopBroadcasting();
         if (this.restartTimeout !== null) {
@@ -249,15 +251,12 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         }
 
         if (this.socket) {
-            if (this.isBound) {
-                try {
-                    this.socket.close();
-                } catch (e) {
-                    console.error('Error closing LAN discovery socket:', e);
-                }
+            try {
+                this.socket.close();
+            } catch (e) {
+                console.error('Error closing LAN discovery socket:', e);
             }
             this.socket = null;
-            this.isBound = false;
         }
         this.discoveredPeers.forEach((peerInfo, peerId) => {
             this.emit('lose', peerInfo);

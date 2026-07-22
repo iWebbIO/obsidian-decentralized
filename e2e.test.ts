@@ -1,8 +1,6 @@
 import { DesktopLANDiscovery } from './discovery';
-import { DirectIpServer, DirectIpClient } from './directip';
-import { PeerInfo } from './types';
 import MockWebSocket from './__mocks__/ws';
-import * as dgram from 'dgram';
+
 
 // Mock dgram for LAN Discovery testing
 jest.mock('dgram', () => {

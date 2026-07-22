@@ -543,4 +543,5 @@ export interface ILANDiscovery {
     stopBroadcasting(): void;
     startListening(): void;
     stop(): void;
+    getDiscoveredPeers(): PeerInfo[];
 }

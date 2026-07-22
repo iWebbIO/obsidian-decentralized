@@ -3,10 +3,16 @@ import { TFile, Vault } from 'obsidian';
 export class FileManager {
     private vault: Vault;
     private fileLocks: Map<string, { peerId: string; expiresAt: number }> = new Map();
+    private cleanupInterval: ReturnType<typeof setInterval>;
 
     constructor(vault: Vault) {
         this.vault = vault;
-        setInterval(() => this.cleanupExpiredLocks(), 60000);
+        this.cleanupInterval = setInterval(() => this.cleanupExpiredLocks(), 60000);
+    }
+
+    public destroy(): void {
+        clearInterval(this.cleanupInterval);
+        this.fileLocks.clear();
     }
 
     /**

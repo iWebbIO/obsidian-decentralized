@@ -27,12 +27,14 @@ describe('DesktopLANDiscovery', () => {
 
     test('should start listening and handle socket creation', () => {
         discovery.startListening();
-        expect((discovery as any).socket).toBeDefined();
-        expect((discovery as any).isBound).toBeFalsy(); // until 'listening' is emitted
+        const socket = (discovery as any).socket;
+        expect(socket).toBeDefined();
 
-        // Emulate listening
-        (discovery as any).socket.emit('listening');
-        expect((discovery as any).isBound).toBeTruthy();
+        // Emulate listening — restart bookkeeping resets and multicast is configured
+        (discovery as any).socketRestartAttempts = 2;
+        socket.emit('listening');
+        expect((discovery as any).socketRestartAttempts).toBe(0);
+        expect((discovery as any).socket).toBe(socket); // socket kept after successful bind
     });
 
     test('should broadcast dynamically serialized beacons', () => {
