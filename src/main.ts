@@ -4312,8 +4312,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.syncedHashes.delete(oldPath);
             this.hashCacheDirty = true;
         }
-        const vector = versionVector ?? this.twoDeviceState.fileVersions[oldPath];
-        if (vector) this.twoDeviceState.fileVersions[newPath] = vector;
+        // Merged, not replaced: a peer's rename of a note edited here must not forget that edit.
+        const vector = mergeVectors(this.twoDeviceState.fileVersions[oldPath], versionVector);
+        if (Object.keys(vector).length) this.twoDeviceState.fileVersions[newPath] = vector;
         delete this.twoDeviceState.fileVersions[oldPath];
         this.tombstones[oldPath] = Date.now();
         delete this.tombstones[newPath];

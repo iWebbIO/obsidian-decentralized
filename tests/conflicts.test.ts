@@ -489,6 +489,21 @@ describe('renames made offline', () => {
     });
 });
 
+describe('renames from another device', () => {
+    test('keep what this device knew about the note', async () => {
+        const vault = vaultWith({ 'note.md': ['edited here', T] });
+        const b = await createDevice(B, { vault });
+        b.plugin.twoDeviceState.fileVersions['note.md'] = { [B]: 1 };
+
+        await (b.plugin as any).processIncomingData(
+            { type: 'file-rename', oldPath: 'note.md', newPath: 'renamed.md', transferId: 't', versionVector: { [A]: 1 } },
+            { peer: A, open: true, send: () => { } });
+        await waitFor(() => vault.has('renamed.md'), { what: 'the rename' });
+
+        expect(b.plugin.twoDeviceState.fileVersions['renamed.md']).toEqual({ [A]: 1, [B]: 1 });
+    });
+});
+
 describe('full-sync completion', () => {
     test('finishes even when the peer gave up on a file it was allowed to pull', async () => {
         // A path the peer abandoned after three failures stayed "allowed" here forever, so this
