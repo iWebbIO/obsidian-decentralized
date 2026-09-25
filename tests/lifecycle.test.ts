@@ -146,3 +146,20 @@ describe('connection glare', () => {
         expect(isLinked(b, a)).toBe(true);
     });
 });
+
+describe('startup', () => {
+    test('the vault loading does not count as edits made on this device', async () => {
+        // Obsidian reports every existing file as created while it loads the vault. Heard by
+        // the plugin, each startup counted every note as edited here — edits that never
+        // happened, which then won conflicts they should have lost.
+        const device = await createDevice('device-aaaa0001', { layoutReady: false, waitForOpen: false });
+        await device.vault.create('existing.md', 'loaded from disk');
+        await sleep(30);
+        expect(device.plugin.twoDeviceState.fileVersions['existing.md']).toBeUndefined();
+
+        device.app.workspace.finishLayout();
+        await device.vault.create('new.md', 'written after startup');
+        await sleep(30);
+        expect(device.plugin.twoDeviceState.fileVersions['new.md']).toEqual({ 'device-aaaa0001': 1 });
+    });
+});

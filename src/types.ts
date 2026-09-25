@@ -493,7 +493,42 @@ export type SyncData =
     | SyncAckPayload
     | MerkleRootPayload
     | MerkleNodeRequestPayload
-    | MerkleNodeResponsePayload;
+    | MerkleNodeResponsePayload
+    | ConfigManifestPayload
+    | ConfigRequestPayload
+    | ConfigFilePayload
+    | ConfigDeletePayload;
+
+// Obsidian settings (config folder) sync. Paths are relative to the config folder, which
+// can be named differently on each device.
+export interface ConfigFileState { hash: string; mtime: number; size: number }
+
+export type ConfigManifestPayload = {
+    type: 'config-manifest';
+    files: Array<{ configPath: string } & ConfigFileState>;
+    deleted: Array<{ configPath: string; at: number }>;
+};
+
+export type ConfigRequestPayload = {
+    type: 'config-request';
+    configPaths: string[];
+};
+
+export type ConfigFilePayload = {
+    type: 'config-file';
+    configPath: string;
+    mtime: number;
+    /** SHA-256 of the uncompressed content. */
+    hash: string;
+    /** Deflated content. */
+    data: ArrayBuffer | Uint8Array;
+};
+
+export type ConfigDeletePayload = {
+    type: 'config-delete';
+    configPath: string;
+    at: number;
+};
 
 // Interfaces
 export interface PeerServerConfig {

@@ -89,7 +89,7 @@ const live = new Set<Device>();
 
 export async function createDevice(
     id: string,
-    opts: { name?: string; settings?: Partial<ObsidianDecentralizedSettings>; vault?: FakeVault; waitForOpen?: boolean } = {}
+    opts: { name?: string; settings?: Partial<ObsidianDecentralizedSettings>; vault?: FakeVault; waitForOpen?: boolean; layoutReady?: boolean } = {}
 ): Promise<Device> {
     // Nearby discovery is desktop-only and needs a UDP socket; the mobile code path swaps in
     // the no-op implementation.
@@ -99,6 +99,8 @@ export async function createDevice(
     const vault = opts.vault ?? new FakeVault();
     vault.ensureHiddenFolder(MANIFEST.dir);
     const app = new FakeApp(vault);
+    // Obsidian loads plugins before the workspace layout (and the vault index) is ready.
+    if (opts.layoutReady === false) app.workspace.layoutReady = false;
     const plugin = new ObsidianDecentralizedPlugin(app as any, { ...MANIFEST } as any);
     (plugin as any)._data = { ...TEST_SETTINGS, ...opts.settings, deviceId: id, friendlyName: opts.name ?? id };
     const device: Device = { id, plugin, app, vault };

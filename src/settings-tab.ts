@@ -59,7 +59,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('How much to show')
-            .setDesc('Auto just works — everything syncs the safe way. Manual lets you pick folders and extras. Advanced adds extra technical options.')
+            .setDesc('Auto just works — every note and file syncs, and so does your theme, CSS snippets and appearance settings. Manual lets you pick folders and extras. Advanced adds extra technical options.')
             .addDropdown(dd => dd
                 .addOption('auto', 'Auto (recommended)')
                 .addOption('manual', 'Manual')
@@ -146,7 +146,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Also sync Obsidian settings (.obsidian)")
-            .setDesc("Risky. Copies themes, snippets, and plugin settings to your other devices. Only turn this on if they use the same plugins and Obsidian version — and make a backup first.")
+            .setDesc("Shares your theme, snippets, settings, hotkeys and other plugins (with their settings) between devices. The window layout stays per device, and this plugin's own settings are never shared. Plugins and settings only travel between devices paired with a pairing code, or joined in Offline Mode. Restart Obsidian after settings arrive. Use the same Obsidian version on each device, and make a backup first.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.syncObsidianConfig)
                 .onChange(async (value) => {

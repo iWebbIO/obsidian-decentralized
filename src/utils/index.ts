@@ -62,6 +62,33 @@ export function decompressText(data: ArrayBuffer | Uint8Array, maxBytes: number 
     }
 }
 
+/** Deflate raw bytes (settings files, plugin code) for the wire. */
+export function compressBytes(data: Uint8Array): Uint8Array {
+    return pako.deflate(data);
+}
+
+/**
+ * Inflate bytes from a peer, refusing to grow past `maxBytes` — the same guard as
+ * decompressText, for binary content.
+ */
+export function decompressBytes(data: ArrayBuffer | Uint8Array, maxBytes: number): Uint8Array {
+    const inflater = new pako.Inflate();
+    let total = 0;
+    let overflowed = false;
+    (inflater as any).onData = function (chunk: Uint8Array) {
+        total += chunk.length;
+        if (total > maxBytes) {
+            overflowed = true;
+            return;
+        }
+        (this as any).chunks.push(chunk);
+    };
+    inflater.push(data instanceof Uint8Array ? data : new Uint8Array(data), true);
+    if (overflowed) throw new Error(`decompressed payload exceeds ${maxBytes} bytes`);
+    if (inflater.err) throw new Error(inflater.msg || `inflate error ${inflater.err}`);
+    return (inflater.result as Uint8Array) ?? new Uint8Array(0);
+}
+
 /**
  * Normalises a vault-relative path that came from a peer and rejects anything that could
  * escape the vault or slip past the folder filters.
@@ -238,6 +265,7 @@ const BINARY_BODY_FIELD: Record<string, 'data' | 'content'> = {
     'encrypted-frame': 'data',
     'sync-control-binary': 'data',
     'file-update': 'content',
+    'config-file': 'data',
 };
 
 /**
@@ -275,6 +303,7 @@ export function splitBinaryPayload(msg: any): { header: any; body: Uint8Array | 
  * `instanceof ArrayBuffer` and is handed straight to the vault's binary writers.
  */
 const VIEW_SAFE_BODY_TYPES = new Set([
+    'config-file',
     'file-chunk-data',
     'file-batch-binary',
     'encrypted-frame',

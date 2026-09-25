@@ -13,6 +13,7 @@ import { DummyLANDiscovery, DesktopLANDiscovery } from './discovery';
 
 // Direct IP imports
 import { DirectIpServer, DirectIpClient } from './directip';
+import { ConfigSync, ConfigScope } from './core/ConfigSync';
 import { compareVectors, mergeVectors, newerVersion, pickVersion, hasOwnUnseenEdit, sanitizeVersionVector, VersionInfo } from './utils/versions';
 
 // Types & Constants imports
@@ -299,6 +300,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     // Two-Device Mode State
     public twoDeviceState: TwoDeviceState = { fileVersions: {}, merkleTreeRoot: null };
+    public configSync!: ConfigSync;
     public tombstones: Record<string, number> = {};
     public currentSyncIsTwoDeviceMode: boolean | null = null;
     /** 0 means the cached Merkle tree is stale and must be rebuilt. */
@@ -415,19 +417,54 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.invalidateMerkleTree();
             this.handleEvent(file);
         };
-        this.registerEvent(this.app.vault.on('create', onVaultEvent));
-        this.registerEvent(this.app.vault.on('modify', onVaultEvent));
-        this.registerEvent(this.app.vault.on('delete', (file) => {
-            // A removed path can no longer be assumed to exist.
-            this.forgetKnownFolders(file.path);
-            onVaultEvent(file);
-        }));
-        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-            this.invalidateMerkleTree();
-            this.forgetKnownFolders(oldPath);
-            this.handleRenameEvent(file, oldPath);
-        }));
+        // Obsidian reports every existing file as "created" while it loads the vault. Heard
+        // here, each startup counted every file as edited on this device — and an edit that
+        // never happened wins conflicts it should lose. Listen once loading is done.
+        this.app.workspace.onLayoutReady(() => {
+            if (this.unloaded) return;
+            this.registerEvent(this.app.vault.on('create', onVaultEvent));
+            this.registerEvent(this.app.vault.on('modify', onVaultEvent));
+            this.registerEvent(this.app.vault.on('delete', (file) => {
+                // A removed path can no longer be assumed to exist.
+                this.forgetKnownFolders(file.path);
+                onVaultEvent(file);
+            }));
+            this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+                this.invalidateMerkleTree();
+                this.forgetKnownFolders(oldPath);
+                this.handleRenameEvent(file, oldPath);
+            }));
+        });
         this.registerEvent(this.app.workspace.on('editor-change', (editor, info) => this.handleEditorChange(editor, info)));
+
+        this.configSync = new ConfigSync({
+            adapter: this.app.vault.adapter as any,
+            configDir: () => this.app.vault.configDir || '.obsidian',
+            ownPluginFolder: () => {
+                const configDir = this.app.vault.configDir || '.obsidian';
+                const dir = this.manifest.dir || `${configDir}/plugins/${this.manifest.id}`;
+                return dir.startsWith(configDir + '/') ? dir.slice(configDir.length + 1) : `plugins/${this.manifest.id}`;
+            },
+            scope: () => this.configScope(),
+            deviceId: () => this.settings.deviceId,
+            peerDeviceId: (peer) => this.realDeviceId(peer) ?? peer,
+            peerName: (peer) => this.clusterPeers.get(peer)?.friendlyName || 'another device',
+            // Offline Mode authenticates both ends with the join token; over the internet only
+            // a device sharing a pairing key qualifies.
+            trustedForCode: (peer) => this.getConnectionMode() === 'direct-ip' || !!this.peerKeyFor(peer),
+            connectedPeers: () => Array.from(this.connections.entries()).filter(([, c]) => c.open).map(([id]) => id),
+            send: (peer, message) => this.sendData(peer, message),
+            hash: (data) => this.getHash(data),
+            notify: (message) => this.showNotice(message, 'important', 15000),
+            log: (...args) => this.log(...args),
+            stateChanged: () => this.scheduleStateSave(),
+        });
+        this.registerEvent(this.app.workspace.on('css-change', () => { void this.configSync.scan(); }));
+        this.registerInterval(window.setInterval(() => { void this.configSync.scan(); }, Platform.isMobile ? 60000 : 30000));
+
+        // Durable state (version vectors, tombstones, queued work) before any device connects.
+        await this.loadState();
+        this.pruneTombstones();
 
         this.initializeConnectionManager();
         this.startHeartbeat();
@@ -440,9 +477,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         window.addEventListener('online',  this.networkChangeHandler);
         window.addEventListener('offline', this.networkChangeHandler);
         this.lanDiscovery.on('network-change', this.networkChangeHandler);
-        
-        await this.loadState();
-        this.pruneTombstones();
     }
 
     onunload() {
@@ -495,6 +529,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.debouncedSaveHashCache.cancel();
         this.debouncedSaveQueue.cancel();
         this.debouncedEditorChange.cancel();
+        this.configSync?.dispose();
         void this.saveState(true);
         void this.saveHashCache(true);
         void this.saveQueueState(true);
@@ -744,6 +779,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             if (state.failedSyncs) this.failedSyncs = state.failedSyncs;
             if (state.tombstones) this.tombstones = state.tombstones;
+            this.configSync?.load(state.configSync);
             if (state.twoDeviceState) {
                 this.twoDeviceState = state.twoDeviceState;
                 if (!this.twoDeviceState.fileVersions) this.twoDeviceState.fileVersions = {};
@@ -789,6 +825,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             failedSyncs: this.failedSyncs,
             twoDeviceState: this.twoDeviceState,
             tombstones: this.tombstones,
+            configSync: this.configSync?.state,
         });
         await this.writeJsonAtomic(this.statePath, json);
     }
@@ -916,6 +953,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // A PSK may have been added, rotated or removed — drop cached CryptoKeys so a
         // stale key is never reused for a peer.
         this.invalidateCryptoKey();
+        void this.configSync?.onSettingsChanged();
     }
     async saveKnownPeers() {
         this.settings.knownPeers = Array.from(this.clusterPeers.values()).map(persistablePeerInfo);
@@ -1022,7 +1060,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return 'newest-with-copy';
     }
     public shouldSyncAllFileTypes() { return this.settings.syncMode === 'auto' ? true : this.settings.syncAllFileTypes; }
-    public shouldSyncObsidianConfig() { return this.settings.syncMode === 'auto' ? true : this.settings.syncObsidianConfig; }
+    public shouldSyncObsidianConfig() { return this.configScope() !== 'off'; }
+    /**
+     * Which Obsidian settings sync: Automatic mode shares the look (theme, CSS snippets,
+     * appearance settings); the manual opt-in adds settings, hotkeys and other plugins.
+     */
+    public configScope(): ConfigScope {
+        if (this.settings.syncMode === 'auto') return 'appearance';
+        return this.settings.syncObsidianConfig ? 'full' : 'off';
+    }
     // Respect the explicit connectionMode even in 'auto' sync mode: hard-forcing
     // 'peerjs' here made the "Switch to Offline Mode" UI a no-op for default-profile
     // users — the UI showed Direct-IP while the runtime kept using PeerJS.
@@ -2772,6 +2818,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 case 'merkle-root': await this.handleMerkleRoot(data, conn!); break;
                 case 'merkle-node-request': await this.handleMerkleNodeRequest(data, conn!); break;
                 case 'merkle-node-response': await this.handleMerkleNodeResponse(data, conn!); break;
+
+                // Obsidian settings
+                case 'config-manifest': if (conn) void this.configSync.handleManifest(data, conn.peer).catch(e => this.log('Config sync failed', e)); break;
+                case 'config-request': if (conn) void this.configSync.handleRequest(data, conn.peer).catch(e => this.log('Config sync failed', e)); break;
+                case 'config-file': if (conn) void this.configSync.handleFile(data, conn.peer).catch(e => this.log('Config sync failed', e)); break;
+                case 'config-delete': if (conn) void this.configSync.handleDelete(data, conn.peer).catch(e => this.log('Config sync failed', e)); break;
             }
         } catch (e) {
             this.log(`Error processing incoming data (type: ${data.type}):`, e);
@@ -2896,6 +2948,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         this.resumeTransfers(conn.peer);
+        void this.configSync.onPeerConnected(conn.peer).catch(e => this.log('Config sync failed', e));
     }
 
     /**
