@@ -38,6 +38,10 @@ export class QueueManager {
     // Incremented on clear(); pending retry timers from an older epoch must not re-add their items
     private epoch: number = 0;
     private seqCounter: number = 0;
+    /** Items handed to the processor and not yet finished, for persistence. */
+    private inFlight: Set<QueueItem> = new Set();
+    /** Set by dispose(): nothing is processed, retried or accepted afterwards. */
+    private disposed: boolean = false;
 
     constructor(
         timeoutManager: TimeoutManager,
@@ -116,7 +120,19 @@ export class QueueManager {
         // Do not reset activeQueueTransfers; let in-flight items finish naturally
     }
 
+    /**
+     * Permanently stop the queue (plugin unload). In-flight items may still settle, but their
+     * retries are dropped and nothing new starts — a retry timer or a late addToQueue used to
+     * restart processing inside a disabled plugin.
+     */
+    public dispose() {
+        this.disposed = true;
+        this.clear();
+        this.syncDrainCallback = null;
+    }
+
     public addToQueue(item: QueueItem) {
+        if (this.disposed) return;
         // Callers are expected to supply a stable, content-derived id so that repeated
         // work for the same path coalesces. Only fall back to a random id when there is
         // nothing to key on — a random id can never dedup against anything.
@@ -139,46 +155,56 @@ export class QueueManager {
     public getActiveTransfers(): number { return this.activeQueueTransfers; }
 
     private processQueue() {
-        if (this.queueIsPaused) return;
+        if (this.queueIsPaused || this.disposed) return;
         // Drain the queue up to the concurrency limit. Since JS is single-threaded,
         // this loop runs atomically — no re-entry can occur before the while exits.
         while (this.activeQueueTransfers < this.maxConcurrency && this.syncQueue.length > 0) {
             const item = this.heapPop()!;
             this.activeQueueTransfers++;
+            this.inFlight.add(item);
+            const epoch = this.epoch;
+
+            // Release the item's dedup slot — but only in the epoch that claimed it. clear()
+            // empties the set, and an item finishing afterwards used to delete the slot of a
+            // NEW item with the same id, letting a duplicate of it into the queue.
+            const release = () => {
+                if (item.id && epoch === this.epoch) this.inQueueOrProcessing.delete(item.id);
+            };
 
             const scheduleRetry = () => {
+                if (this.disposed) return;
                 item.retries++;
                 this.pendingRetries++;
-                const scheduledEpoch = this.epoch;
                 // Keep item.id in inQueueOrProcessing during the retry delay
                 // to prevent duplicates from entering the queue in the window.
                 this.timeoutManager.setTimeout(() => {
                     this.pendingRetries--;
-                    if (item.id) this.inQueueOrProcessing.delete(item.id);
+                    release();
                     // If clear() ran while we were waiting, the item belongs to an
                     // aborted sync — don't resurrect it into the fresh queue.
-                    if (scheduledEpoch === this.epoch) this.addToQueue(item);
+                    if (epoch === this.epoch) this.addToQueue(item);
                 }, 5000);
             };
 
             this.processCallback(item)
                 .then((success) => {
-                    if (!success && item.retries < 3) {
+                    if (!success && item.retries < 3 && !this.disposed) {
                         scheduleRetry();
                     } else {
-                        if (item.id) this.inQueueOrProcessing.delete(item.id);
+                        release();
                     }
                 })
                 .catch((e) => {
                     console.error("Queue item processing error", e);
-                    if (item.retries < 3) {
+                    if (item.retries < 3 && !this.disposed) {
                         scheduleRetry();
                     } else {
-                        if (item.id) this.inQueueOrProcessing.delete(item.id);
+                        release();
                     }
                 })
                 .finally(() => {
                     this.activeQueueTransfers--;
+                    this.inFlight.delete(item);
                     // Re-enter processQueue after each item completes to drain pending work
                     this.processQueue();
                 });
@@ -189,9 +215,13 @@ export class QueueManager {
         }
     }
 
-    /** Snapshot of queued items. Heap order, not drain order — used only for persistence. */
+    /**
+     * Snapshot of queued items plus those currently being processed. Heap order, not drain
+     * order — used only for persistence. In-flight items are included because an unload
+     * interrupts them: re-sending a change after a restart is harmless, losing it is not.
+     */
     public getQueue(): QueueItem[] {
-        return this.syncQueue;
+        return [...this.syncQueue, ...this.inFlight];
     }
 
     public loadQueue(items: QueueItem[]) {

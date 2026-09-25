@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, TFolder, TAbstractFile, Platform, debounce, MarkdownView, setIcon } from 'obsidian';
+import { Notice, Plugin, TFile, TFolder, TAbstractFile, Platform, debounce, Debouncer, MarkdownView, setIcon } from 'obsidian';
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
 
@@ -209,9 +209,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private pairingWindowTimer: number | null = null;
 
     private refreshLanBeacon() {
-        if (Platform.isMobile) return;
+        if (Platform.isMobile || this.unloaded) return;
         this.lanDiscovery?.startBroadcasting(this.getMyPeerInfo());
     }
+    /**
+     * Set first thing in onunload. Several callbacks outlive the plugin (PeerJS and
+     * DataConnection events fired by destroy(), in-flight promises, the pairing-window timer)
+     * and each of them used to be able to restart networking on a disabled instance.
+     */
+    private unloaded = false;
+    /** Fires if the current Peer never reaches the signalling server. */
+    private peerOpenTimeout: number | null = null;
     private clusterConnectionInterval: number | null = null;
     public pendingConnections: Set<string> = new Set();
     private pendingFileChunks: Map<string, {
@@ -257,9 +265,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private statePath: string;
     private hashCachePath: string;
     public manualPingStart: Map<string, number> = new Map();
-    private debouncedSaveState: () => void;
-    private debouncedSaveHashCache: () => void;
-    private debouncedSaveQueue: () => void;
+    private debouncedSaveState: Debouncer<[], void>;
+    private debouncedSaveHashCache: Debouncer<[], void>;
+    private debouncedSaveQueue: Debouncer<[], void>;
     // Dirty flags: without them the debounced savers rewrote identical files on every
     // tick, since most call sites fire whether or not anything actually changed.
     private stateDirty: boolean = false;
@@ -306,7 +314,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // Real-time Editor Sync State
     public activeEditorLocks: Map<string, string> = new Map();
     private isApplyingRemoteEdit: boolean = false;
-    private debouncedEditorChange: (editor: any, info: any) => void;
+    private debouncedEditorChange: Debouncer<[any, TFile], Promise<void>>;
 
     async onload() {
         // Initialize Core Managers
@@ -423,6 +431,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     onunload() {
+        this.unloaded = true;
+
         // Remove centralized network-change listeners
         if (this.networkChangeHandler) {
             window.removeEventListener('online',  this.networkChangeHandler);
@@ -431,30 +441,62 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.networkChangeHandler = null;
         }
 
-        // These three are plain window timers, not registerInterval/timeoutManager ones, so
-        // nothing clears them for us. Left running, a disabled instance keeps calling
-        // initializePeer() and races the next load for the same PeerJS id — which the broker
-        // answers with unavailable-id, and only an Obsidian restart recovers from.
+        // Plain window timers, not registerInterval/timeoutManager ones, so nothing clears
+        // them for us. Left running, a disabled instance keeps calling initializePeer() and
+        // races the next load for the same PeerJS id.
         if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
-        if (this.peerReconnectFallbackTimeout) { clearTimeout(this.peerReconnectFallbackTimeout); this.peerReconnectFallbackTimeout = null; }
         if (this.clusterConnectionInterval) { clearInterval(this.clusterConnectionInterval); this.clusterConnectionInterval = null; }
+        // Re-broadcast the LAN beacon when the pairing window closes — which, on an unloaded
+        // plugin, meant reopening a UDP socket that nothing would ever close again.
+        if (this.pairingWindowTimer !== null) { window.clearTimeout(this.pairingWindowTimer); this.pairingWindowTimer = null; }
 
-        this.peer?.destroy();
+        // Stop a running sync quietly: its phase, idle and keep-alive timers would otherwise
+        // fire into the disabled plugin and pop "Sync stopped" after the user turned it off.
+        this.abortSync(undefined, { silent: true });
+        this.rejectAllPendingAcks('Plugin unloaded');
+        for (const request of this.pendingLockRequests.values()) {
+            window.clearTimeout(request.timeout);
+            request.resolve(false);
+        }
+        this.pendingLockRequests.clear();
+
+        this.destroyPeer();
         this.lanDiscovery.stop();
         this.directIpServer?.stop();
         this.directIpClient?.stop();
-
-        this.activeTransfers.clear();
         this.connections.clear();
-        
-        // Safely destroy all background timeouts and queue processes
-        this.queueManager.clear();
-        this.timeoutManager.clearAll();
 
-        // Force immediate saves on unload instead of waiting out the debounce windows.
+        // An upload cut off here stays as a paused record so the next session re-sends the
+        // file; a partial download is useless without its sender.
+        for (const [id, transfer] of this.activeTransfers) {
+            if (transfer.direction === 'upload') transfer.status = 'paused';
+            else this.activeTransfers.delete(id);
+        }
+
+        // Save now instead of waiting out the debounce windows, and BEFORE the queue is
+        // disposed: this used to clear the queue first and then persist the empty result, so
+        // every change still waiting to go out was lost on each disable or restart.
+        this.debouncedSaveState.cancel();
+        this.debouncedSaveHashCache.cancel();
+        this.debouncedSaveQueue.cancel();
+        this.debouncedEditorChange.cancel();
         void this.saveState(true);
         void this.saveHashCache(true);
         void this.saveQueueState(true);
+
+        this.queueManager.dispose();
+        this.timeoutManager.dispose();
+        document.body.classList.remove('od-hide-native-sync');
+    }
+
+    /** Fail every transfer and sync-message waiter, clearing their timers. */
+    private rejectAllPendingAcks(reason: string) {
+        const acks = Array.from(this.pendingAcks.values());
+        this.pendingAcks.clear();
+        for (const ack of acks) ack.reject(new Error(reason));
+        const syncAcks = Array.from(this.pendingSyncAcks.values());
+        this.pendingSyncAcks.clear();
+        for (const ack of syncAcks) ack.reject(new Error(reason));
     }
 
     // --- Core Two-Device Infrastructure ---
@@ -754,12 +796,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     /** Mark durable state as needing a write and schedule the debounced save. */
     private scheduleStateSave() {
         this.stateDirty = true;
+        // onunload has already written the final copy; a late write could land after the
+        // next instance loaded and overwrite what it saved.
+        if (this.unloaded) return;
         this.debouncedSaveState();
     }
 
     /** Queue contents changed. Persisted separately from state.json, on its own cadence. */
     private scheduleQueueSave() {
         this.queueDirty = true;
+        if (this.unloaded) return;
         this.debouncedSaveQueue();
     }
 
@@ -774,7 +820,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         // Cache-only mutation: this used to trigger a full state write per hashed file.
         this.hashCacheDirty = true;
-        this.debouncedSaveHashCache();
+        if (!this.unloaded) this.debouncedSaveHashCache();
     }
 
     pruneTombstones() {
@@ -858,6 +904,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' | 'warning' | 'transient' = 'info', timeout?: number) {
+        // Work still settling after a disable must not pop toasts for a plugin that is off.
+        if (this.unloaded) {
+            this.log(`[notice after unload] ${message}`);
+            return;
+        }
         // 'transient' is connection-lifecycle churn (dropped/reconnecting/closed). A flaky
         // network fires it in a loop, so it never reaches a toast at all — not even when
         // showToasts is on. The status bar reports the very same state continuously
@@ -1352,8 +1403,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         });
     }
 
-    public abortSync(error?: SyncError) {
+    /**
+     * @param opts.silent skip the user-facing notice (used on unload, where the user just
+     *   turned the plugin off and a "Sync stopped" toast would be noise).
+     */
+    public abortSync(error?: SyncError, opts?: { silent?: boolean }) {
         if (!this.syncState.isSyncing) return;
+        const syncPeer = this.syncState.peerId;
         this.transitionToPhase(SyncPhase.ABORTING);
         this.syncState.isSyncing = false;
         this.currentSyncIsTwoDeviceMode = null;
@@ -1361,7 +1417,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.queueManager.clear();
         this.scheduleQueueSave();
         this.scheduleStateSave();
-        this.activeTransfers.clear();
+        // Only this sync's transfers. Clearing them all also discarded paused uploads to
+        // other devices, which are the only record that those devices still need a file.
+        for (const [id, transfer] of this.activeTransfers) {
+            if (transfer.peerId === syncPeer) this.activeTransfers.delete(id);
+        }
         this.syncState.pendingPulls.clear();
         this.syncState.allowedPulls.clear();
         this.syncState.activeBatches.clear();
@@ -1376,17 +1436,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.pullCursor = 0;
         this.syncState.peerId = null;
         this.peerFileSizes = {};
-        if (this.syncIdleTimeout) { clearTimeout(this.syncIdleTimeout); this.syncIdleTimeout = null; }
+        this.timeoutManager.clearTimeout(this.syncIdleTimeout);
+        this.syncIdleTimeout = null;
         if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
         if (this.syncState.phaseTimeoutHandle) { clearTimeout(this.syncState.phaseTimeoutHandle); this.syncState.phaseTimeoutHandle = null; }
-        
+
         const errorMessage = error ? error.message : "Sync aborted manually.";
-        this.pendingAcks.forEach(ack => ack.reject(new Error(errorMessage)));
-        this.pendingAcks.clear();
-        this.pendingSyncAcks.forEach(ack => ack.reject(new Error(errorMessage)));
-        this.pendingSyncAcks.clear();
-        
-        if (error) {
+        this.rejectAllPendingAcks(errorMessage);
+
+        if (opts?.silent) {
+            this.log(`Sync aborted silently${error ? ` [${error.category}]: ${error.message}` : '.'}`);
+        } else if (error) {
             if (error.category === SyncErrorCategory.TIMEOUT_ERROR && error.message === "Sync idle timeout reached. Connection may have dropped.") {
                 this.showNotice("Sync stalled — nothing moved for a while. Try Force full sync.", "warning");
             } else {
@@ -1964,21 +2024,43 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public reinitializeConnectionManager() {
-        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
+        if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
         if (this.clusterConnectionInterval) { clearInterval(this.clusterConnectionInterval); this.clusterConnectionInterval = null; }
-        this.peer?.destroy();
+        this.destroyPeer();
         this.directIpClient?.stop();
         this.directIpServer?.stop();
         this.directIpClient = null;
         this.directIpServer = null;
         this.connections.clear();
-        this.activeTransfers.clear();
+        this.settleTransfersAfterDisconnect();
         this.initializeConnectionManager();
     }
 
+    /**
+     * After links drop: keep interrupted uploads as paused records, so the file is sent again
+     * when that device is back, and drop downloads, which cannot continue without their sender.
+     * Clearing everything here used to discard the only record of what a peer still needed.
+     */
+    private settleTransfersAfterDisconnect(peerId?: string) {
+        for (const [id, transfer] of this.activeTransfers) {
+            if (peerId !== undefined && transfer.peerId !== peerId) continue;
+            if (transfer.direction === 'upload') {
+                transfer.status = 'paused';
+                transfer.lastUpdate = Date.now();
+            } else {
+                this.activeTransfers.delete(id);
+                // Release the preallocated reassembly buffer too. These were only ever
+                // reclaimed by the five-minute sweeper, so a peer that connected and dropped
+                // repeatedly could pin gigabytes of memory.
+                this.pendingFileChunks.delete(id);
+            }
+        }
+    }
+
     initializeConnectionManager(onOpen?: (id: string) => void) {
-        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
-        
+        if (this.unloaded) return;
+        if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
+
         if (!Platform.isMobile) {
             this.lanDiscovery.startBroadcasting(this.getMyPeerInfo());
             this.lanDiscovery.startListening();
@@ -1991,7 +2073,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
+    /**
+     * Tear down the current Peer so that none of its events can act on the plugin again.
+     *
+     * `this.peer` is cleared BEFORE destroy(). PeerJS's destroy() first runs disconnect(),
+     * which emits 'disconnected' while `destroyed` is still false; our handler answered that
+     * with reconnect(), which reopens the signalling socket — and destroy() never closes it
+     * again. The orphaned socket kept this device's ID registered, so the next Peer (after a
+     * mode switch, a re-enable or a plugin update) was refused with unavailable-id until
+     * Obsidian restarted. Every handler now ignores events from a Peer that is not current.
+     */
+    private destroyPeer() {
+        const peer = this.peer;
+        this.peer = null;
+        if (this.peerOpenTimeout !== null) { window.clearTimeout(this.peerOpenTimeout); this.peerOpenTimeout = null; }
+        if (this.peerReconnectFallbackTimeout !== null) { window.clearTimeout(this.peerReconnectFallbackTimeout); this.peerReconnectFallbackTimeout = null; }
+        if (!peer) return;
+        try {
+            peer.destroy();
+        } catch (e) {
+            this.log('Destroying the PeerJS peer threw', e);
+        }
+    }
+
     initializePeer(onOpen?: (id: string) => void) {
+        if (this.unloaded) return;
         if (this.peer && !this.peer.destroyed) {
             if (this.peer.disconnected) {
                 // A disconnected (but not destroyed) peer can be revived without a full re-init.
@@ -2004,27 +2110,37 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             return;
         }
-        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
-        this.peer?.destroy();
+        if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
+        this.destroyPeer();
         this.updateStatus({ text: 'Connecting...', icon: 'plug', spin: true, state: 'loading' });
 
         let peerOptions: PeerJSOption = {};
         if (this.settings.useCustomPeerServer) { peerOptions = { ...this.settings.customPeerServerConfig }; }
 
         this.log(`Attempting to connect to PeerJS server (Attempt: ${this.peerInitAttempts + 1})...`);
+        let peer: Peer;
         try {
-            this.peer = new Peer(this.settings.deviceId, peerOptions);
+            peer = new Peer(this.settings.deviceId, peerOptions);
         } catch (e) {
             this.handlePeerError(e);
             return;
         }
+        this.peer = peer;
+        // A replaced or destroyed Peer keeps firing events (destroy() itself emits two);
+        // none of them may touch the plugin's current state.
+        const isCurrent = () => this.peer === peer && !this.unloaded;
 
-        const connectionTimeout = setTimeout(() => { this.log('PeerJS connection timed out.'); this.handlePeerError(new Error("Connection timed out")); }, 15000);
+        this.peerOpenTimeout = window.setTimeout(() => {
+            this.peerOpenTimeout = null;
+            if (!isCurrent() || peer.open) return;
+            this.log('PeerJS connection timed out.');
+            this.handlePeerError(new Error("Connection timed out"));
+        }, 15000);
 
-        this.peer.on('open', (id) => {
-            clearTimeout(connectionTimeout);
+        peer.on('open', (id) => {
+            if (!isCurrent()) return;
+            if (this.peerOpenTimeout !== null) { window.clearTimeout(this.peerOpenTimeout); this.peerOpenTimeout = null; }
             // Cancel the reconnect fallback timer now that the peer is back online.
-            // This used to live in a second, separate 'open' listener.
             if (this.peerReconnectFallbackTimeout !== null) {
                 clearTimeout(this.peerReconnectFallbackTimeout);
                 this.peerReconnectFallbackTimeout = null;
@@ -2040,31 +2156,54 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             onOpen?.(id);
         });
 
-        this.peer.on('connection', (conn) => { this.log("Incoming PeerJS connection from:", conn.peer); this.setupConnection(conn); });
-        this.peer.on('error', (err) => { clearTimeout(connectionTimeout); this.handlePeerError(err); });
-        this.peer.on('disconnected', () => {
+        peer.on('connection', (conn) => {
+            if (!isCurrent()) {
+                conn.close();
+                return;
+            }
+            this.log("Incoming PeerJS connection from:", conn.peer);
+            this.setupConnection(conn);
+        });
+        peer.on('error', (err) => {
+            if (!isCurrent()) return;
+            this.handlePeerError(err);
+        });
+        peer.on('disconnected', () => {
+            if (!isCurrent() || peer.destroyed) return;
             this.showNotice('Sync network disconnected. Attempting to reconnect...', 'transient');
             this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' });
-            // Attempt lightweight reconnect first (Phase 3.1)
-            if (this.peer && !this.peer.destroyed) {
-                this.peer.reconnect();
-                // Arm a fallback in case peer.reconnect() stalls silently
-                if (this.peerReconnectFallbackTimeout !== null) clearTimeout(this.peerReconnectFallbackTimeout);
-                this.peerReconnectFallbackTimeout = window.setTimeout(() => {
-                    this.peerReconnectFallbackTimeout = null;
-                    // If still disconnected after the window, fall through to full re-init
-                    if (this.peer && this.peer.disconnected) {
-                        this.log('PeerJS reconnect() stalled — falling back to full re-initialization.');
-                        this.handlePeerError(new Error('Reconnect timed out'));
-                    }
-                }, 15000);
+            // Attempt lightweight reconnect first
+            try {
+                peer.reconnect();
+            } catch (e) {
+                this.log('PeerJS reconnect() refused', e);
+                this.handlePeerError(e);
+                return;
             }
+            // Arm a fallback in case peer.reconnect() stalls silently
+            if (this.peerReconnectFallbackTimeout !== null) clearTimeout(this.peerReconnectFallbackTimeout);
+            this.peerReconnectFallbackTimeout = window.setTimeout(() => {
+                this.peerReconnectFallbackTimeout = null;
+                // If still disconnected after the window, fall through to full re-init
+                if (isCurrent() && peer.disconnected) {
+                    this.log('PeerJS reconnect() stalled — falling back to full re-initialization.');
+                    this.handlePeerError(new Error('Reconnect timed out'));
+                }
+            }, 15000);
         });
-        this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'transient'); this.handlePeerError(new Error("Peer closed.")); });
+        peer.on('close', () => {
+            if (!isCurrent()) return;
+            this.showNotice('Sync connection closed permanently.', 'transient');
+            this.handlePeerError(new Error("Peer closed."));
+        });
     }
 
     private handlePeerError(err: any) {
-        console.error("PeerJS Error:", err);
+        if (this.unloaded) return;
+        // A cluster member that is simply offline surfaces as peer-unavailable every retry
+        // cycle; it is routine, so it stays out of the error console.
+        if (err?.type === 'peer-unavailable') this.log('PeerJS:', err?.message || err);
+        else console.error("PeerJS Error:", err);
 
         if (!shouldTearDownPeer(err || {}, this.connections.size)) {
             this.log(`PeerJS error (${err?.type || err?.message || 'unknown'}) — keeping ${this.connections.size} live link(s).`);
@@ -2077,11 +2216,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             return;
         }
 
-        this.peer?.destroy();
-        this.peer = null;
+        this.destroyPeer();
         this.connections.forEach(conn => conn.close());
         this.connections.clear();
-        this.activeTransfers.clear();
+        this.settleTransfersAfterDisconnect();
 
         this.updateStatus({ text: peerErrorUserMessage(err), icon: 'alert-triangle', state: 'error' });
 
@@ -2090,13 +2228,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (err?.type === 'unavailable-id' && this.peerInitAttempts === 0) {
             this.showNotice('This device ID is already in use — usually because this vault was copied from another computer. Open Settings and tap New ID on this device, then pair again.', 'warning', 12000);
         }
-    
+
         this.peerInitAttempts++;
         const backoff = Math.min(30000, this.peerInitAttempts * 2000);
         this.showNotice(`Sync connection failed. Retrying in ${backoff / 1000}s...`, 'transient');
-    
+
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.peerInitRetryTimeout = window.setTimeout(() => {
+            this.peerInitRetryTimeout = null;
+            if (this.unloaded) return;
             this.updateStatus({ text: 'Retrying connection...', icon: 'refresh-cw', spin: true, state: 'loading' });
             this.initializePeer();
         }, backoff);
@@ -2138,28 +2278,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             });
         });
         conn.on('close', () => {
-            this.pendingConnections.delete(conn.peer);
             const peerId = conn.peer;
+            if (this.unloaded) return;
+            if (this.connections.get(peerId) !== conn) {
+                // A connection that never finished its handshake, or a duplicate that lost the
+                // tie-break. Tearing down per-peer state here used to knock out the live link
+                // to the same device — the one that is still in `connections`.
+                if (!this.connections.has(peerId)) this.pendingConnections.delete(peerId);
+                this.log(`Closed a non-current connection with ${peerId}.`);
+                return;
+            }
+            this.pendingConnections.delete(peerId);
             this.log("DataConnection closed with:", peerId);
             this.connections.delete(peerId);
             this.lastHeard.delete(peerId);
             this.manualPingStart.delete(peerId);
             this.lastSuccessfulMessageTime.delete(peerId);
-            
+
             // Clear remote locks from this peer
             for (const [path, lock] of this.remoteLocks.entries()) {
                 if (lock.peerId === peerId) this.remoteLocks.delete(path);
             }
 
-            for (const [id, transfer] of this.activeTransfers.entries()) {
-                if (transfer.peerId === peerId && transfer.direction === 'download') {
-                    this.activeTransfers.delete(id);
-                    // Release the preallocated reassembly buffer too. These were only ever
-                    // reclaimed by the five-minute sweeper, so a peer that connected and
-                    // dropped repeatedly could pin gigabytes of memory.
-                    this.pendingFileChunks.delete(id);
-                }
-            }
+            this.settleTransfersAfterDisconnect(peerId);
             this.updateStatus();
 
             // Fix: Abort sync immediately if the connection to the syncing peer closes mid-sync
@@ -2309,20 +2450,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     startHeartbeat() {
-        this.registerInterval(window.setInterval(() => {
-            const now = Date.now();
-            this.connections.forEach((conn, peerId) => {
-                if (conn.open) {
-                    // Send directly to bypass the sync queue
-                    conn.send({ type: 'ping' });
-                    const last = this.lastHeard.get(peerId);
-                    if (last && now - last > 20000) { // Increased timeout to 20 seconds
-                        this.log(`Peer ${peerId} timed out (Heartbeat).`);
-                        conn.close();
-                    }
+        this.registerInterval(window.setInterval(() => this.heartbeatTick(), 5000));
+    }
+
+    /** One heartbeat round: ping every open link and drop any that has gone silent for 20 s. */
+    heartbeatTick() {
+        const now = Date.now();
+        this.connections.forEach((conn, peerId) => {
+            if (conn.open) {
+                // Send directly to bypass the sync queue
+                conn.send({ type: 'ping' });
+                const last = this.lastHeard.get(peerId);
+                if (last && now - last > 20000) {
+                    this.log(`Peer ${peerId} timed out (Heartbeat).`);
+                    conn.close();
                 }
-            });
-        }, 5000)); // Check every 5 seconds
+            }
+        });
     }
     
     startSyncKeepAlive() {
@@ -2555,6 +2699,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             conn.close();
             return;
         }
+        const existing = this.connections.get(conn.peer);
+        if (this.getConnectionMode() === 'peerjs' && existing && existing !== conn && existing.open) {
+            // Two links to the same device. Each end must keep the SAME one, or each closes
+            // the link the other kept. Overwriting the map entry (as this used to) left an
+            // orphan whose later close took the live link down.
+            //  - Glare (each side dialled one): keep the link dialled by the lower device ID.
+            //  - A re-dial (one side dialled both, e.g. pairing again): keep the newer link.
+            //    Both ends see the two handshakes in the same order, so both keep this one.
+            const lowerIsMe = this.settings.deviceId < conn.peer;
+            const dialledThis = this.dialledConnections.has(conn);
+            const keepThis = dialledThis === this.dialledConnections.has(existing)
+                ? true
+                : dialledThis === lowerIsMe;
+            if (!keepThis) {
+                this.log(`Duplicate connection with ${conn.peer}; keeping the existing one.`);
+                conn.close();
+                return;
+            }
+            this.log(`Duplicate connection with ${conn.peer}; replacing the existing one.`);
+            // Swap first so the old link's close handler sees it is no longer current.
+            this.connections.set(conn.peer, conn);
+            existing.close();
+        }
         this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'important', 4000);
         this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn);
@@ -2613,31 +2780,53 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.tryToConnectToClusterPeers();
     }
 
+    /** Connections this device dialled, as opposed to accepted; glare resolution needs it. */
+    private dialledConnections = new WeakSet<object>();
+
+    /**
+     * Dial `peerId` and wire the connection up. Every outgoing connection goes through here
+     * so handleHandshake can tell which side initiated each link.
+     *
+     * reliable:true is required — an unordered channel lets file-chunk-data overtake
+     * file-chunk-start, permanently breaking large-file transfers.
+     */
+    public dialPeer(peerId: string): DataConnection | null {
+        if (this.unloaded || !this.peer || this.peer.disconnected || this.peer.destroyed) return null;
+        const conn = this.peer.connect(peerId, { reliable: true });
+        if (!conn) return null;
+        this.dialledConnections.add(conn);
+        this.setupConnection(conn);
+        return conn;
+    }
+
     tryToConnectToClusterPeers() {
-        if (this.getConnectionMode() !== 'peerjs') return;
-        
+        if (this.unloaded || this.getConnectionMode() !== 'peerjs') return;
+
         const attemptConnection = () => {
-            if (!this.peer || this.peer.disconnected) return;
-            
+            if (this.unloaded || !this.peer || this.peer.disconnected) return;
+
             const connectToPeer = (peerId: string) => {
                 if (peerId === this.settings.deviceId) return;
                 if (this.isBlocked(peerId)) return;
                 if (this.connections.has(peerId) || this.pendingConnections.has(peerId)) return;
-                
-                this.log(`Attempting to connect to cluster peer ${peerId}`); 
+
+                this.log(`Attempting to connect to cluster peer ${peerId}`);
                 this.pendingConnections.add(peerId);
-                const conn = this.peer!.connect(peerId, { reliable: true }); 
-                if (conn) {
-                    this.setupConnection(conn);
-                    setTimeout(() => {
-                        if (this.pendingConnections.has(peerId)) {
-                            this.pendingConnections.delete(peerId);
-                            this.log(`Pending connection to ${peerId} timed out. Removing from pending set.`);
-                        }
-                    }, 15000);
-                } else {
+                const conn = this.dialPeer(peerId);
+                if (!conn) {
                     this.pendingConnections.delete(peerId);
+                    return;
                 }
+                // An offline peer never answers, and PeerJS neither opens nor closes the
+                // attempt. Give up on this one after 15 s so the next round can dial again,
+                // and close it so PeerJS drops its negotiator instead of accumulating one per
+                // retry.
+                this.timeoutManager.setTimeout(() => {
+                    if (conn.open || this.connections.get(peerId) === conn) return;
+                    this.log(`Pending connection to ${peerId} timed out. Removing from pending set.`);
+                    this.pendingConnections.delete(peerId);
+                    try { conn.close(); } catch (_) { /* never opened */ }
+                }, 15000);
             };
 
             const companionId = this.settings.companionPeerId;
@@ -2647,11 +2836,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (peerId !== companionId) connectToPeer(peerId);
             }
         };
-        
+
         attemptConnection();
         if (!this.clusterConnectionInterval) {
-            this.clusterConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS); 
-            // Fix: Do not register this dynamically recreated interval to avoid leaking in Obsidian core's internal list.
+            // Deliberately not registerInterval(): this one is torn down and recreated with the
+            // connection manager, and onunload clears it explicitly.
+            this.clusterConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS);
         }
     }
 
@@ -2947,10 +3137,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.lastQueueSaveAt = Date.now();
         try {
             // Only 'task' items are persistable: they name a vault path and are re-derived
-            // from the vault on replay. 'data' items can hold an ArrayBuffer, which
-            // JSON.stringify turns into {} — reloading those produced silently corrupt
-            // queue entries that could never be sent.
-            const persistable = this.queueManager.getQueue().filter(item => !!item.task && !item.data);
+            // from the vault on replay. A built payload is dropped — it can hold an
+            // ArrayBuffer, which JSON.stringify turns into {}, and reloading that produced
+            // silently corrupt entries that could never be sent.
+            const persistable = this.queueManager.getQueue()
+                .filter(item => !!item.task)
+                .map(({ data: _payload, retryable: _retryable, seq: _seq, ...task }) => task);
             await this.writeJsonAtomic(`${this.manifest.dir}/queue.json`, JSON.stringify(persistable));
         } catch (e) {
             console.error('Failed to save queue state:', e);

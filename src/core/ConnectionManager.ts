@@ -83,6 +83,9 @@ export class ConnectionManager {
 
         const deadline = Date.now() + maxWaitMs;
         while (getBufferedAmount() > lowWater) {
+            if (this.timeoutManager.isDisposed) {
+                throw new Error("Stopped waiting for socket buffer to drain: plugin unloaded");
+            }
             if (Date.now() > deadline) {
                 throw new Error("Timeout waiting for socket buffer to drain");
             }

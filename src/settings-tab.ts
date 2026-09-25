@@ -557,8 +557,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                         settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
                             if (this.plugin.peer && !this.plugin.peer.disconnected) {
                                 this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`, 'important');
-                                const newConn = this.plugin.peer.connect(peer.deviceId, { reliable: true });
-                                this.plugin.setupConnection(newConn);
+                                this.plugin.dialPeer(peer.deviceId);
                             } else {
                                 this.plugin.showNotice("Cannot reconnect: this device cannot reach the sync network yet.", 'error');
                             }

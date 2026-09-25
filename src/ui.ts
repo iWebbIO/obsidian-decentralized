@@ -287,19 +287,15 @@ export class ConnectionModal extends Modal {
         this.statusMessage = 'Connecting… keep Connect devices open on both sides.';
         this.render();
 
-        // reliable:true is required — an unordered channel lets file-chunk-data
-        // overtake file-chunk-start, permanently breaking large-file transfers.
-        const conn = this.plugin.peer.connect(peerId, { reliable: true });
+        // dialPeer registers the plugin's handlers BEFORE 'open' fires. setupConnection
+        // attaches its own 'open' listener (which sends the handshake); registering it lazily
+        // inside our own open handler missed the event, so the handshake was never sent and
+        // pairing produced a half-open one-way connection.
+        const conn = this.plugin.dialPeer(peerId);
         if (!conn) {
             this.fail('Could not start the connection. Check that both devices are online and try again.');
             return;
         }
-
-        // Register the plugin's handlers BEFORE 'open' fires. setupConnection attaches
-        // its own 'open' listener (which sends the handshake); registering it lazily
-        // inside our own open handler missed the event, so the handshake was never
-        // sent and pairing produced a half-open one-way connection.
-        this.plugin.setupConnection(conn);
 
         if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
         this.connectTimeout = window.setTimeout(() => {
