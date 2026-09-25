@@ -6,12 +6,22 @@
  *
  * Usage: `afterEach(teardown)`, then createDevice()/connect() inside a test.
  */
+import * as obsidianModule from 'obsidian';
+import * as peerjsModule from 'peerjs';
 import type { ObsidianDecentralizedSettings } from '../../src/types';
 import ObsidianDecentralizedPlugin from '../../src/main';
 import { FakeApp, FakeVault } from './fake-vault';
 
-const obsidianMock = jest.requireMock('obsidian') as any;
-const peerjsMock = jest.requireMock('peerjs') as any;
+// Import the mocks exactly as the plugin does. jest.requireMock() would load a SECOND copy of
+// a root __mocks__ module, so Notice.messages, Platform and the fake network seen here would
+// not be the ones the plugin uses — and assertions on them would pass vacuously.
+const obsidianMock = obsidianModule as any;
+const peerjsMock = peerjsModule as any;
+
+/** The fake PeerJS module the plugin is using (FakePeer, FakeDataConnection, __network). */
+export function peerjs(): any {
+    return peerjsMock;
+}
 
 // --- Browser globals the plugin touches -------------------------------------------------
 

@@ -532,6 +532,11 @@ export interface ObsidianDecentralizedSettings {
 
     // Two-Device Mode Settings
     enableTwoDeviceOptimizations: boolean;
+    /**
+     * Retired; kept so existing data.json files still load. Links to a paired device are
+     * always encrypted: the toggle only affected sending, the receiver still refused
+     * plaintext from a paired device, so switching it off broke every paired link.
+     */
     enableEncryption: boolean;
     enableRealtimeSync: boolean;
     peerKeys: Record<string, string>; // peerId -> base64 PSK

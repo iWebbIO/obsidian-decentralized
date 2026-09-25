@@ -6,7 +6,7 @@
  * reopened a signalling socket that destroy() never closed, so the device ID stayed taken
  * and the next Peer failed with unavailable-id until Obsidian restarted.
  */
-import { createDevice, connect, teardown, waitFor, sleep, network, isLinked } from './helpers/harness';
+import { createDevice, connect, teardown, waitFor, sleep, network, isLinked, peerjs } from './helpers/harness';
 
 afterEach(teardown);
 
@@ -119,7 +119,7 @@ describe('connection glare', () => {
 
         // An attempt that opened but never completed its handshake — rejected, abandoned,
         // or a losing duplicate. Its close used to delete the live entry for the same peer.
-        const { DataConnection } = jest.requireMock('peerjs');
+        const { DataConnection } = peerjs();
         const ghost = new DataConnection(a.plugin.peer, b.id, { reliable: true });
         a.plugin.setupConnection(ghost);
         ghost.open = true;

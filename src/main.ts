@@ -100,7 +100,7 @@ import {
 } from './utils';
 
 import { TimeoutManager } from './utils/Timeouts';
-import { persistablePeerInfo } from './utils/pairing';
+import { persistablePeerInfo, sanitizePeerInfo } from './utils/pairing';
 import { isGenericDeviceName, suggestedDeviceName } from './utils/device-name';
 import { collectLocalIpv4, preferLocalIpv4, type LocalIpv4 } from './utils/net';
 import { peerErrorUserMessage, shouldTearDownPeer } from './utils/peer-error';
@@ -837,8 +837,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (pruned) this.scheduleStateSave();
     }
 
-    async loadSettings() { 
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); 
+    async loadSettings() {
+        // Deep-copy the defaults: a shallow merge handed out DEFAULT_SETTINGS' own nested
+        // objects, so pairing keys, known peers and blocked IDs were written into the shared
+        // defaults themselves and leaked into anything else that read them.
+        const defaults: ObsidianDecentralizedSettings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+        const stored = (await this.loadData()) ?? {};
+        this.settings = Object.assign(defaults, stored);
+        // Merge the nested server config field by field so an older data.json that lacks a
+        // field keeps its default rather than an undefined.
+        this.settings.customPeerServerConfig = {
+            ...JSON.parse(JSON.stringify(DEFAULT_SETTINGS.customPeerServerConfig)),
+            ...(stored.customPeerServerConfig ?? {}),
+        };
         // Invalidate folder filter caches whenever settings are (re-)loaded
         this._cachedExcludedFolders = null;
         this._cachedIncludedFolders = null;
@@ -1188,6 +1199,42 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public invalidateCryptoKey(peerId?: string) {
         if (peerId) this.cryptoKeys.delete(peerId);
         else this.cryptoKeys.clear();
+    }
+
+    /**
+     * The pairing key that governs traffic with `peerId`, or null when that link carries no
+     * application-layer encryption. Sending and receiving both ask this one question: the
+     * send side encrypting under one rule while the receive side refused plaintext under
+     * another is how every paired link came to reject its own heartbeats and acks.
+     *
+     * Offline Mode never uses pairing keys. The host knows a client by its device ID while
+     * the client knows the host as 'direct-ip-host', so a key left over from an earlier Quick
+     * Pair applied on one side only and neither could read the other. Offline Mode is
+     * encrypted by its own transport instead.
+     */
+    public peerKeyFor(peerId: string | null | undefined): string | null {
+        if (!peerId || this.getConnectionMode() === 'direct-ip') return null;
+        return this.settings.peerKeys[peerId] || null;
+    }
+
+    /** `payload` in the form it must travel to `peerId`: encrypted whenever a key applies. */
+    private async toWire(peerId: string | null, payload: any): Promise<any> {
+        return peerId && this.peerKeyFor(peerId) ? this.encryptPayload(payload, peerId) : payload;
+    }
+
+    /**
+     * Send a small control message immediately, outside the queue: heartbeat pings, pongs,
+     * acks, sync-acks. These used to go out as raw conn.send() — plaintext, which a paired
+     * peer refuses — so an idle paired link was dropped by the heartbeat and no transfer or
+     * sync step on it was ever acknowledged.
+     */
+    public sendDirect(conn: { peer: string; open?: boolean; send: (data: any) => void }, payload: any): void {
+        void this.toWire(conn.peer, payload)
+            .then(wire => {
+                if (conn.open === false) return;
+                conn.send(wire);
+            })
+            .catch(e => this.log(`Could not send ${payload?.type} to ${conn.peer}:`, e));
     }
 
     /**
@@ -1767,14 +1814,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (!transferId) throw new Error("Transfer ID missing for chunked transfer");
                 
                 if (peerId) {
-                    const ackPromise = new Promise<void>((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 300000);
-                        this.pendingAcks.set(transferId!, {
-                            resolve: () => { clearTimeout(timeout); resolve(); },
-                            reject: (e) => { clearTimeout(timeout); reject(e); },
-                            peerId: peerId!
-                        });
-                    });
+                    const ackPromise = this.expectAck(transferId, peerId, 300000);
 
                     // file-chunk-start.fileHash must describe the bytes actually on the
                     // wire. fileData.fileHash is the hash of the ORIGINAL content, which
@@ -1789,10 +1829,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     item.data = null as any;
                 }
             } else {
-                let finalPayload = data;
-                if (this.settings.enableEncryption && peerId && this.settings.peerKeys[peerId]) {
-                    finalPayload = await this.encryptPayload(data, peerId);
-                }
+                const finalPayload = peerId ? await this.toWire(peerId, data) : data;
 
                 const isBatchItem = item.task && (item.task as any).batchId;
                 const isSmallFile = (data.type === 'file-update' || data.type === 'file-delta');
@@ -1800,14 +1837,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const skipAck = (isBatchItem && isSmallFile && isDirectIp) || data.type === 'file-batch-binary';
 
                 if (isSmallFile && peerId && !skipAck) {
-                    const ackPromise = new Promise<void>((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
-                        this.pendingAcks.set(transferId!, {
-                            resolve: () => { clearTimeout(timeout); resolve(); },
-                            reject: (e) => { clearTimeout(timeout); reject(e); },
-                            peerId: peerId!
-                        });
-                    });
+                    const ackPromise = this.expectAck(transferId!, peerId, 60000);
 
                     await this.sendPayloadTo(peerId, finalPayload);
                     await ackPromise;
@@ -1837,10 +1867,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     // failures surfaced as unhandled rejections and the sends raced.
                     for (const pId of Array.from(this.connections.keys())) {
                         try {
-                            const pPayload = (this.settings.enableEncryption && this.settings.peerKeys[pId])
-                                ? await this.encryptPayload(data, pId)
-                                : data;
-                            await this.sendPayloadTo(pId, pPayload);
+                            await this.sendPayloadTo(pId, await this.toWire(pId, data));
                         } catch (e) {
                             this.log(`Broadcast to ${pId} failed`, e);
                         }
@@ -1971,6 +1998,30 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
             this.updateStatus();
         }
+    }
+
+    /**
+     * Register a waiter for the peer's ack of `transferId`, failing after `timeoutMs`.
+     *
+     * The promise is created before the send it waits for, so if the send itself throws (the
+     * link dropped mid-file) nothing ever awaits it — and the close handler then rejects it,
+     * which surfaced as an "Uncaught (in promise)" error on every interrupted transfer. The
+     * rejection is marked handled here; awaiting the returned promise still throws.
+     */
+    private expectAck(transferId: string, peerId: string, timeoutMs: number): Promise<void> {
+        const ack = new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                this.pendingAcks.delete(transferId);
+                reject(new Error(`Transfer ${transferId} timed out`));
+            }, timeoutMs);
+            this.pendingAcks.set(transferId, {
+                resolve: () => { clearTimeout(timeout); resolve(); },
+                reject: (e) => { clearTimeout(timeout); reject(e); },
+                peerId,
+            });
+        });
+        ack.catch(() => { /* observed by whoever awaits it, if anyone still does */ });
+        return ack;
     }
 
     rejectPendingAck(transferId: string, reason: string) {
@@ -2244,38 +2295,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     setupConnection(conn: DataConnection, pin?: string) {
         this.pendingConnections.add(conn.peer);
-        conn.on('open', async () => {
+        conn.on('open', () => {
             this.pendingConnections.delete(conn.peer);
             this.log("DataConnection open with:", conn.peer);
-            
-            const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin, protocolVersion: PROTOCOL_VERSION };
-            if (this.settings.peerKeys[conn.peer]) {
-                try {
-                    // encryptPayload already returns the wire envelope
-                    // { type:'encrypted-frame', data } — wrapping it again produces a
-                    // payload the receiver can never decrypt.
-                    const encrypted = await this.encryptPayload(payload, conn.peer);
-                    conn.send(encrypted);
-                } catch(e) {
-                    // Do NOT fall back to sending this in the clear. We hold a key for this
-                    // peer, so a plaintext handshake is exactly the downgrade the receive-side
-                    // gate now rejects, and it contradicts encryptPayload's own contract.
-                    this.log("Failed to encrypt handshake; closing connection instead of sending it in the clear", e);
-                    this.showNotice('Could not encrypt the connection to a paired device. Try re-pairing it.', 'error');
-                    conn.close();
-                    return;
-                }
-            } else {
-                conn.send(payload);
-            }
-            // Role announcement is deferred to handleHandshake (after conn is in this.connections)
-            // to avoid isTwoDeviceMode() seeing wrong connections.size
-            this.resumeTransfers(conn.peer);
+            // Role announcement and resuming interrupted uploads wait for handleHandshake, once
+            // the connection is registered and the peer has proved who it is.
+            void this.sendHandshake(conn, pin);
         });
-        conn.on('data', async (raw: any) => {
-            this.handleRawIncomingData(raw, conn).catch(e => {
-                this.log("Unhandled error in incoming data listener", e);
-            });
+        // Decryption is asynchronous, so messages handled independently can finish out of
+        // order: a file-chunk-data that overtakes its file-chunk-start is dropped as unknown,
+        // and the transfer never completes. Each message waits for the previous one from this
+        // connection. Only decrypt-and-dispatch is serialised — processIncomingData runs
+        // detached, so a slow handler does not hold up pings.
+        let inbound: Promise<void> = Promise.resolve();
+        conn.on('data', (raw: any) => {
+            inbound = inbound
+                .then(() => this.handleRawIncomingData(raw, conn))
+                .catch(e => this.log("Unhandled error in incoming data listener", e));
         });
         conn.on('close', () => {
             const peerId = conn.peer;
@@ -2330,6 +2366,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         });
     }
 
+    /**
+     * Introduce this device on `conn`: encrypted whenever a key applies, and never downgraded.
+     * We hold a key for this peer, so a plaintext handshake is exactly what its receive-side
+     * gate refuses — and what an impersonator would send.
+     */
+    private async sendHandshake(conn: DataConnection, pin?: string) {
+        const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin, protocolVersion: PROTOCOL_VERSION };
+        if (!this.peerKeyFor(conn.peer)) {
+            conn.send(payload);
+            return;
+        }
+        try {
+            // encryptPayload already returns the wire envelope { type:'encrypted-frame', data };
+            // wrapping it again produces a payload the receiver can never decrypt.
+            conn.send(await this.encryptPayload(payload, conn.peer));
+        } catch (e) {
+            this.log("Failed to encrypt handshake; closing connection instead of sending it in the clear", e);
+            this.showNotice('Could not encrypt the connection to a paired device. Try re-pairing it.', 'error');
+            conn.close();
+        }
+    }
+
     async handleRawIncomingData(raw: any, conn: DataConnection) {
         let data = raw;
         let wasEncrypted = false;
@@ -2347,14 +2405,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         if (raw && raw.type === 'encrypted-frame') {
-            if (this.settings.peerKeys[conn.peer]) {
+            if (this.peerKeyFor(conn.peer)) {
                 try {
                     data = await this.decryptPayload(raw, conn.peer);
                 } catch(e) {
                     this.log("Decryption failed, ignoring message", e);
                     return;
                 }
-            } else if (this.getActivePsk()) {
+            } else if (this.getConnectionMode() === 'peerjs' && this.getActivePsk()) {
                 // A peer pairing via the active QR code has no stored key yet. Adopt the
                 // active PSK provisionally, and roll it back if it does not decrypt.
                 // getActivePsk() returns null once the pairing window has closed.
@@ -2365,6 +2423,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.unblockPeer(conn.peer);
                     await this.saveSettings();
                     this.log(`Successfully authenticated new peer ${conn.peer} via active PSK`);
+                    // Our own handshake went out when the link opened — in plaintext, since we
+                    // had no key yet — and the pairing device, which does hold the key, refused
+                    // it. Without a second, encrypted one it never registered this link, and
+                    // its Connect screen reported a failed pairing.
+                    void this.sendHandshake(conn);
                 } catch(e) {
                     delete this.settings.peerKeys[conn.peer];
                     this.invalidateCryptoKey(conn.peer);
@@ -2382,15 +2445,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // encrypted-frame fell through and was processed as trusted, so a peer could skip the
         // envelope entirely rather than needing the key. Reject plaintext from any peer we
         // hold a key for.
-        if (!wasEncrypted && this.settings.peerKeys[conn.peer]) {
-            this.log(`Refusing unencrypted message from ${conn.peer}, which has an encryption key.`);
-            this.showNotice('Refused an unencrypted message from a paired device. If this repeats, re-pair the devices.', 'warning');
+        if (!wasEncrypted && this.peerKeyFor(conn.peer)) {
+            this.log(`Refusing unencrypted ${raw?.type} from ${conn.peer}, which has an encryption key.`);
+            // One plaintext handshake is expected while pairing: the other device sends it
+            // before it has adopted the key, then repeats it encrypted. Warn about anything else.
+            if (raw?.type !== 'handshake') {
+                this.showNotice('Refused an unencrypted message from a paired device. If this repeats, re-pair the devices.', 'warning');
+            }
             return;
         }
 
         // Under strict security the handshake is the only thing allowed before a key exists;
-        // everything else from an unknown peer is dropped.
-        if (this.settings.strictSecurity && !wasEncrypted && raw?.type !== 'handshake') {
+        // everything else from an unknown peer is dropped. Offline Mode is exempt: the host
+        // has already checked the joining device's token, and its frames never carry a
+        // pairing key.
+        if (this.settings.strictSecurity && this.getConnectionMode() === 'peerjs' && !wasEncrypted && raw?.type !== 'handshake') {
             this.log(`Strict security: dropping ${raw?.type} from unauthenticated peer ${conn.peer}.`);
             return;
         }
@@ -2398,55 +2467,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.processIncomingData(data, conn);
     }
     
-    async resumeTransfers(peerId: string) {
-        const transfersToResume = Array.from(this.activeTransfers.values())
-            .filter(t => t.peerId === peerId && t.status === 'paused' && t.direction === 'upload');
-
-        for (const t of transfersToResume) {
-            this.log(`Resuming transfer ${t.id} to ${peerId}`);
-            t.status = 'active';
-            this.updateStatus();
-            
-            const file = this.app.vault.getAbstractFileByPath(t.path);
+    /**
+     * Re-send uploads to `peerId` that a dropped link or a restart interrupted.
+     *
+     * They restart from the first chunk, through the normal send path. Continuing mid-file
+     * never worked: the receiver discards its partial reassembly when the link drops (and has
+     * nothing at all after a restart), so the resumed chunks were rejected as belonging to an
+     * unknown transfer — while the queue had already written the file off as sent.
+     */
+    resumeTransfers(peerId: string) {
+        let resumed = 0;
+        for (const [id, transfer] of this.activeTransfers) {
+            if (transfer.peerId !== peerId || transfer.direction !== 'upload' || transfer.status !== 'paused') continue;
+            this.activeTransfers.delete(id);
+            const file = this.app.vault.getAbstractFileByPath(transfer.path);
             if (file instanceof TFile) {
-                let content: ArrayBuffer;
-                if (t.compressed) {
-                    const textContent = await this.app.vault.read(file);
-                    content = compressText(textContent);
-                } else {
-                    content = await this.app.vault.readBinary(file);
-                }
-                
-                const ackPromise = new Promise<void>((resolve, reject) => {
-                    const timeout = setTimeout(() => reject(new Error(`Transfer ${t.id} timed out`)), 60000);
-                    this.pendingAcks.set(t.id, {
-                        resolve: () => { clearTimeout(timeout); resolve(); },
-                        reject: (e) => { clearTimeout(timeout); reject(e); },
-                        peerId: peerId
-                    });
-                });
-
-                try {
-                    const vv = this.twoDeviceState.fileVersions[t.path];
-                    await this.sendFileInChunks(t.peerId, t.path, file.stat.mtime, content, t.id, t.processedChunks, t.compressed, vv);
-                    await ackPromise;
-                    this.log(`Resumed transfer ${t.id} completed.`);
-                    this.activeTransfers.delete(t.id);
-                    this.scheduleStateSave();
-                } catch (e) {
-                    if (e.message === 'Paused') this.log(`Transfer ${t.id} paused again.`);
-                    else this.log(`Resumed transfer ${t.id} failed:`, e);
-                } finally {
-                    if (this.pendingAcks.has(t.id)) {
-                        this.pendingAcks.get(t.id)!.resolve();
-                        this.pendingAcks.delete(t.id);
-                    }
-                }
-            } else {
-                this.activeTransfers.delete(t.id);
-                this.scheduleStateSave();
+                void this.sendFileUpdate(file, peerId, true);
+                resumed++;
             }
         }
+        if (resumed > 0) this.log(`Re-sending ${resumed} interrupted upload(s) to ${peerId}.`);
+        this.scheduleStateSave();
+        this.updateStatus();
     }
 
     startHeartbeat() {
@@ -2458,8 +2500,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const now = Date.now();
         this.connections.forEach((conn, peerId) => {
             if (conn.open) {
-                // Send directly to bypass the sync queue
-                conn.send({ type: 'ping' });
+                // Direct, bypassing the sync queue, but encrypted like everything else.
+                this.sendDirect(conn, { type: 'ping' });
                 const last = this.lastHeard.get(peerId);
                 if (last && now - last > 20000) {
                     this.log(`Peer ${peerId} timed out (Heartbeat).`);
@@ -2480,7 +2522,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
                 this.syncState.missedPings++;
                 const conn = this.connections.get(this.syncState.peerId);
-                if (conn && conn.open) conn.send({ type: 'sync-ping' });
+                if (conn && conn.open) this.sendDirect(conn, { type: 'sync-ping' });
             } else {
                 if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
             }
@@ -2504,7 +2546,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         if (data.messageId && data.type !== 'sync-ack' && conn) {
-            conn.send({ type: 'sync-ack', messageId: data.messageId });
+            this.sendDirect(conn, { type: 'sync-ack', messageId: data.messageId });
             // Dedup: sendSyncMessage retries after 30s even if the first copy was merely
             // slow — re-processing a control message (e.g. request-batch) corrupts sync
             // state, so ack duplicates but process each messageId only once.
@@ -2538,7 +2580,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                     break;
                 case 'cluster-gossip': this.handleClusterGossip(data); break;
-                case 'companion-pair': this.handleCompanionPair(data); break;
+                case 'companion-pair': void this.handleCompanionPair(data, conn); break;
                 case 'ack':
                     if (this.pendingAcks.has(data.transferId)) {
                         this.log(`Ack received for ${data.transferId}.`);
@@ -2557,13 +2599,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     break;
                 case 'file-update': 
                     this.applyFileUpdate(data).then(() => {
-                        if (conn && data.transferId && !data.skipAck) conn.send({ type: 'ack', transferId: data.transferId });
+                        if (conn && data.transferId && !data.skipAck) this.sendDirect(conn, { type: 'ack', transferId: data.transferId });
                         this.resetIdleTimeout();
                     }).catch(e => {
                         this.log(`Failed to apply file update: ${data.path}`, e);
                         if (conn && data.transferId && !data.skipAck) {
                             const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
-                            conn.send({ type: 'nack', transferId: data.transferId, reason });
+                            this.sendDirect(conn, { type: 'nack', transferId: data.transferId, reason });
                         }
                     }); 
                     break;
@@ -2584,13 +2626,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     break;
                 case 'file-delta':
                     this.applyFileDelta(data).then(() => {
-                        if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
+                        if (conn && data.transferId) this.sendDirect(conn, { type: 'ack', transferId: data.transferId });
                         this.resetIdleTimeout();
                     }).catch(e => {
                         this.log(`Failed to apply delta: ${data.path}`, e);
                         if (conn && data.transferId) {
                             const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
-                            conn.send({ type: 'nack', transferId: data.transferId, reason });
+                            this.sendDirect(conn, { type: 'nack', transferId: data.transferId, reason });
                         }
                     });
                     break;
@@ -2627,7 +2669,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 case 'file-chunk-start': this.handleFileChunkStart(data, conn); break;
                 case 'file-chunk-data': await this.handleFileChunkData(data, conn!); break;
                 
-                case 'ping': conn?.send({ type: 'pong' }); break;
+                case 'ping': if (conn) this.sendDirect(conn, { type: 'pong' }); break;
                 case 'pong': 
                     if (this.manualPingStart.has(conn!.peer)) {
                         const start = this.manualPingStart.get(conn!.peer)!;
@@ -2636,7 +2678,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         this.showNotice(`${this.clusterPeers.get(conn!.peer)?.friendlyName || 'The other device'} replied in ${rtt} ms`, 'important');
                     }
                     break;
-                case 'sync-ping': conn?.send({ type: 'sync-pong' }); this.resetIdleTimeout(); break;
+                case 'sync-ping': if (conn) this.sendDirect(conn, { type: 'sync-pong' }); this.resetIdleTimeout(); break;
                 case 'sync-pong': this.syncState.missedPings = 0; this.resetIdleTimeout(); break;
                     
                 case 'cluster-forget': this.handleClusterForget(data); break;
@@ -2667,16 +2709,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     handleHandshake(data: HandshakePayload, conn: DataConnection) {
-        // V3 changed the wire format incompatibly. Refuse mismatched peers up front —
-        // letting them through would mean silently dropped messages at best and a
-        // half-applied sync at worst.
-        if ((data.protocolVersion || 0) !== PROTOCOL_VERSION) {
-            this.showNotice(
-                'Update Obsidian Decentralized on the other device to the same version.',
-                'error', 12000
-            );
-            this.log(`Rejecting handshake from ${conn.peer}: protocol v${data.protocolVersion || 'unknown'} (expected v${PROTOCOL_VERSION})`);
+        const peerInfo = sanitizePeerInfo(data.peerInfo);
+        if (!peerInfo) {
+            this.log(`Rejecting handshake from ${conn.peer}: missing or malformed device info.`);
             conn.close();
+            return;
+        }
+        // Over PeerJS the connection itself says who dialled; a handshake claiming another
+        // ID would file this device's details under someone else's entry.
+        if (this.getConnectionMode() === 'peerjs') peerInfo.deviceId = conn.peer;
+
+        // Refuse mismatched versions up front — letting them through would mean silently
+        // dropped messages at best and a half-applied sync at worst.
+        const theirVersion = typeof data.protocolVersion === 'number' ? data.protocolVersion : 0;
+        if (theirVersion !== PROTOCOL_VERSION) {
+            this.refuseIncompatiblePeer(conn, peerInfo.friendlyName, theirVersion);
             return;
         }
         // Strict security: only peers we already share a key with, or one arriving during an
@@ -2689,6 +2736,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             return;
         }
         if (this.settings.strictSecurity
+            && this.getConnectionMode() === 'peerjs'
             && !this.settings.peerKeys[conn.peer]
             && !this.getActivePsk()) {
             this.showNotice(
@@ -2722,10 +2770,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.connections.set(conn.peer, conn);
             existing.close();
         }
-        this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'important', 4000);
+        this.showNotice(`Connected to ${peerInfo.friendlyName}`, 'important', 4000);
+        this.incompatiblePeers.delete(conn.peer);
         this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn);
-        this.clusterPeers.set(conn.peer, persistablePeerInfo(data.peerInfo));
+        this.clusterPeers.set(conn.peer, peerInfo);
         this.updateStatus();
         this.saveKnownPeers();
         const existingPeers = Array.from(this.clusterPeers.values());
@@ -2736,7 +2785,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         } else {
             this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers.map(persistablePeerInfo) });
-            this.broadcastData({ type: 'cluster-gossip', peers: [persistablePeerInfo(this.getMyPeerInfo()), persistablePeerInfo(data.peerInfo)] });
+            this.broadcastData({ type: 'cluster-gossip', peers: [persistablePeerInfo(this.getMyPeerInfo()), peerInfo] });
         }
         
         if (this.isTwoDeviceMode()) {
@@ -2752,19 +2801,45 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     .catch(e => this.log('Failed to build Merkle tree for auto-reconciliation', e));
             }
         }
+
+        this.resumeTransfers(conn.peer);
+    }
+
+    /**
+     * Peers whose handshake carried a different protocol version, with when to try them again.
+     * A refused peer redials every few seconds; without this each attempt ended in another
+     * error toast here, and our own reconnect loop kept dialling it too.
+     */
+    private incompatiblePeers: Map<string, number> = new Map();
+    private static readonly INCOMPATIBLE_RETRY_MS = 10 * 60 * 1000;
+
+    private refuseIncompatiblePeer(conn: DataConnection, name: string, theirVersion: number) {
+        const firstTime = !this.incompatiblePeers.has(conn.peer);
+        this.incompatiblePeers.set(conn.peer, Date.now() + ObsidianDecentralizedPlugin.INCOMPATIBLE_RETRY_MS);
+        this.log(`Rejecting handshake from ${conn.peer}: protocol v${theirVersion || 'unknown'} (expected v${PROTOCOL_VERSION})`);
+        if (firstTime) {
+            const which = theirVersion > PROTOCOL_VERSION ? 'this device' : name;
+            this.showNotice(
+                `${name} runs a different version of Obsidian Decentralized. Update the plugin on ${which} so both match, then they will reconnect.`,
+                'error', 12000
+            );
+        }
+        conn.close();
     }
 
     handleClusterGossip(data: ClusterGossipPayload) {
-        if (this.getConnectionMode() !== 'peerjs') return;
+        if (this.getConnectionMode() !== 'peerjs' || !Array.isArray(data.peers)) return;
         let hasNew = false;
-        data.peers.forEach(peerInfo => {
-            if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) return;
-            if (this.isBlocked(peerInfo.deviceId)) return;
+        for (const raw of data.peers.slice(0, 256)) {
+            const peerInfo = sanitizePeerInfo(raw);
+            if (!peerInfo) continue;
+            if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) continue;
+            if (this.isBlocked(peerInfo.deviceId)) continue;
             if (!this.clusterPeers.has(peerInfo.deviceId)) {
-                this.clusterPeers.set(peerInfo.deviceId, persistablePeerInfo(peerInfo));
+                this.clusterPeers.set(peerInfo.deviceId, peerInfo);
                 hasNew = true;
             }
-        });
+        }
         if (hasNew) {
             this.saveKnownPeers();
             this.updateStatus();
@@ -2772,11 +2847,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
-    async handleCompanionPair(data: CompanionPairPayload) {
-        if (this.isBlocked(data.peerInfo.deviceId)) return;
-        this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
-        this.clusterPeers.set(data.peerInfo.deviceId, persistablePeerInfo(data.peerInfo));
-        this.showNotice(`${data.peerInfo.friendlyName} is now your primary sync partner.`, 'important', 4000);
+    async handleCompanionPair(data: CompanionPairPayload, conn?: DataConnection | null) {
+        const peerInfo = sanitizePeerInfo(data.peerInfo);
+        if (!peerInfo) return;
+        // Only the device on the other end of this link can make itself our partner.
+        if (conn && this.getConnectionMode() === 'peerjs') peerInfo.deviceId = conn.peer;
+        if (this.isBlocked(peerInfo.deviceId)) return;
+        this.settings.companionPeerId = peerInfo.deviceId;
+        await this.saveSettings();
+        this.clusterPeers.set(peerInfo.deviceId, peerInfo);
+        this.showNotice(`${peerInfo.friendlyName} is now your primary sync partner.`, 'important', 4000);
         this.tryToConnectToClusterPeers();
     }
 
@@ -2809,6 +2889,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (peerId === this.settings.deviceId) return;
                 if (this.isBlocked(peerId)) return;
                 if (this.connections.has(peerId) || this.pendingConnections.has(peerId)) return;
+                const retryIncompatibleAt = this.incompatiblePeers.get(peerId);
+                if (retryIncompatibleAt !== undefined && Date.now() < retryIncompatibleAt) return;
 
                 this.log(`Attempting to connect to cluster peer ${peerId}`);
                 this.pendingConnections.add(peerId);
@@ -2953,6 +3035,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.connections.get(deviceId)?.close();
         this.connections.delete(deviceId);
         this.clusterPeers.delete(deviceId);
+        // Paused uploads to it will never resume; left behind they held the status bar on
+        // "Sync paused" for good.
+        for (const [id, transfer] of this.activeTransfers) {
+            if (transfer.peerId === deviceId) this.activeTransfers.delete(id);
+        }
+        this.scheduleStateSave();
         delete this.settings.peerKeys[deviceId];
         this.invalidateCryptoKey(deviceId);
         if (this.settings.companionPeerId === deviceId) this.settings.companionPeerId = undefined;
@@ -3211,7 +3299,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let lastYieldTime = Date.now();
         const transferStartTime = Date.now();
         
-        const encryptFor = this.settings.enableEncryption && !!this.settings.peerKeys[peerId];
+        const encryptFor = !!this.peerKeyFor(peerId);
 
         if (startIndex === 0) {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector, totalBytes: fileContent.byteLength, chunkSize };
@@ -3410,19 +3498,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const computedHash = await this.getHash(reassembled.buffer);
                 if (transfer.fileHash && computedHash && transfer.fileHash !== computedHash) {
                     this.log(`Integrity check failed for chunked transfer ${transfer.path}. Rejecting.`);
-                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
+                    this.sendDirect(conn, { type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
                     return;
                 }
 
                 await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId, compressed: transfer.compressed, versionVector: transfer.versionVector });
-                this.sendData(conn.peer, { type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
+                // Replies go out directly: through the queue they waited at the lowest priority
+                // behind bulk transfers, long enough for the sender's ack timer to expire.
+                this.sendDirect(conn, { type: 'ack', transferId: payload.transferId });
+                this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
             } catch (e) {
                 this.log(`Failed to apply chunked file update: ${transfer.path}`, e);
-                if (e instanceof Error && e.message.includes('IntegrityError')) {
-                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
-                } else {
-                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'write-error' });
-                }
+                const reason = e instanceof Error && e.message.includes('IntegrityError') ? 'integrity-failure' : 'write-error';
+                this.sendDirect(conn, { type: 'nack', transferId: payload.transferId, reason });
             }
         }
     }
@@ -4128,7 +4216,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`Received a sync request from ${conn.peer}, but a sync is already in progress in phase ${this.syncState.currentPhase}. Declining.`);
             // Say so rather than going quiet. If both devices start a sync at the same moment
             // each was left waiting on the other until the 120 s planning timeout fired.
-            try { conn.send({ type: 'sync-busy' }); } catch (_) { /* peer already gone */ }
+            this.sendDirect(conn, { type: 'sync-busy' });
             return;
         }
         try {

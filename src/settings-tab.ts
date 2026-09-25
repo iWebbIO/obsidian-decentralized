@@ -227,16 +227,6 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
-            .setName("Enable End-to-End Encryption")
-            .setDesc("Uses AES-GCM encryption with a PSK exchanged during pairing. Highly recommended.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableEncryption)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableEncryption = value;
-                    await this.plugin.saveSettings();
-                }));
-
         containerEl.createEl('h4', { text: 'Advanced Settings' });
 
         new Setting(containerEl)
@@ -545,7 +535,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     if (this.plugin.settings.syncMode === 'advanced') {
                         settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
                             this.plugin.manualPingStart.set(peer.deviceId, Date.now());
-                            conn.send({ type: 'ping' });
+                            this.plugin.sendDirect(conn, { type: 'ping' });
                         }));
                     }
                 } else {

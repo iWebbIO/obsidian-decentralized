@@ -183,11 +183,17 @@ export async function mapWithConcurrency<T, R>(
 }
 
 /**
- * Wire protocol version. Bumped for V3, which replaced the base64-in-JSON
- * encryption envelope with a binary frame. A V3 peer cannot talk to a 2.x peer,
- * so the handshake refuses mismatched versions rather than corrupting a vault.
+ * Wire protocol version. The handshake refuses a mismatch rather than letting two
+ * incompatible devices corrupt a vault.
+ *
+ * 3: binary frames replaced the base64-in-JSON encryption envelope.
+ * 4: control replies (pings, acks, sync-acks) are encrypted on paired links, two-device
+ *    conflicts are resolved by edit time rather than device role, and Offline Mode
+ *    authenticates and encrypts its own transport. A v3 device refuses the replies of a
+ *    v4 one on a paired link and would resolve conflicts differently, so the two must not
+ *    mix silently.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Messages that carry a large binary body in a single named field. */
 const BINARY_BODY_FIELD: Record<string, 'data' | 'content'> = {
