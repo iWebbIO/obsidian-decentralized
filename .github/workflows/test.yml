@@ -25,9 +25,21 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node-version }}
-        
+        cache: 'npm'
+
     - name: Install dependencies
       run: npm ci
-      
+
+    - name: Type-check
+      run: npm run typecheck
+
     - name: Run tests
       run: npm run test
+
+    # The tests run against the TypeScript sources; only the bundle shows whether the
+    # plugin still builds and still loads on mobile (no Node built-ins at load time).
+    - name: Build plugin
+      run: npm run build
+
+    - name: Verify the bundle loads on mobile
+      run: npm run test:mobile-load
