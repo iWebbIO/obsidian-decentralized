@@ -138,6 +138,21 @@ export async function connect(a: Device, b: Device, opts: { encrypted?: boolean 
     await waitFor(() => isLinked(a, b) && isLinked(b, a), { what: `${a.id} <-> ${b.id} handshake` });
 }
 
+/**
+ * Cut the link between two devices and keep them apart (their reconnect loops keep failing)
+ * until heal().
+ */
+export async function partition(a: Device, b: Device) {
+    peerjsMock.__network.partitions.add(a.id < b.id ? `${a.id}|${b.id}` : `${b.id}|${a.id}`);
+    a.plugin.connections.get(b.id)?.close();
+    b.plugin.connections.get(a.id)?.close();
+    await waitFor(() => !a.plugin.connections.has(b.id) && !b.plugin.connections.has(a.id), { what: 'the link to drop' });
+}
+
+export function heal(a: Device, b: Device) {
+    peerjsMock.__network.partitions.delete(a.id < b.id ? `${a.id}|${b.id}` : `${b.id}|${a.id}`);
+}
+
 // --- Waiting ------------------------------------------------------------------------
 
 export const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));

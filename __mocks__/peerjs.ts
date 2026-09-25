@@ -20,11 +20,21 @@ class FakeNetwork {
     created: FakePeer[] = [];
     /** Delivery delay for data messages, in ms. */
     latencyMs = 0;
+    /** Pairs of ids that cannot reach each other (tests only). */
+    partitions = new Set<string>();
+
+    static pairKey(a: string, b: string) {
+        return a < b ? `${a}|${b}` : `${b}|${a}`;
+    }
+    isPartitioned(a: string, b: string) {
+        return this.partitions.has(FakeNetwork.pairKey(a, b));
+    }
 
     reset() {
         this.peers.clear();
         this.created = [];
         this.latencyMs = 0;
+        this.partitions.clear();
     }
 }
 
@@ -155,7 +165,7 @@ export default class FakePeer extends EventEmitter {
         this.connections.push(local);
         setTimeout(() => {
             const remotePeer = __network.peers.get(remoteId);
-            if (!remotePeer || remotePeer.destroyed || !remotePeer.open || local.closed) {
+            if (!remotePeer || remotePeer.destroyed || !remotePeer.open || local.closed || __network.isPartitioned(this.id, remoteId)) {
                 this.emit('error', peerError(`Could not connect to peer ${remoteId}`, 'peer-unavailable'));
                 return;
             }

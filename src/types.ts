@@ -385,6 +385,8 @@ export type MerkleNodeResponsePayload = {
     type: 'merkle-node-response';
     path: string;
     children: Record<string, string>;
+    /** Which children are folders. Absent from older peers. */
+    folders?: string[];
 };
 
 export interface MerkleNode {
@@ -509,7 +511,8 @@ export interface ObsidianDecentralizedSettings {
     directIpHostPort: number;
     syncAllFileTypes: boolean;
     syncObsidianConfig: boolean;
-    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins' | 'role-based';
+    /** Applies with three or more devices; two paired devices use newest-wins with a copy. */
+    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins';
     includedFolders: string;
     excludedFolders: string;
     hideNativeSyncStatus: boolean;

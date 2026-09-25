@@ -99,6 +99,42 @@ export function sanitizeVaultPath(rawPath: unknown): string | null {
     return segments.join('/');
 }
 
+/**
+ * Parse a user's folder list (one folder per line) into normalised vault paths.
+ *
+ * Accepts the spellings people actually type — `Archive/`, `/Archive`, `./Archive`,
+ * `Archive\Old` — and drops blank or unusable lines.
+ */
+export function parseFolderList(text: string | null | undefined): string[] {
+    const out: string[] = [];
+    for (const line of (text ?? '').split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const folder = sanitizeVaultPath(trimmed.replace(/^[\\/]+/, ''));
+        if (folder && !out.includes(folder)) out.push(folder);
+    }
+    return out;
+}
+
+/**
+ * True when `path` is one of `folders` or lies inside one.
+ *
+ * Folder rules were plain startsWith() prefixes, so excluding `Work` also excluded
+ * `Workshop/` and `Work notes.md`, and including `Journal` pulled in `Journal archive/`.
+ */
+export function isWithinFolders(path: string, folders: string[]): boolean {
+    return folders.some(folder => path === folder || path.startsWith(folder + '/'));
+}
+
+/**
+ * True when any segment of `path` starts with a dot. Obsidian never indexes such paths, so no
+ * legitimate vault sync involves them, and a peer writing one could reach `.git/hooks` or
+ * other tooling outside the notes.
+ */
+export function hasHiddenSegment(path: string): boolean {
+    return path.split('/').some(segment => segment.startsWith('.'));
+}
+
 /** Inverse of getConflictPath: `Note (conflict on 2024-01-02).md` → `Note.md`. */
 const CONFLICT_COPY_RE = /^(.*) \(conflict on \d{4}-\d{2}-\d{2}(?: \d+)?\)(\.[^./]+)?$/;
 

@@ -325,3 +325,32 @@ describe('decompressText accepts a view', () => {
         expect(decompressText(backing.subarray(8))).toBe(text);
     });
 });
+
+describe('folder rules', () => {
+    const { parseFolderList, isWithinFolders, hasHiddenSegment } = require('../src/utils');
+
+    it('parses the spellings people type', () => {
+        expect(parseFolderList('Archive/\n/Journal\n./Work\r\n  Deep\\Nested  \n\n../escape')).toEqual([
+            'Archive', 'Journal', 'Work', 'Deep/Nested',
+        ]);
+        expect(parseFolderList('')).toEqual([]);
+        expect(parseFolderList(undefined)).toEqual([]);
+    });
+
+    it('matches whole folders, not name prefixes', () => {
+        // startsWith('Work') used to exclude Workshop/ and "Work notes.md" too.
+        const folders = ['Work', 'Journal/Daily'];
+        expect(isWithinFolders('Work', folders)).toBe(true);
+        expect(isWithinFolders('Work/plan.md', folders)).toBe(true);
+        expect(isWithinFolders('Workshop/plan.md', folders)).toBe(false);
+        expect(isWithinFolders('Work notes.md', folders)).toBe(false);
+        expect(isWithinFolders('Journal/Daily/2026-01-01.md', folders)).toBe(true);
+        expect(isWithinFolders('Journal/Dailies/x.md', folders)).toBe(false);
+    });
+
+    it('spots hidden segments anywhere in a path', () => {
+        expect(hasHiddenSegment('.git/hooks/pre-commit')).toBe(true);
+        expect(hasHiddenSegment('notes/.trash/x.md')).toBe(true);
+        expect(hasHiddenSegment('notes/v1.2/x.md')).toBe(false);
+    });
+});
