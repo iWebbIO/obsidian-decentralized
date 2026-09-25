@@ -197,6 +197,8 @@ export type FileDeletePayload = BasePayload & {
     type: 'file-delete';
     path: string;
     versionVector?: VersionVector; // Added versionVector for conflict resolution on deletion
+    /** When the file was deleted. Decides against an edit made independently of the deletion. */
+    deletedAt?: number;
 };
 
 export type FileRenamePayload = BasePayload & {
@@ -235,6 +237,8 @@ export type SyncPlanPayload = {
     filesReceiverMustDelete: string[];
     filesInitiatorMustDelete: string[];
     fileSizes: Record<string, number>;
+    /** For each of filesInitiatorMustDelete: when it was deleted, and the deletion's vector. */
+    deletions?: Record<string, { at: number; vv?: VersionVector }>;
 };
 
 export type RequestBatchPayload = {
@@ -425,7 +429,15 @@ export interface SyncStatusState {
 }
 
 export type SyncTask =
-    | { taskType: 'send-file'; path: string; mtime: number; forceFull: boolean; batchId?: string }
+    | {
+        taskType: 'send-file'; path: string; mtime: number; forceFull: boolean; batchId?: string;
+        /**
+         * Send this vector instead of the file's current one. A device answering a conflict
+         * it won sends its vector from before it folded in the loser's, so the loser sees the
+         * conflict and keeps its version as a copy.
+         */
+        versionVector?: VersionVector;
+    }
     | { taskType: 'send-file-batch'; paths: string[]; batchId: string }
     | { taskType: 'send-folder-create'; path: string; batchId?: string }
     | { taskType: 'send-delete'; path: string }

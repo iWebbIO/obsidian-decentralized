@@ -98,6 +98,19 @@ describe('taskQueueId', () => {
         );
     });
 
+    it('keeps a pull retried in a later batch apart from the earlier batch', () => {
+        const pull = (batchId: string): SyncTask => ({ taskType: 'send-file', path: 'a.md', mtime: 1, forceFull: true, batchId });
+        expect(taskQueueId('p', pull('b1'))).not.toBe(taskQueueId('p', pull('b2')));
+    });
+
+    it('never merges a conflict reply into a plain send', () => {
+        // The reply carries the vector from before the conflict; merged into a plain send it
+        // went out with the merged vector and the other device lost its edit without a copy.
+        const plain: SyncTask = { taskType: 'send-file', path: 'a.md', mtime: 1, forceFull: true };
+        const reply: SyncTask = { ...plain, versionVector: { a: 1 } };
+        expect(taskQueueId('p', plain)).not.toBe(taskQueueId('p', reply));
+    });
+
     it('distinguishes renames that share one endpoint', () => {
         const a: SyncTask = { taskType: 'send-rename', oldPath: 'x.md', newPath: 'y.md' };
         const b: SyncTask = { taskType: 'send-rename', oldPath: 'x.md', newPath: 'z.md' };

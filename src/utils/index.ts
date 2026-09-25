@@ -361,9 +361,16 @@ export function taskQueueId(peerId: string | null, task: SyncTask): string {
     // A batch is flushed in several chunks that all share one batchId, so the paths have to
     // be part of the id. Keying on batchId alone made every flush after the first a
     // duplicate, and those files were silently never sent.
-    const target = task.taskType === 'send-rename'
-        ? `${task.oldPath}\0${task.newPath}`
-        : (task.taskType === 'send-file-batch' ? `${task.batchId}\0${task.paths.join('\0')}` : task.path);
+    let target: string;
+    if (task.taskType === 'send-rename') target = `${task.oldPath}\0${task.newPath}`;
+    else if (task.taskType === 'send-file-batch') target = `${task.batchId}\0${task.paths.join('\0')}`;
+    else target = task.path;
+    if (task.taskType === 'send-file') {
+        // A pull retried in a later batch must not be swallowed by the earlier batch's task,
+        // and a conflict reply carries its own vector, so neither may merge with a plain send.
+        if (task.batchId) target += `\0batch:${task.batchId}`;
+        if (task.versionVector) target += '\0reply';
+    }
     return `${peerId || '*'}\0${task.taskType}\0${target}`;
 }
 

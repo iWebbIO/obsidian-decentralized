@@ -123,11 +123,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName("When both devices change the same note")
-            .setDesc("If you edit a file here and on another device before they sync, choose what happens.")
+            .setName("When two devices change the same note")
+            .setDesc("If a note changes here and on another device before they sync, the more recent change is kept on every device. Choose what happens to the other one.")
             .addDropdown(dd => dd
-                .addOption('create-conflict-file', 'Keep both copies (safest)')
-                .addOption('last-write-wins', 'Keep the newest, drop the other')
+                .addOption('create-conflict-file', 'Keep it as a conflict copy (safest)')
+                .addOption('last-write-wins', 'Discard it')
                 .setValue(this.plugin.settings.conflictResolutionStrategy)
                 .onChange(async (value: 'create-conflict-file' | 'last-write-wins') => {
                     this.plugin.settings.conflictResolutionStrategy = value;
@@ -215,11 +215,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     }
 
     displayAdvancedSettings(containerEl: HTMLElement): void {
-        containerEl.createEl('h4', { text: 'Two-Device Enhancements' });
+        containerEl.createEl('h4', { text: 'Catching up' });
         
         new Setting(containerEl)
-            .setName("Enable Two-Device Optimizations")
-            .setDesc("If exactly one device is connected, enables Version Vectors, Merkle Tree syncing, and Role-based conflict resolution.")
+            .setName("Compare vaults when a device reconnects")
+            .setDesc("Quickly finds what changed while devices were apart and exchanges only that. With exactly one other device connected, also coordinates edits to the same note.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.enableTwoDeviceOptimizations)
                 .onChange(async (value) => {

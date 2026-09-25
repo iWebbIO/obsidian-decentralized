@@ -156,6 +156,175 @@ describe('two devices reconciling after time apart', () => {
     });
 });
 
+describe('after a conflict', () => {
+    test('the next ordinary edit is not another conflict', async () => {
+        // The winner never folded the loser's edit into its version vector, so its next plain
+        // edit looked concurrent with the loser's merged vector and produced a second copy.
+        const a = await createDevice(A, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        await connect(a, b);
+        await partition(a, b);
+        await edit(a, 'note.md', 'older edit on A', T + 10_000);
+        await edit(b, 'note.md', 'newer edit on B', T + 20_000);
+        heal(a, b);
+        await connect(a, b);
+        await waitFor(() => a.vault.text('note.md') === 'newer edit on B', { what: 'the conflict to resolve' });
+        await settle(a, b);
+        expect(conflictCopies(a)).toHaveLength(1);
+
+        await edit(b, 'note.md', 'later ordinary edit on B', T + 30_000);
+        await waitFor(() => a.vault.text('note.md') === 'later ordinary edit on B', { what: 'the edit to arrive' });
+        await settle(a, b);
+        expect(conflictCopies(a)).toHaveLength(1);
+        expect(conflictCopies(b)).toEqual([]);
+    });
+});
+
+describe('first sync of vaults that differed before the plugin was installed', () => {
+    test('the newer copy of each note wins, without conflict copies', async () => {
+        // Neither side has any recorded edit: there is no edit here to protect, and a copy
+        // per differing note would bury a stale vault clone in "(conflict on …)" files.
+        const a = await createDevice(A, { vault: vaultWith({ 'x.md': ['stale on A', T], 'y.md': ['newer on A', T + 5_000] }) });
+        const b = await createDevice(B, { vault: vaultWith({ 'x.md': ['newer on B', T + 5_000], 'y.md': ['stale on B', T] }) });
+        await connect(a, b);
+        await waitFor(() => a.vault.text('x.md') === 'newer on B' && b.vault.text('y.md') === 'newer on A', { what: 'the newer copies to win' });
+        await settle(a, b);
+
+        expect([a.vault.text('x.md'), a.vault.text('y.md')]).toEqual(['newer on B', 'newer on A']);
+        expect([b.vault.text('x.md'), b.vault.text('y.md')]).toEqual(['newer on B', 'newer on A']);
+        expect(conflictCopies(a)).toEqual([]);
+        expect(conflictCopies(b)).toEqual([]);
+    });
+});
+
+describe('conflict setting', () => {
+    async function concurrentEdits(settings: Record<string, unknown>) {
+        const a = await createDevice(A, { vault: vaultWith({ 'note.md': ['v1', T] }), settings });
+        const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['v1', T] }), settings });
+        await connect(a, b);
+        await partition(a, b);
+        await edit(a, 'note.md', 'older edit on A', T + 10_000);
+        await edit(b, 'note.md', 'newer edit on B', T + 20_000);
+        heal(a, b);
+        await connect(a, b);
+        await waitFor(() => a.vault.text('note.md') === 'newer edit on B', { what: 'the newer edit to win' });
+        await settle(a, b);
+        return [a, b] as const;
+    }
+
+    test('a saved "create conflict file" keeps the newer version on both devices, and the older as a copy', async () => {
+        // It used to keep each device's own version and file the other's as the copy, so the
+        // two devices never agreed on the note itself.
+        const [a, b] = await concurrentEdits({ syncMode: 'manual', conflictResolutionStrategy: 'create-conflict-file' });
+        expect(b.vault.text('note.md')).toBe('newer edit on B');
+        expect(conflictCopies(a).map(p => a.vault.text(p))).toEqual(['older edit on A']);
+    });
+
+    test('"last write wins" keeps the newer version and no copy', async () => {
+        const [a, b] = await concurrentEdits({ syncMode: 'manual', conflictResolutionStrategy: 'last-write-wins' });
+        expect(b.vault.text('note.md')).toBe('newer edit on B');
+        expect(conflictCopies(a)).toEqual([]);
+        expect(conflictCopies(b)).toEqual([]);
+    });
+});
+
+describe('three devices', () => {
+    const C = 'device-cccc0003';
+
+    async function trio(files: Record<string, [string, number]>) {
+        const a = await createDevice(A, { vault: vaultWith(files) });
+        const b = await createDevice(B, { vault: vaultWith(files) });
+        const c = await createDevice(C, { vault: vaultWith(files) });
+        await connect(a, b);
+        await connect(a, c);
+        await connect(b, c);
+        return [a, b, c] as const;
+    }
+
+    async function settleAll(...devices: Device[]) {
+        await waitFor(() => devices.every(d => d.plugin.queueManager.getActiveTransfers() === 0 && d.plugin.queueManager.getQueueSize() === 0),
+            { what: 'every queue to drain' });
+        await sleep(150);
+    }
+
+    /** Conflict copies may spread to other devices by reconciliation; none may hold the winner. */
+    function copyContents(...devices: Device[]): Set<string> {
+        return new Set(devices.flatMap(d => conflictCopies(d).map(p => d.vault.text(p) ?? '')));
+    }
+
+    test('independent edits end with the newer one on every device, the older kept as a copy', async () => {
+        const [a, b, c] = await trio({ 'note.md': ['v1', T] });
+        // A and B cannot reach each other; C still reaches both.
+        await partition(a, b);
+
+        await edit(a, 'note.md', 'older edit on A', T + 10_000);
+        await edit(b, 'note.md', 'newer edit on B', T + 20_000);
+        await waitFor(() => c.vault.text('note.md') === 'newer edit on B', { what: 'C to settle on the newer edit' });
+
+        heal(a, b);
+        await connect(a, b);
+        await waitFor(() => [a, b, c].every(d => d.vault.text('note.md') === 'newer edit on B'), { what: 'every device to hold the newer edit' });
+        await settleAll(a, b, c);
+
+        expect([a, b, c].map(d => d.vault.text('note.md'))).toEqual(['newer edit on B', 'newer edit on B', 'newer edit on B']);
+        // A's edit is never silently dropped: A keeps it, once.
+        expect(conflictCopies(a).map(p => a.vault.text(p))).toEqual(['older edit on A']);
+        expect(copyContents(a, b, c)).toEqual(new Set(['older edit on A']));
+        for (const d of [b, c]) expect(conflictCopies(d).length).toBeLessThanOrEqual(1);
+    });
+
+    test('identical edit times go to the lower device ID on every device', async () => {
+        const [a, b, c] = await trio({ 'note.md': ['v1', T] });
+        await partition(a, b);
+
+        await edit(a, 'note.md', 'from A', T + 10_000);
+        await edit(b, 'note.md', 'from B', T + 10_000);
+
+        heal(a, b);
+        await connect(a, b);
+        await waitFor(() => [a, b, c].every(d => d.vault.text('note.md') === 'from A'), { what: 'A\'s edit to win everywhere' });
+        await settleAll(a, b, c);
+
+        expect([a, b, c].map(d => d.vault.text('note.md'))).toEqual(['from A', 'from A', 'from A']);
+        expect(conflictCopies(b).map(p => b.vault.text(p))).toEqual(['from B']);
+        expect(copyContents(a, b, c)).toEqual(new Set(['from B']));
+    });
+
+    test('a deletion made after an edit elsewhere wins everywhere; the edit goes to the trash', async () => {
+        const [a, b, c] = await trio({ 'note.md': ['v1', T] });
+        await partition(a, b);
+
+        await edit(a, 'note.md', 'edited on A', T + 10_000);
+        await b.vault.delete(b.vault.getAbstractFileByPath('note.md')!);   // now: after the edit
+        await sleep(40);
+
+        heal(a, b);
+        await connect(a, b);
+        await waitFor(() => [a, b, c].every(d => !d.vault.has('note.md')), { what: 'the deletion to win everywhere' });
+        await settleAll(a, b, c);
+
+        expect([a, b, c].some(d => d.vault.has('note.md'))).toBe(false);
+        expect(a.vault.trashed).toContain('note.md');
+    });
+
+    test('an edit made after a deletion elsewhere wins everywhere; the note comes back', async () => {
+        const [a, b, c] = await trio({ 'note.md': ['v1', T] });
+        await partition(a, b);
+
+        await b.vault.delete(b.vault.getAbstractFileByPath('note.md')!);
+        await sleep(40);
+        await edit(a, 'note.md', 'edited after the deletion', Date.now() + 60_000);
+
+        heal(a, b);
+        await connect(a, b);
+        await waitFor(() => [a, b, c].every(d => d.vault.text('note.md') === 'edited after the deletion'), { what: 'the edit to win everywhere' });
+        await settleAll(a, b, c);
+
+        expect(b.plugin.tombstones['note.md']).toBeUndefined();
+        expect(c.plugin.tombstones['note.md']).toBeUndefined();
+    });
+});
+
 describe('hash cache', () => {
     test('an update this device rejects does not leave the peer\'s hash behind', async () => {
         // The peer's hash used to be cached before deciding. When the update was then

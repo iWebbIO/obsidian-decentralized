@@ -13,6 +13,7 @@ import { DummyLANDiscovery, DesktopLANDiscovery } from './discovery';
 
 // Direct IP imports
 import { DirectIpServer, DirectIpClient } from './directip';
+import { compareVectors, mergeVectors, newerVersion, pickVersion, hasOwnUnseenEdit, sanitizeVersionVector, VersionInfo } from './utils/versions';
 
 // Types & Constants imports
 import {
@@ -297,7 +298,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private lastSentContent: Map<string, { content: string, timestamp: number }> = new Map();
 
     // Two-Device Mode State
-    public currentRole: DeviceRole | null = null;
     public twoDeviceState: TwoDeviceState = { fileVersions: {}, merkleTreeRoot: null };
     public tombstones: Record<string, number> = {};
     public currentSyncIsTwoDeviceMode: boolean | null = null;
@@ -539,27 +539,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.twoDeviceState.fileVersions[path]) this.twoDeviceState.fileVersions[path] = {};
         this.twoDeviceState.fileVersions[path][this.settings.deviceId] = (this.twoDeviceState.fileVersions[path][this.settings.deviceId] || 0) + 1;
         this.scheduleStateSave();
-    }
-
-    mergeVersions(local: VersionVector, remote: VersionVector): VersionVector {
-        const merged: VersionVector = {};
-        const keys = new Set([...Object.keys(local), ...Object.keys(remote)]);
-        for (const k of keys) {
-            merged[k] = Math.max(local[k] || 0, remote[k] || 0);
-        }
-        return merged;
-    }
-
-    isNewerThan(v1: VersionVector, v2: VersionVector): boolean {
-        let hasGreater = false;
-        const keys = new Set([...Object.keys(v1), ...Object.keys(v2)]);
-        for (const k of keys) {
-            const val1 = v1[k] || 0;
-            const val2 = v2[k] || 0;
-            if (val1 < val2) return false;
-            if (val1 > val2) hasGreater = true;
-        }
-        return hasGreater;
     }
 
     // --- Merkle Tree Vault Diffing ---
@@ -1033,13 +1012,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     /**
-     * Two paired devices resolve conflicts on their own: newest edit wins, the other version
-     * is kept as a conflict copy. With more devices the user's choice applies.
+     * The newer version always wins. By default the device whose edit lost keeps it as a
+     * conflict copy; "last write wins" (manual mode) drops it instead. A saved
+     * 'create-conflict-file' means the default: it used to keep the incoming version as the
+     * copy on every device, so each device kept its own version and they never converged.
      */
-    public getConflictStrategy(): 'newest-with-copy' | 'create-conflict-file' | 'last-write-wins' {
-        if (this.isTwoDeviceMode() && this.settings.enableTwoDeviceOptimizations) return 'newest-with-copy';
-        const chosen = this.settings.syncMode === 'auto' ? 'create-conflict-file' : this.settings.conflictResolutionStrategy;
-        return chosen === 'last-write-wins' ? 'last-write-wins' : 'create-conflict-file';
+    public getConflictStrategy(): 'newest-with-copy' | 'last-write-wins' {
+        if (this.settings.syncMode !== 'auto' && this.settings.conflictResolutionStrategy === 'last-write-wins') return 'last-write-wins';
+        return 'newest-with-copy';
     }
     public shouldSyncAllFileTypes() { return this.settings.syncMode === 'auto' ? true : this.settings.syncAllFileTypes; }
     public shouldSyncObsidianConfig() { return this.settings.syncMode === 'auto' ? true : this.settings.syncObsidianConfig; }
@@ -1200,12 +1180,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     /**
      * Count a local change in the file's version vector — every local change, connected or
-     * not. Counting only while exactly one peer was connected meant an edit made offline never
-     * advanced the vector; on reconnect it tied with the other device's older copy and the
-     * tie-break could throw the edit away.
+     * not, however many devices are connected. The vectors are how every device tells "made
+     * with the other's change in hand" from "changed independently", and conflicts are
+     * decided from them; an edit that went uncounted could lose to an older copy.
      */
     private recordLocalEdit(path: string) {
-        if (this.settings.enableTwoDeviceOptimizations) this.incrementVersion(path);
+        this.incrementVersion(path);
     }
 
     // --- Real-time Editor Sync ---
@@ -1714,7 +1694,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         if (hash) this.updateHashCache(file.path, hash, statAtRead);
                         
                         let isCompressedText = false;
-                        let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[file.path] : undefined;
+                        // A snapshot taken when the send was queued wins: a conflict reply must
+                        // carry the vector from before this device folded in the other side's.
+                        let vv = task.versionVector ?? this.twoDeviceState.fileVersions[file.path];
                         
                         if (!this.isBinary(file.extension)) {
                             if (this.settings.enableDeltaSync && !task.forceFull) {
@@ -1771,12 +1753,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     // before queueing this task, but it was never put on the wire, so the
                     // receiver's edit-versus-delete branch could never run and every remote
                     // delete applied unconditionally — destroying concurrent local edits.
-                    let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[task.path] : undefined;
-                    item.data = { type: 'file-delete', path: task.path, transferId: this.generateTransferId(task.path), versionVector: vv };
+                    if (this.app.vault.getAbstractFileByPath(task.path)) {
+                        // Recreated since the deletion was queued: telling peers to delete
+                        // it now would remove a file this device has.
+                        this.log(`Not sending the deletion of ${task.path}: it exists again.`);
+                        success = true;
+                        return;
+                    }
+                    const vv = this.twoDeviceState.fileVersions[task.path];
+                    item.data = { type: 'file-delete', path: task.path, transferId: this.generateTransferId(task.path), versionVector: vv, deletedAt: this.tombstones[task.path] };
                 } else if (task.taskType === 'send-folder-create') {
                     item.data = { type: 'folder-create', path: task.path, transferId: this.generateTransferId(task.path) };
                 } else if (task.taskType === 'send-rename') {
-                    let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[task.newPath] : undefined;
+                    const vv = this.twoDeviceState.fileVersions[task.newPath];
                     item.data = { type: 'file-rename', oldPath: task.oldPath, newPath: task.newPath, transferId: this.generateTransferId(task.newPath), versionVector: vv };
                 } else if (task.taskType === 'send-file-batch') {
                     // Read and compress the batch's files concurrently. Serially this was
@@ -2720,7 +2709,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 case 'file-delete':
                     // Unlike file-update and file-delta this had no error handling at all, so
                     // a failed delete surfaced only as an unhandled rejection.
-                    this.applyFileDelete(data).catch(e => {
+                    this.applyFileDelete(data, conn?.peer).catch(e => {
                         this.log(`Failed to apply remote delete for ${data.path}`, e);
                         this.showNotice(`Could not delete ${data.path} — it may still exist on this device.`, 'error');
                     });
@@ -2799,6 +2788,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * path is unusable (absolute, `..`, NUL, ...).
      */
     private canonicalizePeerPaths(data: any): boolean {
+        // Version vectors from a peer are merged into our own state; one with non-numeric or
+        // absurd counts would poison every later comparison for that file.
+        if ('versionVector' in data) data.versionVector = sanitizeVersionVector(data.versionVector);
+        if ('deletedAt' in data && !(typeof data.deletedAt === 'number' && Number.isFinite(data.deletedAt))) delete data.deletedAt;
         for (const field of ['path', 'oldPath', 'newPath']) {
             const value = data[field];
             if (value === undefined) continue;
@@ -2891,17 +2884,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.broadcastData({ type: 'cluster-gossip', peers: [persistablePeerInfo(this.getMyPeerInfo()), peerInfo] });
         }
         
-        if (this.isTwoDeviceMode()) {
-            this.currentRole = this.getMyRole(conn.peer);
-
-            // Auto-reconciliation: the primary initiates a cheap Merkle-root exchange so
-            // paired vaults converge automatically after a reconnect. Without this trigger
-            // the whole Merkle diffing path was dead code — nothing ever sent 'merkle-root'.
-            if (this.settings.enableTwoDeviceOptimizations && this.currentRole === 'primary' && !this.syncState.isSyncing) {
-                this.getMerkleTree()
-                    .then(tree => this.sendData(conn.peer, { type: 'merkle-root', rootHash: tree.hash }))
-                    .catch(e => this.log('Failed to build Merkle tree for auto-reconciliation', e));
-            }
+        // Auto-reconciliation: a cheap Merkle-root exchange on every (re)connection, so
+        // changes made while two devices were apart reach each other and any conflict is
+        // settled by the usual rule. This used to run only while exactly one device was
+        // connected, so in a group of three, two devices that had been apart never compared
+        // notes. The device with the lower ID starts, so each pair runs one exchange.
+        if (this.settings.enableTwoDeviceOptimizations && this.getMyRole(conn.peer) === 'primary' && !this.syncState.isSyncing) {
+            this.getMerkleTree()
+                .then(tree => this.sendData(conn.peer, { type: 'merkle-root', rootHash: tree.hash }))
+                .catch(e => this.log('Failed to build Merkle tree for auto-reconciliation', e));
         }
 
         this.resumeTransfers(conn.peer);
@@ -3681,16 +3672,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 throw new Error("IntegrityError: File not found for delta sync");
             }
             
-            if (this.isTwoDeviceMode() && data.versionVector) {
-                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
-                if (this.isNewerThan(localVV, data.versionVector) && !this.isNewerThan(data.versionVector, localVV)) {
-                    return;
-                }
-            } else if (data.mtime <= existingFile.stat.mtime + this.settings.mtimeTolerance &&
-                       data.mtime >= existingFile.stat.mtime - this.settings.mtimeTolerance) {
-                // Within mtime tolerance — fall through to baseHash check below instead of
-                // silently dropping the delta. If baseHash matches, the delta is valid and
-                // should be applied; if not, IntegrityError is thrown and triggers full resend.
+            // A delta applies only on top of exactly the content it was made from (the base
+            // hash check below); anything else fails over to a full send, where conflicts are
+            // decided. One made from an older version than ours is simply stale.
+            const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+            if (compareVectors(data.versionVector, localVV) === 'before') {
+                this.log(`Ignoring a delta for ${data.path}: this device's version already includes it.`);
+                return;
             }
 
             const localContent = await this.app.vault.read(existingFile);
@@ -3711,11 +3699,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             this.ignoreNextEventForPath(data.path);
             await this.app.vault.modify(existingFile, newContent, { mtime: data.mtime });
-
-            if (this.isTwoDeviceMode() && data.versionVector) {
-                this.twoDeviceState.fileVersions[data.path] = data.versionVector;
-                this.scheduleStateSave();
-            }
+            this.adoptVector(data.path, mergeVectors(localVV, data.versionVector));
 
             this.noteRemoteWrite(data.path, await this.getHash(newContent));
         });
@@ -3752,10 +3736,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (!existingFile) {
                 if (this.deletionOutranks(data, fromPeer)) return;
                 await this.handleNewFileCreation(data, fromPeer);
-                if (this.isTwoDeviceMode() && data.versionVector) {
-                    this.twoDeviceState.fileVersions[data.path] = data.versionVector;
-                    this.scheduleStateSave();
-                }
+                this.adoptVector(data.path, mergeVectors(this.twoDeviceState.fileVersions[data.path], data.versionVector));
             } else if (existingFile instanceof TFile) {
                 await this.handleFileModification(data, existingFile, fromPeer);
             } else {
@@ -3765,26 +3746,25 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     /**
-     * True when we deleted `data.path` after the copy a peer just sent was last changed, so
-     * that copy must not come back. Deletions made while offline were resurrected exactly
-     * this way: the reconciliation on reconnect pushed the other device's older copy, and it
-     * was recreated here and its tombstone cleared. Same rule as full-sync planning: a
-     * deletion beats a copy last modified before it; a copy edited afterwards wins.
-     *
-     * The sender is told to delete its copy too, with a version vector that dominates the one
-     * it sent, so its edit-vs-delete check accepts the deletion instead of pushing back.
+     * True when this device's deletion of `data.path` beats the copy a peer just sent, so the
+     * copy must not come back. Deletions made while offline were resurrected exactly this way:
+     * reconciliation on reconnect pushed the other device's older copy, and it was recreated
+     * here and its tombstone cleared. Same rule as edits: the vectors decide when one side
+     * saw the other's change (a copy edited after the peer learned of the deletion wins; a
+     * copy the deletion already covered loses), and otherwise the later of deletion and edit.
+     * The sender is then told to delete its copy too.
      */
     private deletionOutranks(data: FileUpdatePayload, fromPeer?: string): boolean {
         const deletedAt = this.tombstones[data.path];
-        if (deletedAt === undefined || !(data.mtime < deletedAt)) return false;
+        if (deletedAt === undefined) return false;
+        const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+        const remoteVV = data.versionVector || {};
+        const deletion: VersionInfo = { mtime: deletedAt, vv: localVV, deviceId: this.settings.deviceId };
+        const copy: VersionInfo = { mtime: data.mtime, vv: remoteVV, hash: data.fileHash, deviceId: this.realDeviceId(fromPeer) };
+        if (pickVersion(deletion, copy) === 'b') return false;
         this.log(`Not recreating ${data.path}: it was deleted here after that copy was last changed.`);
         if (fromPeer) {
-            if (this.settings.enableTwoDeviceOptimizations) {
-                const merged = this.mergeVersions(this.twoDeviceState.fileVersions[data.path] || {}, data.versionVector || {});
-                merged[this.settings.deviceId] = (merged[this.settings.deviceId] || 0) + 1;
-                this.twoDeviceState.fileVersions[data.path] = merged;
-                this.scheduleStateSave();
-            }
+            this.adoptVector(data.path, mergeVectors(localVV, remoteVV));
             this.addToQueueTask(fromPeer, { taskType: 'send-delete', path: data.path });
         }
         return true;
@@ -3805,17 +3785,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private realDeviceId(peerKey?: string | null): string | null {
         if (!peerKey) return null;
         return this.clusterPeers.get(peerKey)?.deviceId || peerKey;
-    }
-
-    /**
-     * Whether the peer's edit beats ours: the later modification time wins, and identical
-     * times go to the lower device ID. Both devices compare the same two timestamps, so both
-     * reach the same answer.
-     */
-    private remoteEditWins(remoteMtime: number, localMtime: number, fromPeer?: string | null): boolean {
-        if (remoteMtime !== localMtime) return remoteMtime > localMtime;
-        const theirs = this.realDeviceId(fromPeer);
-        return theirs !== null && theirs < this.settings.deviceId;
     }
 
     private async handleNewFileCreation(data: FileUpdatePayload, fromPeer?: string) {
@@ -3892,50 +3861,34 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 ? await this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
                 : localContent === data.content;
 
+            const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+            const remoteVV = data.versionVector || {};
+
             if (contentIsSame) {
                 this.log(`Ignoring update (content is identical): ${data.path}`);
                 if (data.fileHash) this.updateHashCache(data.path, data.fileHash, existingFile.stat);
-                if (this.isTwoDeviceMode() && data.versionVector) {
-                    this.twoDeviceState.fileVersions[data.path] = this.mergeVersions(this.twoDeviceState.fileVersions[data.path] || {}, data.versionVector);
-                    this.scheduleStateSave();
-                }
+                this.adoptVector(data.path, mergeVectors(localVV, remoteVV));
                 return;
             }
 
-            if (this.isTwoDeviceMode() && data.versionVector) {
-                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
-                const remoteVV = data.versionVector;
-                const isRemoteNewer = this.isNewerThan(remoteVV, localVV);
-                const isLocalNewer = this.isNewerThan(localVV, remoteVV);
-
-                // Version vectors order edits causally, which beats comparing two devices'
-                // clocks: the version that already includes the other's change wins.
-                if (isRemoteNewer && !isLocalNewer) {
-                    this.log(`Applying update (remote vector dominates): ${data.path}`);
-                    await this.writeRemoteVersion(existingFile, data);
-                    this.twoDeviceState.fileVersions[data.path] = remoteVV;
-                    this.scheduleStateSave();
-                    return;
-                } else if (isLocalNewer && !isRemoteNewer) {
-                    this.log(`Ignoring update (local vector dominates): ${data.path}`);
-                    return;
-                } else {
-                    await this.resolveConcurrentEdit(data, existingFile, localContent, fromPeer);
-                    return;
-                }
-            }
-
-            if (data.mtime > existingFile.stat.mtime + this.settings.mtimeTolerance) {
-                this.log(`Applying update (remote is newer): ${data.path}`);
+            // Version vectors order edits causally, which beats comparing two devices'
+            // clocks: the version made with the other already in hand wins.
+            const order = compareVectors(remoteVV, localVV);
+            if (order === 'after') {
+                this.log(`Applying update (it includes this device's version): ${data.path}`);
                 await this.writeRemoteVersion(existingFile, data);
+                this.adoptVector(data.path, mergeVectors(localVV, remoteVV));
+                return;
+            }
+            if (order === 'before') {
+                this.log(`Ignoring update (this device's version already includes it): ${data.path}`);
+                // The sender is behind; offer it ours rather than leave it stale until the
+                // next full sync.
+                this.replyWithOurVersion(existingFile, fromPeer, localVV);
                 return;
             }
 
-            if (data.mtime < existingFile.stat.mtime - this.settings.mtimeTolerance) {
-                this.log(`Ignoring update (local is newer): ${data.path}`);
-                return;
-            }
-
+            // Changed on both sides independently, or no record tells the versions apart.
             await this.resolveConflict(data, existingFile, localContent, fromPeer);
         } catch (e) {
             if (e instanceof Error && (e.message.includes("File not found") || e.message.includes("no such file"))) {
@@ -3949,66 +3902,73 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     /**
-     * Two-device mode: an edit made here and one made on the peer that neither version vector
-     * orders. The more recent edit wins on both devices (identical times go to the lower
-     * device ID), and the losing version is never thrown away — the device holding it saves it
-     * as a conflict copy first. This used to be decided by device role alone: the "primary"
-     * always won and the other device's edit was silently overwritten, even if it was newer.
+     * Both devices changed the file without seeing each other's change (or nothing records
+     * which came first). The more recent change wins on every device — see pickVersion, which
+     * every device evaluates identically — and the losing version is not thrown away: the
+     * device whose own edit lost saves it as a conflict copy first. "Last write wins" (a
+     * manual-mode opt-out) skips the copy.
+     *
+     * This used to depend on how many devices happened to be connected: with one, the device
+     * "role" decided and the other edit was silently overwritten; with two or more, a newer
+     * copy overwrote without a copy and near-simultaneous edits left each device keeping its
+     * own version.
      */
-    private async resolveConcurrentEdit(data: FileUpdatePayload, existingFile: TFile, localContent: string | ArrayBuffer, fromPeer?: string) {
+    private async resolveConflict(data: FileUpdatePayload, existingFile: TFile, localContent: string | ArrayBuffer, fromPeer: string | undefined) {
         const localVV = this.twoDeviceState.fileVersions[data.path] || {};
-        if (this.remoteEditWins(data.mtime, existingFile.stat.mtime, fromPeer)) {
-            this.log(`Concurrent edits to ${data.path}: the other device's is newer. Keeping ours as a conflict copy.`);
-            const copy = await this.createConflictCopy(data.path, localContent);
-            await this.writeRemoteVersion(existingFile, data);
-            this.twoDeviceState.fileVersions[data.path] = this.mergeVersions(localVV, data.versionVector || {});
-            this.scheduleStateSave();
-            if (copy) {
-                this.showNotice(`${existingFile.name} was changed on both devices. The newer version was kept; this device's version is saved as ${copy.split('/').pop()}.`, 'important', 12000);
-            }
+        const remoteVV = data.versionVector || {};
+        const merged = mergeVectors(localVV, remoteVV);
+        const local: VersionInfo = { mtime: existingFile.stat.mtime, vv: localVV, hash: await this.getHash(localContent).catch(() => undefined), deviceId: this.settings.deviceId };
+        const remote: VersionInfo = { mtime: data.mtime, vv: remoteVV, hash: data.fileHash, deviceId: this.realDeviceId(fromPeer) };
+
+        if (newerVersion(remote, local) === 'b') {
+            this.log(`Conflicting versions of ${data.path}: this device's is newer. Sending it back.`);
+            // Sent with our vector from BEFORE merging theirs, so the other device sees the
+            // same conflict, reaches the same verdict and keeps its own version as a copy.
+            // Merging first made ours look like a plain successor, and it overwrote its edit.
+            this.replyWithOurVersion(existingFile, fromPeer, localVV);
+            this.adoptVector(data.path, merged);
             return;
         }
 
-        this.log(`Concurrent edits to ${data.path}: ours is newer. Sending it back.`);
-        // Send ours back WITHOUT folding in the peer's vector. The peer then sees the same
-        // concurrent pair, reaches the same verdict, and saves its own version as the
-        // conflict copy. Merging first (as the role-based rule did) made our copy look like a
-        // plain successor, so the peer overwrote its edit without keeping it.
-        const cooldownKey = `conflict:${data.path}`;
-        const cooldownUntil = this.ignoreEvents.get(cooldownKey);
-        if (cooldownUntil && Date.now() < cooldownUntil) {
-            this.log(`Skipping re-send for ${data.path} — conflict cooldown active`);
-            return;
+        // Only an edit made on this device is worth a copy here. A version that came from
+        // another device is kept by the device that made it, if it lost there; and content
+        // no edit here ever touched (vaults that differed before the plugin was installed)
+        // simply takes the newer version, so a first sync does not litter copies.
+        const keepCopy = this.getConflictStrategy() === 'newest-with-copy'
+            && hasOwnUnseenEdit(localVV, remoteVV, this.settings.deviceId);
+        this.log(`Conflicting versions of ${data.path}: the other device's is newer.${keepCopy ? ' Keeping ours as a conflict copy.' : ''}`);
+        const copy = keepCopy ? await this.createConflictCopy(data.path, localContent) : null;
+        await this.writeRemoteVersion(existingFile, data);
+        this.adoptVector(data.path, merged);
+        if (copy) {
+            const from = this.clusterPeers.get(fromPeer ?? '')?.friendlyName || 'another device';
+            this.showNotice(`${existingFile.name} was also changed on ${from}. The newer version was kept; this device's version is saved as ${copy.split('/').pop()} — use “Resolve sync conflicts” to compare them.`, 'important', 12000);
         }
-        this.ignoreEvents.set(cooldownKey, Date.now() + 5000);
-        const target = fromPeer ?? this.twoDevicePeerId;
-        if (target) void this.sendFileUpdate(existingFile, target, true);
     }
 
-    /** Conflicts that version vectors did not settle (no vectors, or several devices). */
-    private async resolveConflict(data: FileUpdatePayload, existingFile: TFile, localContent: string | ArrayBuffer, fromPeer?: string) {
-        const strategy = this.getConflictStrategy();
-        this.log(`Conflict detected for: ${data.path}. Strategy: ${strategy}`);
-
-        if (strategy === 'newest-with-copy') {
-            await this.resolveConcurrentEdit(data, existingFile, localContent, fromPeer);
+    /**
+     * Send our version of `file` to `peer` (the device that just sent an older or losing one),
+     * with `vector` rather than whatever the file's vector is by the time the send runs.
+     * Rate-limited per path and peer: two devices answering each other must not loop.
+     */
+    private replyWithOurVersion(file: TFile, peer: string | undefined, vector: VersionVector) {
+        if (!peer) return;
+        const key = `${peer}\0${file.path}`;
+        const now = Date.now();
+        if ((this.replyCooldowns.get(key) ?? 0) > now) {
+            this.log(`Not answering ${peer} about ${file.path} again so soon.`);
             return;
         }
+        for (const [k, until] of this.replyCooldowns) if (until <= now) this.replyCooldowns.delete(k);
+        this.replyCooldowns.set(key, now + 5000);
+        this.addToQueueTask(peer, { taskType: 'send-file', path: file.path, mtime: file.stat.mtime, forceFull: true, versionVector: { ...vector } });
+    }
 
-        if (strategy === 'last-write-wins') {
-            // Both devices must pick the same survivor; with equal timestamps "local wins"
-            // on each side kept both versions forever.
-            if (this.remoteEditWins(data.mtime, existingFile.stat.mtime, fromPeer)) {
-                this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`);
-                await this.writeRemoteVersion(existingFile, data);
-            } else {
-                this.log(`Conflict resolved by 'last-write-wins' (local wins): ${data.path}`);
-            }
-            return;
-        }
+    private replyCooldowns = new Map<string, number>();
 
-        this.log(`Creating conflict file for: ${data.path}`);
-        await this.createConflictFile(data);
+    private adoptVector(path: string, vector: VersionVector) {
+        this.twoDeviceState.fileVersions[path] = vector;
+        this.scheduleStateSave();
     }
 
     async applyFileBatchBinary(data: FileBatchBinaryPayload, fromPeer?: string): Promise<{ succeeded: string[], failed: string[] }> {
@@ -4098,14 +4058,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return results;
     }
 
-    /** Save a peer's conflicting version beside the original ("Keep both copies"). */
-    async createConflictFile(data: FileUpdatePayload) {
-        const copy = await this.createConflictCopy(data.path, data.content);
-        if (copy) {
-            this.showNotice(`Conflict on ${data.path}. Open Conflict Center (left ribbon, or “Resolve sync conflicts”) to choose a version.`, 'important', 12000);
-        }
-    }
-
     /**
      * Write `content` to a fresh "(conflict on DATE)" path next to `originalPath` and list it in
      * the Conflict Center. Returns the copy's path, or null if none could be made.
@@ -4159,7 +4111,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return { files, folders, hasOutOfScope };
     }
 
-    async applyFileDelete(data: FileDeletePayload) {
+    async applyFileDelete(data: FileDeletePayload, fromPeer?: string) {
         if (!this.isPathSyncable(data.path)) return;
         await this.runLocked(data.path, async () => {
             const existingFile = this.app.vault.getAbstractFileByPath(data.path);
@@ -4170,39 +4122,41 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 return;
             }
 
-            if (this.isTwoDeviceMode() && data.versionVector) {
-                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
-                const remoteVV = data.versionVector;
-                const isRemoteNewer = this.isNewerThan(remoteVV, localVV);
+            const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+            const remoteVV = data.versionVector || {};
+            const merged = mergeVectors(localVV, remoteVV);
 
-                if (!isRemoteNewer && !existingFile) {
-                    // Already gone here (the same deletion arriving twice, or deleted on both
-                    // sides): nothing to defend, just record what the peer knows.
-                    this.twoDeviceState.fileVersions[data.path] = this.mergeVersions(localVV, remoteVV);
-                    this.scheduleStateSave();
-                    return;
-                }
-                if (!isRemoteNewer) {
-                    // Local edit wins (local is strictly newer, or there's a concurrent conflict).
-                    // We merge the remote vector, increment local version, and push the local file back to the peer.
-                    this.log(`Edit-vs-delete conflict: local edit wins for ${data.path}`);
-                    const merged = this.mergeVersions(localVV, remoteVV);
-                    merged[this.settings.deviceId] = (merged[this.settings.deviceId] || 0) + 1;
-                    this.twoDeviceState.fileVersions[data.path] = merged;
-                    this.scheduleStateSave();
-
-                    if (existingFile instanceof TFile && this.twoDevicePeerId) {
-                        this.sendFileUpdate(existingFile, this.twoDevicePeerId, true);
-                    }
-                    return;
-                } else {
-                    // Remote delete dominates. Update version vector to reflect the deletion.
-                    this.twoDeviceState.fileVersions[data.path] = remoteVV;
+            if (!existingFile) {
+                // Already gone here (the same deletion arriving twice, or deleted on both
+                // sides): nothing to defend, just record what the peer knows.
+                this.adoptVector(data.path, merged);
+                if (this.tombstones[data.path] === undefined) {
+                    this.tombstones[data.path] = data.deletedAt ?? Date.now();
                     this.scheduleStateSave();
                 }
+                return;
             }
 
-            this.tombstones[data.path] = Date.now();
+            // Edit versus delete: the vectors decide when one side saw the other's change;
+            // otherwise the later of the edit and the deletion wins, on both devices. Only a
+            // deletion from an older peer, which says neither when nor what it deleted, is
+            // applied as it stands.
+            const deletion: VersionInfo = { mtime: data.deletedAt ?? 0, vv: remoteVV, deviceId: this.realDeviceId(fromPeer) };
+            const ours: VersionInfo = { mtime: existingFile.stat.mtime, vv: localVV, deviceId: this.settings.deviceId };
+            const legacy = data.deletedAt === undefined && compareVectors(remoteVV, localVV) !== 'before';
+            if (!legacy && pickVersion(deletion, ours) === 'b') {
+                this.log(`Keeping ${data.path}: it was changed here after the other device deleted it.`);
+                this.replyWithOurVersion(existingFile, fromPeer, localVV);
+                this.adoptVector(data.path, merged);
+                return;
+            }
+            if (hasOwnUnseenEdit(localVV, remoteVV, this.settings.deviceId)) {
+                const from = this.clusterPeers.get(fromPeer ?? '')?.friendlyName || 'another device';
+                this.showNotice(`${existingFile.name} was deleted on ${from} after it was changed here. This device's version is in the trash.`, 'important', 12000);
+            }
+            this.adoptVector(data.path, merged);
+
+            this.tombstones[data.path] = data.deletedAt ?? Date.now();
             this.scheduleStateSave();
             this.syncedHashes.delete(data.path);
             if (existingFile) {
@@ -4246,9 +4200,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } else if (target instanceof TFile) {
                     // Already renamed here (or the rename arrived after the file itself).
                     if (data.versionVector) {
-                        this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
+                        this.adoptVector(data.newPath, mergeVectors(this.twoDeviceState.fileVersions[data.newPath], data.versionVector));
                         delete this.twoDeviceState.fileVersions[data.oldPath];
-                        this.scheduleStateSave();
                     }
                 } else if (!fileToRename && !target && conn) {
                     // We never had the file under its old name, so there is nothing to move.
@@ -4571,6 +4524,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const filesReceiverMustDelete: string[] = [];
             const filesInitiatorMustDelete: string[] = [];
             const fileSizes: Record<string, number> = {};
+            // When, and with what vector, each side's winning deletions happened: recorded as
+            // the tombstone on the device that applies them, so a later comparison against an
+            // edit elsewhere uses the real deletion time rather than "when the sync ran".
+            const deletions: Record<string, { at: number; vv?: VersionVector }> = {};
+            const myDeletions = new Map<string, { at: number; vv?: VersionVector }>();
             
             const allPaths = new Set([...localIndex.keys(), ...remoteIndex.keys()]);
             
@@ -4589,7 +4547,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (localItem.type !== 'file' || remoteItem.type !== 'file') continue;
                 if (localItem.hash) continue;
                 if (localItem.size !== remoteItem.size) continue;
-                if (Math.abs(localItem.mtime - remoteItem.mtime) <= this.settings.mtimeTolerance) continue;
+                // Close times with no recorded edits on either side are taken as the same
+                // file below; everything else of equal size needs the hash to tell.
+                if (Math.abs(localItem.mtime - remoteItem.mtime) <= this.settings.mtimeTolerance
+                    && compareVectors(localItem.versionVector, remoteItem.versionVector) === 'equal') continue;
                 needsHash.push(path);
             }
 
@@ -4623,64 +4584,33 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         this.peerFileSizes[path] = remoteItem.size;
                     }
                 } else if (localItem && remoteItem) {
+                    if (localItem.type === 'folder' || remoteItem.type === 'folder') continue;
+                    // One rule for every pair, the same one each device applies on receipt:
+                    // the vectors decide when one side saw the other's change, otherwise the
+                    // more recent change wins (a deletion's time is when it happened). The
+                    // device receiving the winner keeps its own losing edit as a copy.
+                    const local: VersionInfo = { mtime: localItem.mtime, vv: localItem.versionVector, hash: localItem.hash, deviceId: this.settings.deviceId };
+                    const remote: VersionInfo = { mtime: remoteItem.mtime, vv: remoteItem.versionVector, hash: remoteItem.hash, deviceId: this.realDeviceId(conn.peer) };
                     if (localItem.type === 'file' && remoteItem.type === 'file') {
-                        let conflictResolved = false;
-                        if (this.currentSyncIsTwoDeviceMode && localItem.versionVector && remoteItem.versionVector) {
-                            const isLocalNewer = this.isNewerThan(localItem.versionVector, remoteItem.versionVector);
-                            const isRemoteNewer = this.isNewerThan(remoteItem.versionVector, localItem.versionVector);
-                            if (isLocalNewer && !isRemoteNewer) {
-                                filesReceiverWillSend.push(path);
-                                fileSizes[path] = localItem.size;
-                                conflictResolved = true;
-                            }
-                            else if (isRemoteNewer && !isLocalNewer) {
-                                filesInitiatorMustSend.push(path);
-                                this.peerFileSizes[path] = remoteItem.size;
-                                conflictResolved = true;
-                            }
-                            else if (!isLocalNewer && !isRemoteNewer) {
-                                if (localItem.hash && remoteItem.hash && localItem.hash === remoteItem.hash) {
-                                    conflictResolved = true;
-                                } else {
-                                    // Concurrent edits: the newer one travels, and the device
-                                    // receiving it keeps its own version as a conflict copy.
-                                    if (this.remoteEditWins(remoteItem.mtime, localItem.mtime, conn.peer)) {
-                                        filesInitiatorMustSend.push(path);
-                                        this.peerFileSizes[path] = remoteItem.size;
-                                    } else {
-                                        filesReceiverWillSend.push(path);
-                                        fileSizes[path] = localItem.size;
-                                    }
-                                    conflictResolved = true;
-                                }
-                            }
-                        } 
-                        
-                        if (!conflictResolved) {
-                            if (localItem.size !== remoteItem.size) {
-                                if (localItem.mtime > remoteItem.mtime) { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
-                                else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
-                            } else if (Math.abs(localItem.mtime - remoteItem.mtime) > this.settings.mtimeTolerance) {
-                                // Resolved by the concurrent pre-pass above; may still be
-                                // undefined if the file vanished in the meantime.
-                                const lHash = localItem.hash;
-                                if (remoteItem.hash && lHash === remoteItem.hash) {
-                                    // Match
-                                } else {
-                                    if (localItem.mtime > remoteItem.mtime) { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
-                                    else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
-                                }
-                            }
-                        }
-                    } else if (localItem.type === 'deleted' && remoteItem.type === 'file') {
-                        // Tombstone mtime = deletion time; file mtime = last modification time.
-                        // Comparing directly is intentional: if the file was modified AFTER it
-                        // was deleted on the other side, the newer modification takes precedence.
-                        if (localItem.mtime > remoteItem.mtime) filesInitiatorMustDelete.push(path);
+                        if (localItem.hash && remoteItem.hash && localItem.hash === remoteItem.hash) continue;
+                        // No recorded change on either side, same size, (nearly) the same time
+                        // and nothing to show the contents differ: the same file.
+                        if (compareVectors(localItem.versionVector, remoteItem.versionVector) === 'equal'
+                            && localItem.size === remoteItem.size
+                            && !(localItem.hash && remoteItem.hash)
+                            && Math.abs(localItem.mtime - remoteItem.mtime) <= this.settings.mtimeTolerance) continue;
+                        if (pickVersion(local, remote) === 'a') { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
                         else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
+                    } else if (localItem.type === 'deleted' && remoteItem.type === 'file') {
+                        if (pickVersion(local, remote) === 'a') {
+                            filesInitiatorMustDelete.push(path);
+                            deletions[path] = { at: localItem.mtime, vv: localItem.versionVector };
+                        } else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
                     } else if (localItem.type === 'file' && remoteItem.type === 'deleted') {
-                        if (remoteItem.mtime > localItem.mtime) filesReceiverMustDelete.push(path);
-                        else { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
+                        if (pickVersion(local, remote) === 'b') {
+                            filesReceiverMustDelete.push(path);
+                            myDeletions.set(path, { at: remoteItem.mtime, vv: remoteItem.versionVector });
+                        } else { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
                     }
                 }
             }
@@ -4695,11 +4625,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log("Vaults are completely identical. No sync needed.");
             }
             
-            await this.sendSyncMessage(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes }); ; 
+            await this.sendSyncMessage(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes, deletions });
             
             for (const path of filesReceiverMustDelete) {
                 const entry = localIndex.get(path);
-                await this.deleteForSyncPlan(path, entry && entry.type !== 'folder' ? entry.mtime : undefined);
+                await this.deleteForSyncPlan(path, entry && entry.type !== 'folder' ? entry.mtime : undefined, myDeletions.get(path));
             }
 
             this.syncState.allowedPulls = new Set(filesReceiverWillSend);
@@ -4734,7 +4664,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const mtime = Number(item.mtime);
                 const size = Number(item.size);
                 if (!Number.isFinite(mtime) || !Number.isFinite(size)) continue;
-                scoped.push({ ...item, path, mtime, size });
+                const hash = typeof item.hash === 'string' && item.hash.length <= 256 ? item.hash : undefined;
+                scoped.push({ type: item.type, path, mtime, size, hash, versionVector: sanitizeVersionVector(item.versionVector) });
             }
         }
         return scoped;
@@ -4745,7 +4676,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * this device syncs and it still has the mtime the plan was computed from, so an edit
      * made while the plan was in flight survives.
      */
-    private async deleteForSyncPlan(path: string, expectedMtime: number | undefined) {
+    private async deleteForSyncPlan(path: string, expectedMtime: number | undefined, deletion?: { at: number; vv?: VersionVector }) {
         await this.runLocked(path, async () => {
             const file = this.app.vault.getAbstractFileByPath(path);
             if (!(file instanceof TFile) || !this.isPathSyncable(path)) {
@@ -4758,8 +4689,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             try {
                 this.syncedHashes.delete(path);
-                if (this.isTwoDeviceMode()) this.incrementVersion(path);
-                this.tombstones[path] = Date.now();
+                // Record the deletion as the other device made it, not as a new one here.
+                if (deletion?.vv) this.adoptVector(path, mergeVectors(this.twoDeviceState.fileVersions[path], deletion.vv));
+                else this.incrementVersion(path);
+                this.tombstones[path] = deletion?.at ?? Date.now();
                 this.scheduleStateSave();
                 await this.trashForPeer(file);
             } catch (e) {
@@ -4789,7 +4722,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             // unchecked — any path, folders included.
             for (const raw of Array.isArray(data.filesInitiatorMustDelete) ? data.filesInitiatorMustDelete : []) {
                 const path = sanitizeVaultPath(raw);
-                if (path) await this.deleteForSyncPlan(path, this.sentManifestMtimes.get(path));
+                const deletion = path && data.deletions && typeof data.deletions === 'object' ? data.deletions[raw] : undefined;
+                if (path) await this.deleteForSyncPlan(path, this.sentManifestMtimes.get(path),
+                    deletion && Number.isFinite(deletion.at) ? { at: deletion.at, vv: sanitizeVersionVector(deletion.vv) } : undefined);
             }
 
             // Pull only what this device syncs: anything else would be refused on arrival yet
@@ -5140,7 +5075,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // Yield on a time budget rather than every 50 files. A 20k-file vault produced
         // ~400 macrotask yields, and browser timer clamping turned that into seconds of
         // pure scheduling latency inside a phase that has a 120 s timeout.
-        const twoDevice = this.currentSyncIsTwoDeviceMode ?? this.isTwoDeviceMode();
         let count = 0;
         let lastYield = Date.now();
         for (const file of allFiles) {
@@ -5149,7 +5083,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     if (file.path !== '/') manifest.push({ type: 'folder', path: file.path });
                 } else if (file instanceof TFile) {
                     const hash = this.cachedHashFor(file);
-                    const vv = twoDevice ? this.twoDeviceState.fileVersions[file.path] : undefined;
+                    const vv = this.twoDeviceState.fileVersions[file.path];
                     manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash, versionVector: vv });
                     count++;
 
@@ -5168,7 +5102,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const livePaths = new Set(manifest.map(entry => entry.path));
         for (const [path, timestamp] of Object.entries(this.tombstones)) {
             if (livePaths.has(path)) continue;
-            manifest.push({ type: 'deleted', path, mtime: timestamp, size: 0 });
+            manifest.push({ type: 'deleted', path, mtime: timestamp, size: 0, versionVector: this.twoDeviceState.fileVersions[path] });
         }
         return manifest;
     }
