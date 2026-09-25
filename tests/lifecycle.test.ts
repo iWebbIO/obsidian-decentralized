@@ -163,3 +163,37 @@ describe('startup', () => {
         expect(device.plugin.twoDeviceState.fileVersions['new.md']).toEqual({ 'device-aaaa0001': 1 });
     });
 });
+
+describe('status bar', () => {
+    test('the last of a burst of updates is always shown', async () => {
+        // Updates within 200 ms of the previous one were dropped outright, so the bar could
+        // stay on "Syncing…" long after the sync finished.
+        const device = await createDevice('device-aaaa0001', { waitForOpen: false });
+        const plugin: any = device.plugin;
+        const status = jest.spyOn(plugin, 'calculateStatus');
+        const text = () => plugin.statusTextEl.textContent;
+
+        status.mockReturnValue({ text: 'first', icon: 'x', state: 'neutral' });
+        await sleep(250);
+        plugin.updateStatus();
+        expect(text()).toBe('first');
+
+        status.mockReturnValue({ text: 'last', icon: 'x', state: 'neutral' });
+        plugin.updateStatus();
+        expect(text()).toBe('first');
+        await sleep(250);
+        expect(text()).toBe('last');
+    });
+
+    test('a status shown on purpose is not painted over by an owed refresh', async () => {
+        const device = await createDevice('device-aaaa0001', { waitForOpen: false });
+        const plugin: any = device.plugin;
+        jest.spyOn(plugin, 'calculateStatus').mockReturnValue({ text: 'computed', icon: 'x', state: 'neutral' });
+        await sleep(250);
+        plugin.updateStatus();
+        plugin.updateStatus();                       // owed
+        plugin.updateStatus({ text: 'Reconnecting…', icon: 'y', state: 'loading' });
+        await sleep(250);
+        expect(plugin.statusTextEl.textContent).toBe('Reconnecting…');
+    });
+});

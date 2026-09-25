@@ -158,19 +158,4 @@ describe('QueueManager', () => {
         for (let i = 0; i < 100; i++) await Promise.resolve();
         expect(processCallback.mock.calls.map(c => c[0].id)).toEqual(['b', 'a']);
     });
-
-    test('should call syncDrainCallback when queue is empty and no retries pending', async () => {
-        const drainCallback = jest.fn();
-        manager.setSyncDrainCallback(drainCallback);
-
-        processCallback.mockResolvedValueOnce(true);
-
-        manager.addToQueue({ id: 'drain', peerId: 'A', retries: 0, priority: 1 });
-
-        expect(drainCallback).not.toHaveBeenCalled();
-
-        for (let i = 0; i < 10; i++) await Promise.resolve(); // item processes
-
-        expect(drainCallback).toHaveBeenCalledTimes(1);
-    });
 });

@@ -28,12 +28,10 @@ export class QueueManager {
      */
     private syncQueue: QueueItem[] = [];
     private activeQueueTransfers: number = 0;
-    private pendingRetries: number = 0;
     private inQueueOrProcessing: Set<string> = new Set();
     private maxConcurrency: number = 3;
     private timeoutManager: TimeoutManager;
     private processCallback: (item: QueueItem) => Promise<boolean>;
-    private syncDrainCallback: (() => void) | null = null;
     private queueIsPaused: boolean = false;
     // Incremented on clear(); pending retry timers from an older epoch must not re-add their items
     private epoch: number = 0;
@@ -100,9 +98,6 @@ export class QueueManager {
         this.maxConcurrency = limit;
     }
 
-    public setSyncDrainCallback(callback: () => void) {
-        this.syncDrainCallback = callback;
-    }
 
     public pause() {
         this.queueIsPaused = true;
@@ -128,7 +123,6 @@ export class QueueManager {
     public dispose() {
         this.disposed = true;
         this.clear();
-        this.syncDrainCallback = null;
     }
 
     public addToQueue(item: QueueItem) {
@@ -174,11 +168,9 @@ export class QueueManager {
             const scheduleRetry = () => {
                 if (this.disposed) return;
                 item.retries++;
-                this.pendingRetries++;
                 // Keep item.id in inQueueOrProcessing during the retry delay
                 // to prevent duplicates from entering the queue in the window.
                 this.timeoutManager.setTimeout(() => {
-                    this.pendingRetries--;
                     release();
                     // If clear() ran while we were waiting, the item belongs to an
                     // aborted sync — don't resurrect it into the fresh queue.
@@ -210,9 +202,6 @@ export class QueueManager {
                 });
         }
 
-        if (this.activeQueueTransfers === 0 && this.syncQueue.length === 0 && this.pendingRetries === 0 && this.syncDrainCallback) {
-            this.syncDrainCallback();
-        }
     }
 
     /**

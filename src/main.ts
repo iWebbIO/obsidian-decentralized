@@ -248,6 +248,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private syncKeepAliveInterval: number | null = null;
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
+    /** A throttled status refresh still owed (see updateStatus). */
+    private statusTimer: number | null = null;
     private currentConcurrency = 16;
     private currentChunkSize = 512 * 1024;
     private targetChunkSize = 512 * 1024;
@@ -308,7 +310,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private merkleTreeBuiltAt: number = 0;
     /** Bumped by every vault change; a tree built across a change is not cached as current. */
     private merkleGeneration = 0;
-    private syncDrainCallback: (() => void) | null = null;
     
     // Pull-based Sync State
     private pullRetries: Map<string, number> = new Map();
@@ -531,6 +532,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.debouncedSaveQueue.cancel();
         this.debouncedEditorChange.cancel();
         this.configSync?.dispose();
+        this.clearStatusTimer();
         void this.saveState(true);
         void this.saveHashCache(true);
         void this.saveQueueState(true);
@@ -979,11 +981,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         await this.saveSettings();
     }
 
-    /**
-     * Kept for the settings tab. Per-path debouncers read settings.debounceDelay when
-     * they are armed, so a changed delay applies to subsequent events with no rebuild.
-     */
-    public updateDebounceDelay() { /* no-op: delay is read per event */ }
 
     applyHideNativeSync() {
         if (this.settings.hideNativeSyncStatus) {
@@ -1604,7 +1601,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.transitionToPhase(SyncPhase.ABORTING);
         this.syncState.isSyncing = false;
         this.currentSyncIsTwoDeviceMode = null;
-        this.syncDrainCallback = null;
         this.queueManager.clear();
         this.scheduleQueueSave();
         this.scheduleStateSave();
@@ -1738,10 +1734,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private processQueue() {
         this.queueManager.setConcurrencyLimit(this.getConcurrencyLimit());
-        if (this.syncDrainCallback) {
-            this.queueManager.setSyncDrainCallback(this.syncDrainCallback);
-            this.syncDrainCallback = null;
-        }
         this.queueManager.resume();
     }
 
@@ -5480,9 +5472,33 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * on every single call, and the 200 ms throttle did not apply when idle. Now the
      * elements are created once and only the changed parts are touched.
      */
+    private clearStatusTimer() {
+        if (this.statusTimer !== null) window.clearTimeout(this.statusTimer);
+        this.statusTimer = null;
+    }
+
     updateStatus(customStatus?: SyncStatusState) {
+        if (this.unloaded) return;
         const now = Date.now();
-        if (!customStatus && now - this.lastStatusUpdate < 200) return;
+        if (customStatus) {
+            // Shown as given; a refresh owed from before must not paint over it.
+            this.clearStatusTimer();
+        } else {
+            // At most one refresh per 200 ms — but the last one always happens. Dropping it
+            // left the bar on whatever it said mid-burst ("Syncing 1 file…") until something
+            // unrelated refreshed it.
+            const wait = this.lastStatusUpdate + 200 - now;
+            if (wait > 0) {
+                if (this.statusTimer === null) {
+                    this.statusTimer = window.setTimeout(() => {
+                        this.statusTimer = null;
+                        this.updateStatus();
+                    }, wait);
+                }
+                return;
+            }
+            this.clearStatusTimer();
+        }
         this.lastStatusUpdate = now;
 
         const status = customStatus || this.calculateStatus();

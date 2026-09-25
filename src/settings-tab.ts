@@ -293,12 +293,13 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Tombstone Retention (Days)")
-            .setDesc("How long to remember deleted files. Peers offline longer than this might resurrect deleted files.")
+            .setDesc("How long to remember deleted files (1–3650 days). A device offline longer than this may bring deleted files back.")
             .addText(text => text
                 .setValue(this.plugin.settings.tombstoneRetentionDays?.toString() || "30")
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.tombstoneRetentionDays = isNaN(num) ? DEFAULT_SETTINGS.tombstoneRetentionDays : Math.max(0, Math.min(num, 3650));
+                    // 0 used to be accepted and then silently treated as 30.
+                    this.plugin.settings.tombstoneRetentionDays = isNaN(num) ? DEFAULT_SETTINGS.tombstoneRetentionDays : Math.max(1, Math.min(num, 3650));
                     await this.plugin.saveSettings();
                 }));
 
@@ -316,7 +317,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Chunk Size (Bytes)")
-            .setDesc("Size of file chunks in bytes. Default is dynamic (starts at 64KB).")
+            .setDesc("Size of file chunks in bytes (64 KB–4 MB). Leave empty to adjust automatically: it starts at 512 KB, or 2 MB in Offline Mode.")
             .addText(text => text
                 .setPlaceholder("Auto")
                 .setValue(this.plugin.settings.chunkSize?.toString() || "")
@@ -333,8 +334,8 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.debounceDelay.toString())
                 .onChange(async (value) => {
                     const num = parseInt(value);
+                    // Read per change, so a new delay applies from the next edit.
                     this.plugin.settings.debounceDelay = isNaN(num) ? DEFAULT_SETTINGS.debounceDelay : Math.max(250, num);
-                    this.plugin.updateDebounceDelay();
                     await this.plugin.saveSettings();
                 }));
 
