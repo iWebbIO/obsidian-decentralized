@@ -230,8 +230,8 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         containerEl.createEl('h4', { text: 'Advanced Settings' });
 
         new Setting(containerEl)
-            .setName("Turbo Real-time")
-            .setDesc("WARNING: Streams live keystrokes instantly to avoid conflicts. Requires a flawless connection and a strict 2-device setup. Can be destructive if misused.")
+            .setName("Live typing (experimental)")
+            .setDesc("Streams keystrokes to the other device as you type. Only works with exactly two devices on a steady connection, and if both sides type in the same note at once, text can be lost. Off by default.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.enableRealtimeSync)
                 .onChange(async (value) => {

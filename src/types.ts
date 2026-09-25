@@ -588,11 +588,23 @@ export interface ObsidianDecentralizedSettings {
      * plaintext from a paired device, so switching it off broke every paired link.
      */
     enableEncryption: boolean;
+    /**
+     * Stream keystrokes to the other device. Off by default: it rewrites the open editor from
+     * the network and can clobber text when both sides type at once.
+     */
     enableRealtimeSync: boolean;
     peerKeys: Record<string, string>; // peerId -> base64 PSK
     /** Device IDs the user removed. Handshake/gossip must not put them back until they pair again. */
     blockedPeers: string[];
+    /** Which one-time settings migrations have run (see SETTINGS_VERSION). */
+    settingsVersion: number;
 }
+
+/**
+ * Bumped with each one-time migration of saved settings.
+ *   2: real-time keystroke sync switched off for everyone (it had defaulted to on).
+ */
+export const SETTINGS_VERSION = 2;
 
 export interface TwoDeviceState {
     fileVersions: Record<string, VersionVector>; // path -> { deviceId: version }
@@ -631,9 +643,10 @@ export const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
 
     enableTwoDeviceOptimizations: true,
     enableEncryption: true,
-    enableRealtimeSync: true,
+    enableRealtimeSync: false,
     peerKeys: {},
     blockedPeers: [],
+    settingsVersion: SETTINGS_VERSION,
 };
 
 export interface ILANDiscovery {

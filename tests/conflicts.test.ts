@@ -5,7 +5,8 @@
  * device-aaaa0001 sorts first, so it is the side that used to "win" every two-device conflict
  * under the old role rule regardless of which edit was newer.
  */
-import { TFile } from 'obsidian';
+import { TFile, Modal } from 'obsidian';
+import { ConflictListModal } from '../src/ui';
 import { createDevice, connect, teardown, waitFor, partition, heal, sleep, Device } from './helpers/harness';
 import { FakeVault } from './helpers/fake-vault';
 import { SyncPhase } from '../src/types';
@@ -76,10 +77,13 @@ describe('two devices reconciling after time apart', () => {
         await settle(a, b);
 
         expect(b.vault.text('note.md')).toBe('newer edit on B');
-        // The losing edit is preserved exactly once, on the device that made it.
+        // The losing edit is kept once — saved by the device that made it, and synced like
+        // any note so the conflict can be resolved on either device.
         expect(conflictCopies(a)).toHaveLength(1);
         expect(a.vault.text(conflictCopies(a)[0])).toBe('older edit on A');
-        expect(conflictCopies(b)).toEqual([]);
+        await waitFor(() => conflictCopies(b).length === 1, { what: 'the copy to sync' });
+        expect(conflictCopies(b)).toEqual(conflictCopies(a));
+        expect(b.vault.text(conflictCopies(b)[0])).toBe('older edit on A');
     });
 
     test('identical edit times go to the lower device ID on both sides', async () => {
@@ -98,7 +102,8 @@ describe('two devices reconciling after time apart', () => {
 
         expect(a.vault.text('note.md')).toBe('from A');
         expect(conflictCopies(b).map(p => b.vault.text(p))).toEqual(['from B']);
-        expect(conflictCopies(a)).toEqual([]);
+        await waitFor(() => conflictCopies(a).length === 1, { what: 'the copy to sync' });
+        expect(conflictCopies(a).map(p => a.vault.text(p))).toEqual(['from B']);
     });
 
     test('a file deleted offline is not brought back by the other device', async () => {
@@ -176,7 +181,7 @@ describe('after a conflict', () => {
         await waitFor(() => a.vault.text('note.md') === 'later ordinary edit on B', { what: 'the edit to arrive' });
         await settle(a, b);
         expect(conflictCopies(a)).toHaveLength(1);
-        expect(conflictCopies(b)).toEqual([]);
+        expect(conflictCopies(b)).toEqual(conflictCopies(a));
     });
 });
 
@@ -194,6 +199,94 @@ describe('first sync of vaults that differed before the plugin was installed', (
         expect([b.vault.text('x.md'), b.vault.text('y.md')]).toEqual(['newer on B', 'newer on A']);
         expect(conflictCopies(a)).toEqual([]);
         expect(conflictCopies(b)).toEqual([]);
+    });
+});
+
+describe('an edit right after a change arrives', () => {
+    test('is synced, not taken for the incoming write', async () => {
+        // Every event on a note was ignored for two seconds after a peer's version was
+        // written there, so an edit made in that window was never counted or sent. (Edit
+        // locks, which deliberately hold the other device's edits for a while, are off here.)
+        const settings = { enableTwoDeviceOptimizations: false };
+        const a = await createDevice(A, { vault: vaultWith({ 'note.md': ['v1', T] }), settings });
+        const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['v1', T] }), settings });
+        await connect(a, b);
+
+        await edit(a, 'note.md', 'from A', T + 10_000);
+        await waitFor(() => b.vault.text('note.md') === 'from A', { what: 'A\'s edit to arrive' });
+        await edit(b, 'note.md', 'from A, then B right away', T + 11_000);
+
+        await waitFor(() => a.vault.text('note.md') === 'from A, then B right away', { what: 'B\'s quick edit to reach A', timeout: 1500 });
+        await settle(a, b);
+        expect(conflictCopies(a)).toEqual([]);
+        expect(conflictCopies(b)).toEqual([]);
+    });
+
+    test('the incoming write itself is not counted as an edit here', async () => {
+        const a = await createDevice(A, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        await connect(a, b);
+
+        await edit(a, 'note.md', 'from A', T + 10_000);
+        await waitFor(() => b.vault.text('note.md') === 'from A', { what: 'A\'s edit to arrive' });
+        await settle(a, b);
+        expect(b.plugin.twoDeviceState.fileVersions['note.md']?.[B]).toBeUndefined();
+    });
+});
+
+describe('resolving a conflict', () => {
+    async function resolvedConflict() {
+        const a = await createDevice(A, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        await connect(a, b);
+        await partition(a, b);
+        await edit(a, 'note.md', 'older edit on A', T + 10_000);
+        await edit(b, 'note.md', 'newer edit on B', T + 20_000);
+        heal(a, b);
+        await connect(a, b);
+        await waitFor(() => conflictCopies(a).length === 1 && a.vault.text('note.md') === 'newer edit on B', { what: 'the conflict copy' });
+        await settle(a, b);
+        return [a, b] as const;
+    }
+
+    function chooseInModal(label: string) {
+        const open = (Modal as any).openModals as any[];
+        const modal = open[open.length - 1];
+        const button = modal.contentEl.findByText(label);
+        if (!button) throw new Error(`No "${label}" button`);
+        button.click();
+    }
+
+    test('picking the conflict copy updates every device and removes the copy', async () => {
+        const [a, b] = await resolvedConflict();
+        const copyPath = conflictCopies(a)[0];
+
+        const list = new ConflictListModal(a.app as any, (a.plugin as any).conflictCenter, a.plugin);
+        await list.showResolutionModal('note.md', copyPath);
+        chooseInModal('Use the conflict copy');
+
+        await waitFor(() => b.vault.text('note.md') === 'older edit on A', { what: 'the chosen version to reach B' });
+        await settle(a, b);
+        expect(a.vault.text('note.md')).toBe('older edit on A');
+        expect(conflictCopies(a)).toEqual([]);
+        expect(conflictCopies(b)).toEqual([]);
+        expect(a.vault.trashed).toContain(copyPath);
+    });
+
+    test('keeping the current version sends nothing and removes the copy', async () => {
+        const [a, b] = await resolvedConflict();
+        const copyPath = conflictCopies(a)[0];
+        const sent = jest.spyOn(a.plugin, 'sendFileUpdate');
+
+        const list = new ConflictListModal(a.app as any, (a.plugin as any).conflictCenter, a.plugin);
+        await list.showResolutionModal('note.md', copyPath);
+        chooseInModal('Keep the current version');
+        await waitFor(() => conflictCopies(a).length === 0, { what: 'the copy to go' });
+        await settle(a, b);
+
+        expect(a.vault.text('note.md')).toBe('newer edit on B');
+        expect(b.vault.text('note.md')).toBe('newer edit on B');
+        expect(sent.mock.calls.filter(([file]) => (file as TFile).path === 'note.md')).toEqual([]);
     });
 });
 

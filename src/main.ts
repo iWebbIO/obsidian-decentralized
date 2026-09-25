@@ -78,6 +78,7 @@ import {
     ObsidianDecentralizedSettings,
     TwoDeviceState,
     DEFAULT_SETTINGS,
+    SETTINGS_VERSION,
     ILANDiscovery,
     FileBatchBinaryPayload
 } from './types';
@@ -413,9 +414,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         // Any vault mutation — local or applied from a peer — makes the cached Merkle
         // tree stale.
-        const onVaultEvent = (file: TAbstractFile) => {
+        const onVaultEvent = (file: TAbstractFile, kind?: 'modify') => {
             this.invalidateMerkleTree();
-            this.handleEvent(file);
+            this.handleEvent(file, kind);
         };
         // Obsidian reports every existing file as "created" while it loads the vault. Heard
         // here, each startup counted every file as edited on this device — and an edit that
@@ -423,7 +424,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.app.workspace.onLayoutReady(() => {
             if (this.unloaded) return;
             this.registerEvent(this.app.vault.on('create', onVaultEvent));
-            this.registerEvent(this.app.vault.on('modify', onVaultEvent));
+            this.registerEvent(this.app.vault.on('modify', (file) => onVaultEvent(file, 'modify')));
             this.registerEvent(this.app.vault.on('delete', (file) => {
                 // A removed path can no longer be assumed to exist.
                 this.forgetKnownFolders(file.path);
@@ -940,11 +941,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         if (!this.settings.peerKeys) this.settings.peerKeys = {};
         if (!Array.isArray(this.settings.blockedPeers)) this.settings.blockedPeers = [];
+        await this.migrateSettings(stored);
         this.applyHideNativeSync(); 
         if (this.settings.knownPeers) {
             this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, persistablePeerInfo(p)));
         }
     }
+    /** One-time changes to settings saved by earlier versions. */
+    private async migrateSettings(stored: Partial<ObsidianDecentralizedSettings>) {
+        // A data.json without a version predates versioning (1); a fresh install has nothing
+        // to migrate.
+        const from = typeof stored.settingsVersion === 'number'
+            ? stored.settingsVersion
+            : (Object.keys(stored).length ? 1 : SETTINGS_VERSION);
+        if (from >= SETTINGS_VERSION) return;
+        if (from < 2) {
+            // Real-time keystroke sync defaulted to on and rewrote the open editor from the
+            // network; it is opt-in now, including for installs that never touched it.
+            this.settings.enableRealtimeSync = false;
+        }
+        this.settings.settingsVersion = SETTINGS_VERSION;
+        await this.saveData(this.settings);
+    }
+
     async saveSettings() {
         await this.saveData(this.settings);
         // Invalidate folder filter caches so isPathSyncable picks up the new values immediately
@@ -1083,8 +1102,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private generateTransferId(path: string): string { return `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
     
     // --- File System Events ---
-    private handleEvent(file: TAbstractFile) {
-        if (this.shouldIgnoreEvent(file.path)) return;
+    private handleEvent(file: TAbstractFile, kind?: 'modify') {
+        // A change right after we wrote a peer's version is either that write coming back or
+        // a real edit on top of it: handleFileChange compares contents to tell. Silencing the
+        // path for two seconds instead dropped any edit made in that window — it was never
+        // counted or sent.
+        const checkContent = kind === 'modify' && this.remoteEchoHashes.has(file.path);
+        if (!checkContent && this.shouldIgnoreEvent(file.path)) return;
         if (!this.isPathSyncable(file.path)) return;
 
         // Record local state even with no peer connected. This used to return here first, so
@@ -1092,7 +1116,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // bump, and — because the tombstone is written inside handleFileDelete — no record of
         // the deletion at all. On the next connection the stale hash made the vaults look
         // identical, and peers resurrected files that had been deleted offline.
-        if (!this.hasPeers()) {
+        if (!this.hasPeers() && !checkContent) {
             if (!this.app.vault.getAbstractFileByPath(file.path)) {
                 this.syncedHashes.delete(file.path);
                 this.recordLocalEdit(file.path);
@@ -1156,11 +1180,25 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
 
             if (file instanceof TFile) {
+                const echo = this.remoteEchoHashes.get(file.path);
+                if (echo) {
+                    this.remoteEchoHashes.delete(file.path);
+                    const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
+                    if (await this.getHash(content) === echo.hash) {
+                        // Our own write of a peer's version: nothing was edited here.
+                        this.ignoreEvents.delete(file.path);
+                        return;
+                    }
+                }
                 this.recordLocalEdit(file.path);
                 this.syncedHashes.delete(file.path);
                 // Recreating a deleted file must retract our deletion record, or the next
                 // manifest still advertises it as deleted and peers remove their copy.
                 this.clearTombstone(file.path);
+                if (!this.hasPeers()) {
+                    this.scheduleStateSave();
+                    return;
+                }
                 await this.sendFileUpdate(file);
             } else if (file instanceof TFolder) {
                 this.addToQueueTask(null, { taskType: 'send-folder-create', path: file.path });
@@ -4121,7 +4159,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.isPathSyncable(originalPath)) return null;
         const conflictPath = this.getConflictPath(originalPath);
         if (!sanitizeVaultPath(conflictPath)) return null;
-        this.ignoreNextEventForPath(conflictPath);
+        // Not silenced: the copy syncs like any note, so the losing edit is kept on every
+        // device and the conflict can be resolved from any of them.
         const folderPath = conflictPath.substring(0, conflictPath.lastIndexOf('/'));
         if (folderPath) await this.ensureFolderExists(folderPath);
         if (typeof content === 'string') {
