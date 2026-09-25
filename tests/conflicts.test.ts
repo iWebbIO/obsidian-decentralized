@@ -120,6 +120,26 @@ describe('two devices reconciling after time apart', () => {
         expect(a.vault.trashed).toContain('note.md');
     });
 
+    test('an offline deletion still reaches the other device when its queued send was lost', async () => {
+        // Deletions used to reach the other device only through the queued send-delete. When
+        // that was lost (a restart, retries exhausted) reconciliation pulled the file back.
+        const a = await createDevice(A, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        await connect(a, b);
+        await partition(a, b);
+
+        await b.vault.delete(b.vault.getAbstractFileByPath('note.md')!);
+        await sleep(20);
+        b.plugin.queueManager.clear();
+
+        heal(a, b);
+        await connect(a, b);
+        await waitFor(() => !a.vault.has('note.md'), { what: 'the deletion to reach A' });
+        await settle(a, b);
+
+        expect(b.vault.has('note.md')).toBe(false);
+    });
+
     test('a copy edited after the deletion is restored', async () => {
         const vaultB = new FakeVault();
         const b = await createDevice(B, { vault: vaultB, settings: { enableTwoDeviceOptimizations: false } });

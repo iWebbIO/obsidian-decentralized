@@ -56,3 +56,45 @@ export function collectLocalIpv4(interfaces: Ifaces): LocalIpv4[] {
 export function preferLocalIpv4(addrs: LocalIpv4[]): string | null {
     return addrs[0]?.address ?? null;
 }
+
+/** A host as it goes into a ws:// URL: IPv6 literals need brackets. */
+export function formatHostForUrl(host: string): string {
+    const bare = host.trim().replace(/^\[(.*)\]$/, '$1');
+    return bare.includes(':') ? `[${bare}]` : bare;
+}
+
+export interface ParsedHostInput {
+    host: string;
+    port: number | null;
+    /** Present when the pasted text carried the token too ("Copy IP and token"). */
+    token: string | null;
+}
+
+/**
+ * Read what someone typed or pasted into the "Host IP" box: `host`, `host:port`,
+ * `[ipv6]:port`, a bare IPv6 address, or the host's "Copy IP and token" text
+ * (address on the first line, token on the next). Null when there is no usable host.
+ */
+export function parseHostInput(raw: string): ParsedHostInput | null {
+    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (lines.length === 0) return null;
+    let address = lines[0].replace(/^wss?:\/\//i, '').replace(/\/.*$/, '');
+    const token = lines.length > 1 ? lines[1] : null;
+    let port: number | null = null;
+
+    const bracketed = address.match(/^\[([^\]]+)\](?::(\d+))?$/);
+    if (bracketed) {
+        address = bracketed[1];
+        if (bracketed[2]) port = Number(bracketed[2]);
+    } else if ((address.match(/:/g) || []).length === 1) {
+        const [host, portText] = address.split(':');
+        if (!/^\d+$/.test(portText)) return null;
+        address = host;
+        port = Number(portText);
+    }
+    // Anything else with colons is a bare IPv6 address.
+
+    if (!address || /\s/.test(address) || !/^[A-Za-z0-9.:%_-]+$/.test(address)) return null;
+    if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535)) return null;
+    return { host: address, port, token };
+}

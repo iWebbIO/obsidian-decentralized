@@ -303,6 +303,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public currentSyncIsTwoDeviceMode: boolean | null = null;
     /** 0 means the cached Merkle tree is stale and must be rebuilt. */
     private merkleTreeBuiltAt: number = 0;
+    /** Bumped by every vault change; a tree built across a change is not cached as current. */
+    private merkleGeneration = 0;
     private syncDrainCallback: (() => void) | null = null;
     
     // Pull-based Sync State
@@ -574,6 +576,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async buildMerkleTree(): Promise<MerkleNode> {
         const MERKLE_SURROGATE_SIZE = 5 * 1024 * 1024;
         const tree: MerkleNode = { hash: '', children: {} };
+        const generation = this.merkleGeneration;
         const allFiles = this.app.vault.getAllLoadedFiles();
 
         // Two passes. The first resolves every file's hash, reading and digesting the
@@ -664,7 +667,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         await computeHashes(tree);
         this.twoDeviceState.merkleTreeRoot = tree;
-        this.merkleTreeBuiltAt = Date.now();
+        // A file changed while this was being built (hashing yields): the tree may already be
+        // stale, so use it this once but build afresh next time. Caching it made a deletion
+        // made right after connecting invisible, and reconciliation reported "in sync".
+        this.merkleTreeBuiltAt = generation === this.merkleGeneration ? Date.now() : 0;
         this.scheduleStateSave();
         return tree;
     }
@@ -684,6 +690,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     private invalidateMerkleTree() {
+        this.merkleGeneration++;
         this.merkleTreeBuiltAt = 0;
     }
 
@@ -742,7 +749,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async loadState() {
         let state = await this.readJson(this.statePath);
-        if (!state) {
+        // No state.json at all is a first run, not a failure worth reporting.
+        if (!state && (await this.app.vault.adapter.exists(this.statePath) || await this.app.vault.adapter.exists(this.statePath + '.bak'))) {
             console.warn('Primary state.json failed — attempting backup recovery...');
             state = await this.readJson(this.statePath + '.bak');
             if (state) this.showNotice('We restored sync info from a backup file.', 'warning');
@@ -1988,6 +1996,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.log(`Re-queueing.`);
                     item.retryable = true;
                 }
+            } else if (this.unloaded) {
+                // Work cut short by unloading is saved as paused and resumed next time.
+                return;
             } else {
                 console.error(`Error processing queue item ${transferId}:`, e);
                 item.retryable = true;
@@ -2873,7 +2884,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         
         if (this.getConnectionMode() === 'direct-ip') {
             if (!data.isResponse) {
-                this.sendData(conn.peer, { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: data.pin, isResponse: true, protocolVersion: PROTOCOL_VERSION } as any);
+                this.sendData(conn.peer, { type: 'handshake', peerInfo: this.getMyPeerInfo(), isResponse: true, protocolVersion: PROTOCOL_VERSION } as any);
             }
         } else {
             this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers.map(persistablePeerInfo) });
@@ -3038,7 +3049,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         } else if (mode === 'direct-ip') {
             if (this.directIpClient) {
                 this.log('Network change: triggering DirectIpClient reconnect.');
-                this.directIpClient.triggerReconnect();
+                this.directIpClient.triggerReconnect({ resetBackoff: true });
             }
         }
     }
@@ -4164,6 +4175,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const remoteVV = data.versionVector;
                 const isRemoteNewer = this.isNewerThan(remoteVV, localVV);
 
+                if (!isRemoteNewer && !existingFile) {
+                    // Already gone here (the same deletion arriving twice, or deleted on both
+                    // sides): nothing to defend, just record what the peer knows.
+                    this.twoDeviceState.fileVersions[data.path] = this.mergeVersions(localVV, remoteVV);
+                    this.scheduleStateSave();
+                    return;
+                }
                 if (!isRemoteNewer) {
                     // Local edit wins (local is strictly newer, or there's a concurrent conflict).
                     // We merge the remote vector, increment local version, and push the local file back to the peer.
@@ -4485,7 +4503,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (isFolder) {
                 this.sendData(conn.peer, { type: 'merkle-node-request', path: fullPath });
             } else if (!myHash && remoteHash) {
-                this.sendData(conn.peer, { type: 'request-file', path: fullPath });
+                if (!file && this.tombstones[fullPath] !== undefined) {
+                    // Deleted here while the devices were apart. Pulling it back would undo
+                    // the deletion; send the deletion instead and let the peer's version
+                    // vectors decide whether an edit it made since outranks it.
+                    this.addToQueueTask(conn.peer, { taskType: 'send-delete', path: fullPath });
+                } else {
+                    this.sendData(conn.peer, { type: 'request-file', path: fullPath });
+                }
             } else if (file instanceof TFile) {
                 // Exchange BOTH directions: push ours and pull theirs. Each side's conflict
                 // resolution then picks the same winner deterministically. Pushing only our
@@ -5321,20 +5346,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     public async connectToDirectIpHost(config: DirectIpConfig) {
         this.reinitializeConnectionManager();
-        this.directIpClient = new DirectIpClient(this, config);
+        // The handshake goes out first on every authenticated link, reconnects included: the
+        // host forgets this device when a socket closes, and without a fresh handshake it
+        // never sent it anything again. The token itself is never sent — the transport
+        // proves it instead.
+        const client = new DirectIpClient(this, config,
+            () => ({ type: 'handshake', peerInfo: this.getMyPeerInfo(), protocolVersion: PROTOCOL_VERSION }));
+        this.directIpClient = client;
         this.clusterPeers.set('direct-ip-host', { deviceId: 'direct-ip-host', friendlyName: `Host (${config.host})`, ip: config.host });
-        
+
         const mockConn = {
-            send: (data: any) => this.directIpClient?.send(data),
+            send: (data: any) => client.send(data),
             peer: 'direct-ip-host',
-            open: true,
-            close: () => this.directIpClient?.triggerReconnect()
+            // Only once the host has proved it holds the token and the link is encrypted.
+            get open() { return client.isOpen; },
+            close: () => client.triggerReconnect()
         } as any;
         this.connections.set('direct-ip-host', mockConn);
         this.updateStatus();
-
-        // Initiate handshake
-        await this.directIpClient.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: config.pin, protocolVersion: PROTOCOL_VERSION });
     }
 
     /** True when Sync Progress has something to show (not merely "Connecting…"). */

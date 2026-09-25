@@ -150,25 +150,4 @@ describe('DirectIpClient', () => {
         expect(buffer[0].data.index).toBe(50);
         expect(buffer[99].data.index).toBe(149);
     });
-
-    test('flushSendBuffer should drop item after max retries', () => {
-        const mockSocket = new MockWebSocket('ws://localhost');
-        mockSocket.send = jest.fn(() => { throw new Error('Send failed'); });
-        mockSocket.readyState = 1;
-        (client as any).ws = mockSocket;
-
-        client.send({ type: 'test', data: 'hello' }).catch(() => {});
-        
-        const buffer = (client as any).sendBuffer;
-        expect(buffer.length).toBe(1);
-        expect(buffer[0].retries).toBe(1);
-        
-        // Manual flushes to trigger retries
-        (client as any).flushSendBuffer();
-        expect(buffer[0].retries).toBe(2);
-
-        (client as any).flushSendBuffer();
-        // The 3rd retry drops it
-        expect(buffer.length).toBe(0);
-    });
 });

@@ -91,8 +91,8 @@ describe('paired links', () => {
             what: 'the full sync to finish',
         });
 
-        expect(a.vault.text('only-b.md')).toBe('from b');
-        expect(b.vault.text('only-a.md')).toBe('from a');
+        // "Complete" means everything was sent; the last write can still be landing.
+        await waitFor(() => a.vault.text('only-b.md') === 'from b' && b.vault.text('only-a.md') === 'from a', { what: 'both files to land' });
         expect(notices().filter(n => /Sync stopped/.test(n))).toEqual([]);
         expect(notices().some(n => /Sync complete/.test(n))).toBe(true);
         expect(refusals()).toEqual([]);

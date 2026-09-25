@@ -599,7 +599,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                             return;
                         }
                         try {
-                            await navigator.clipboard.writeText(`${ip}\n${pin}`);
+                            await navigator.clipboard.writeText(`${ip}:${this.plugin.settings.directIpHostPort}\n${pin}`);
                             new Notice('IP and token copied.');
                         } catch {
                             new Notice('Select the IP and token and copy them (Ctrl+C / Cmd+C).');

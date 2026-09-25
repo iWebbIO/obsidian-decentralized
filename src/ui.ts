@@ -7,7 +7,7 @@ import { PeerInfo, describeSyncPhase } from './types';
 import { originalPathFromConflictCopy } from './utils';
 import { buildPairingPayload, parsePairingInput, persistablePeerInfo } from './utils/pairing';
 import { isGenericDeviceName } from './utils/device-name';
-import type { LocalIpv4 } from './utils/net';
+import { formatHostForUrl, parseHostInput, type LocalIpv4 } from './utils/net';
 
 // The QR generator and scanner together account for over half the bundle, yet they
 // are only reachable from the pairing modal. Importing them dynamically keeps their
@@ -773,7 +773,7 @@ export class ConnectionModal extends Modal {
 
         if (client?.isFatalError) {
             container.createDiv({
-                text: 'The host rejected this token. Check the IP and token from the hosting device and try again.',
+                text: client.fatalReason || 'The host rejected this token. Check the IP and token from the hosting device and try again.',
                 cls: 'mod-warning'
             });
         }
@@ -786,19 +786,40 @@ export class ConnectionModal extends Modal {
         const pinInput = container.createEl('input', { type: 'text', placeholder: 'Security Token' });
         if (Platform.isMobile) { pinInput.style.width = '100%'; pinInput.style.marginBottom = '10px'; }
 
+        // A one-line input drops the line break from the host's "Copy IP and token" text,
+        // so split it here and fill both boxes.
+        ipInput.addEventListener('paste', (event: ClipboardEvent) => {
+            const parsed = parseHostInput(event.clipboardData?.getData('text') ?? '');
+            if (!parsed?.token) return;
+            event.preventDefault();
+            ipInput.value = parsed.port ? `${formatHostForUrl(parsed.host)}:${parsed.port}` : parsed.host;
+            pinInput.value = parsed.token;
+        });
+
         const connectBtn = container.createEl('button', { text: 'Connect', cls: 'mod-cta od-full-width' });
         connectBtn.onclick = async () => {
-            const host = ipInput.value.trim();
-            const token = pinInput.value.trim();
-            if (!host || !token) {
+            // Accepts "IP", "IP:port", "[IPv6]:port", or the host's "Copy IP and token" text.
+            const parsed = parseHostInput(ipInput.value);
+            const token = pinInput.value.trim() || parsed?.token || '';
+            if (!ipInput.value.trim() || !token) {
                 new Notice('Enter both the host IP and the token.');
                 return;
             }
-            this.plugin.settings.directIpHostAddress = host;
+            if (!parsed) {
+                new Notice('That does not look like an IP address. Enter the address shown on the hosting computer, like 192.168.1.20.');
+                return;
+            }
+            this.plugin.settings.directIpHostAddress = parsed.host;
+            if (parsed.port) this.plugin.settings.directIpHostPort = parsed.port;
             await this.plugin.saveSettings();
             this.statusState = 'connecting';
             this.statusMessage = 'Connecting to the offline host… keep this screen open.';
-            this.plugin.connectToDirectIpHost({ host, port: this.plugin.settings.directIpHostPort, pin: token });
+            try {
+                await this.plugin.connectToDirectIpHost({ host: parsed.host, port: this.plugin.settings.directIpHostPort, pin: token });
+            } catch (e: any) {
+                this.fail(`Could not connect: ${e?.message || e}`);
+                return;
+            }
             this.render();
             this.watchDirectIpClient();
         };
@@ -830,7 +851,8 @@ export class ConnectionModal extends Modal {
         };
 
         if (ip) {
-            const share = `${ip}\n${pin}`;
+            // With the port, so pasting this into the other device works on any port.
+            const share = `${ip}:${port}\n${pin}`;
             const copyBoth = container.createEl('button', { text: 'Copy IP and token', cls: 'od-full-width' });
             copyBoth.onclick = async () => {
                 try {
@@ -880,7 +902,7 @@ export class ConnectionModal extends Modal {
             const client = this.plugin.directIpClient;
             if (!client) return;
             if (client.isFatalError) {
-                this.fail('The host rejected this token. Check it and try again.');
+                this.fail(client.fatalReason || 'The host rejected this token. Check it and try again.');
                 return;
             }
             if (client.isLive) {

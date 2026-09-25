@@ -1,4 +1,4 @@
-import { collectLocalIpv4, preferLocalIpv4 } from '../src/utils/net';
+import { collectLocalIpv4, preferLocalIpv4, parseHostInput, formatHostForUrl } from '../src/utils/net';
 
 describe('collectLocalIpv4', () => {
     it('skips loopback and link-local addresses', () => {
@@ -32,5 +32,41 @@ describe('collectLocalIpv4', () => {
             'Ethernet 2': [{ family: 'IPv4', internal: false, address: '192.168.1.10' }],
         });
         expect(addrs).toHaveLength(1);
+    });
+});
+
+describe('parseHostInput', () => {
+    it('accepts a bare address', () => {
+        expect(parseHostInput(' 192.168.1.20 ')).toEqual({ host: '192.168.1.20', port: null, token: null });
+    });
+
+    it('accepts host:port', () => {
+        expect(parseHostInput('192.168.1.20:41300')).toEqual({ host: '192.168.1.20', port: 41300, token: null });
+        expect(parseHostInput('laptop.local:41300')).toEqual({ host: 'laptop.local', port: 41300, token: null });
+    });
+
+    it('accepts IPv6, bare or bracketed with a port', () => {
+        expect(parseHostInput('fe80::1')).toEqual({ host: 'fe80::1', port: null, token: null });
+        expect(parseHostInput('[fe80::1]:41235')).toEqual({ host: 'fe80::1', port: 41235, token: null });
+    });
+
+    it('takes the token from the host\'s "Copy IP and token" text', () => {
+        expect(parseHostInput('192.168.1.20\nabc123\n')).toEqual({ host: '192.168.1.20', port: null, token: 'abc123' });
+    });
+
+    it('rejects things that are not addresses', () => {
+        expect(parseHostInput('')).toBeNull();
+        expect(parseHostInput('my laptop')).toBeNull();
+        expect(parseHostInput('192.168.1.20:port')).toBeNull();
+        expect(parseHostInput('192.168.1.20:70000')).toBeNull();
+        expect(parseHostInput('host/../../x')).toEqual({ host: 'host', port: null, token: null });
+    });
+});
+
+describe('formatHostForUrl', () => {
+    it('brackets IPv6 literals only', () => {
+        expect(formatHostForUrl('192.168.1.20')).toBe('192.168.1.20');
+        expect(formatHostForUrl('fe80::1')).toBe('[fe80::1]');
+        expect(formatHostForUrl('[fe80::1]')).toBe('[fe80::1]');
     });
 });
