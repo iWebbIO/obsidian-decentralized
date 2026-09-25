@@ -98,6 +98,19 @@ describe('taskQueueId', () => {
         );
     });
 
+    it('keeps a pull retried in a later batch apart from the earlier batch', () => {
+        const pull = (batchId: string): SyncTask => ({ taskType: 'send-file', path: 'a.md', mtime: 1, forceFull: true, batchId });
+        expect(taskQueueId('p', pull('b1'))).not.toBe(taskQueueId('p', pull('b2')));
+    });
+
+    it('never merges a conflict reply into a plain send', () => {
+        // The reply carries the vector from before the conflict; merged into a plain send it
+        // went out with the merged vector and the other device lost its edit without a copy.
+        const plain: SyncTask = { taskType: 'send-file', path: 'a.md', mtime: 1, forceFull: true };
+        const reply: SyncTask = { ...plain, versionVector: { a: 1 } };
+        expect(taskQueueId('p', plain)).not.toBe(taskQueueId('p', reply));
+    });
+
     it('distinguishes renames that share one endpoint', () => {
         const a: SyncTask = { taskType: 'send-rename', oldPath: 'x.md', newPath: 'y.md' };
         const b: SyncTask = { taskType: 'send-rename', oldPath: 'x.md', newPath: 'z.md' };
@@ -323,5 +336,34 @@ describe('decompressText accepts a view', () => {
         backing.set(compressed, 8);
 
         expect(decompressText(backing.subarray(8))).toBe(text);
+    });
+});
+
+describe('folder rules', () => {
+    const { parseFolderList, isWithinFolders, hasHiddenSegment } = require('../src/utils');
+
+    it('parses the spellings people type', () => {
+        expect(parseFolderList('Archive/\n/Journal\n./Work\r\n  Deep\\Nested  \n\n../escape')).toEqual([
+            'Archive', 'Journal', 'Work', 'Deep/Nested',
+        ]);
+        expect(parseFolderList('')).toEqual([]);
+        expect(parseFolderList(undefined)).toEqual([]);
+    });
+
+    it('matches whole folders, not name prefixes', () => {
+        // startsWith('Work') used to exclude Workshop/ and "Work notes.md" too.
+        const folders = ['Work', 'Journal/Daily'];
+        expect(isWithinFolders('Work', folders)).toBe(true);
+        expect(isWithinFolders('Work/plan.md', folders)).toBe(true);
+        expect(isWithinFolders('Workshop/plan.md', folders)).toBe(false);
+        expect(isWithinFolders('Work notes.md', folders)).toBe(false);
+        expect(isWithinFolders('Journal/Daily/2026-01-01.md', folders)).toBe(true);
+        expect(isWithinFolders('Journal/Dailies/x.md', folders)).toBe(false);
+    });
+
+    it('spots hidden segments anywhere in a path', () => {
+        expect(hasHiddenSegment('.git/hooks/pre-commit')).toBe(true);
+        expect(hasHiddenSegment('notes/.trash/x.md')).toBe(true);
+        expect(hasHiddenSegment('notes/v1.2/x.md')).toBe(false);
     });
 });

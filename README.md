@@ -38,16 +38,17 @@ Your notes are your own. This plugin ensures they stay that way.
 -   **🕵️‍♂️ LAN Discovery:** On desktop, Connect devices lists other vaults on the same Wi-Fi. Tap one only after that device also has Connect devices open (it shares the pairing key).
 -   **🤝 Multiple Connection Methods:** Pair with the full pairing code or its QR (device ID plus encryption key). A short device ID alone is refused. On the same Wi-Fi you can tap a nearby device. With no internet, use Offline Mode (one desktop hosts; others join with its IP and token).
 -   **⚙️ Powerful Sync Engine:**
-    -   Handles file/folder creation, deletion, and renaming.
+    -   Handles file/folder creation, deletion, and renaming. Edits made while devices are apart are exchanged when they reconnect.
     -   Efficiently syncs only the changes.
     -   Intelligently chunks large files to handle attachments and media.
+    -   Files deleted on another device go to your trash, so a mistake can be undone.
 -   **⚔️ Conflict Management:**
-    -   Choose your preferred conflict resolution strategy: create a duplicate file (safest) or last-write-wins. There is no automatic merge of conflicting edits.
-    -   A dedicated "Conflict Center" in the ribbon helps you review and resolve conflicts.
+    -   When a note changes on two devices before they sync, the more recent change is kept on every device and the other is saved as `Note (conflict on DATE).md`. There is no automatic merge of conflicting edits.
+    -   A dedicated "Conflict Center" in the ribbon helps you review and resolve conflicts on any device.
 -   **🎛️ Granular Control:**
     -   Selectively include or exclude folders from sync.
     -   Optionally sync all file types (images, PDFs, etc.).
-    -   Optionally sync your `.obsidian` config folder (use with caution!).
+    -   Your theme, CSS snippets and appearance sync automatically; settings, hotkeys and other plugins can be added in Manual mode.
 -   **🏡 Fully Self-Hostable:** For ultimate privacy, you can run your own PeerJS signaling server.
 -   **📱 Cross-Platform:** Works on Desktop (Windows, macOS, Linux) and Mobile (via PeerJS). LAN Discovery is desktop-only.
 
@@ -157,19 +158,34 @@ All options live in the plugin's settings tab (`Settings` → `Obsidian Decentra
 -   **Included folders:** Only sync folders that are in this list (one path per line). If this is empty, all folders are synced by default.
 -   **Excluded folders:** Never sync folders in this list. This takes priority over the included list.
 
+Rules match whole folders: `Work` covers `Work/` and everything inside it, but not `Workshop/` or a note named `Work notes.md`. Hidden folders (names starting with `.`) and Obsidian's config folder never sync as notes. Another device cannot move, create or delete anything outside what *this* device syncs.
+
 ### Conflict Resolution
 
-When a file is changed on two devices before they have a chance to sync, a conflict occurs. Choose how you want to handle this:
+When a note is changed on two devices before they have a chance to sync, the **more recent change is kept on every device** — the same rule however many devices you have.
 
--   **Create Conflict File (default and safest):** The incoming change is saved as a new file, e.g. `My Note (conflict on 2023-10-27).md`, so you can compare and merge them yourself.
--   **Last Write Wins:** The version with the newest modification time is kept and the other is discarded.
+The plugin first checks whether it is really a conflict: if one device already had the other's change when it edited the note, that edit is simply newer and wins, whatever the clocks say. Only when both devices changed the note independently does the time decide. Exact ties go to the device with the lower ID, so every device picks the same version.
 
-When exactly two devices are paired and two-device optimizations are on, the plugin instead resolves conflicts by role: the primary device's copy wins. This is automatic and overrides the setting above.
+What happens to the other version is up to you (Manual mode):
+
+-   **Keep it as a conflict copy (default and safest):** the device whose edit lost saves it as a new file, e.g. `My Note (conflict on 2026-09-25).md`. The copy syncs like any note, so you can compare and resolve it on any device.
+-   **Discard it:** the older version is dropped.
+
+Deletions follow the same rule. A note deleted on one device and edited later on another comes back; a note deleted after its last edit stays deleted everywhere (other devices move their copy to the trash).
+
+The rule relies on your devices' clocks being roughly right. If a clock is far off, the "wrong" edit can win — but it is still kept as a conflict copy, so nothing is lost.
 
 ### Syncing Attachments and Config Files
 
 -   **Sync all file types:** By default, the plugin focuses on text files. Enable this to sync images, PDFs, audio, and other attachments.
--   **Sync '.obsidian' configuration folder:** **(DANGEROUS)** Syncs your Obsidian settings, themes, and snippets. This can cause problems if your devices have different plugins, themes, or operating systems. **Always make a backup before enabling this.**
+-   **Obsidian settings (the `.obsidian` folder):**
+    -   In **Auto** mode your theme, CSS snippets and appearance settings sync.
+    -   In **Manual/Advanced** mode, **Also sync Obsidian settings** adds Obsidian's settings, hotkeys, core plugin settings and your community plugins (their code and settings). With it off, nothing in the config folder is shared.
+    -   The window layout (`workspace.json`) stays per device, and this plugin's own settings — which hold your device ID and pairing keys — are never shared.
+    -   Plugins and settings only travel between devices paired with a pairing code, or joined in Offline Mode: they can run code, or hold other plugins' passwords and API keys. Theme and snippets are shared with any connected device.
+    -   The newer change wins, deletions included (deleted files go to the trash). **Restart Obsidian, or run "Reload app without saving", after settings arrive** — Obsidian only reads them at startup.
+    -   Use the same Obsidian version on every device, and keep a backup.
+-   **Live typing (experimental, Advanced):** streams keystrokes to the other device as you type. It is off by default; it only works with exactly two devices on a steady connection, and text can be lost if both sides type in the same note at once.
 
 ### Offline Mode (no signaling server)
 
@@ -183,9 +199,9 @@ For LAN-only environments with no internet, or where you don't want a signaling 
 
 **On each other device:**
 1.  Open the connection helper → **Advanced** tab → **Switch to Offline Mode**. After that, Connect devices opens Offline Mode directly.
-2.  Under **Join a Network**, enter the host's IP address and token, then connect. Hosts found on your Wi-Fi are also listed and can be selected directly.
+2.  Under **Join a Network**, enter the host's IP address and token, then connect. Hosts found on your Wi-Fi are also listed and can be selected directly. You can paste the host's **Copy IP and token** text straight into the IP box — it fills in both fields. `host:port` and IPv6 addresses (`[fe80::1]:41235`) work too.
 
-Unlike the default mode, Offline Mode authenticates the connection: the host rejects any client presenting the wrong token.
+Offline Mode is authenticated and encrypted. The token itself never crosses the network: the host and each joining device prove to each other that they know it, and every message after that is encrypted with keys derived from it (AES-256-GCM, separate keys per direction). A device answering at the host's address without the token is rejected, and so is a device running an older version of the plugin — update both.
 
 ### Using a Custom Signaling Server
 
@@ -197,13 +213,16 @@ If a conflict occurs and a `(conflict on DATE)` file is created, a new icon (`sw
 
 -   The icon shows a badge with the number of unresolved conflicts.
 -   Clicking it opens a modal listing all conflicts.
--   Click `Resolve` on any conflict to open a diff view, allowing you to compare your local version with the remote version and choose which one to keep. **Decide later** (or closing the diff) returns you to the list. After one is resolved, the list reopens if others remain.
+-   Click `Resolve` on any conflict to compare the **current version** (the newer one, which every device has) with the **conflict copy** (the edit that lost). Keep the current version, or use the conflict copy instead — either way the choice syncs to your other devices and the copy moves to the trash everywhere. **Decide later** (or closing the diff) returns you to the list. After one is resolved, the list reopens if others remain.
 
 ## 🛡️ Security and Privacy
 
 -   **No cloud storage.** Your notes are never stored on a third-party server. They exist only on your devices.
 -   **Transport encryption, always.** Every WebRTC connection is encrypted in transit with DTLS. This protects the data on the wire but says nothing about *who* is on the other end.
--   **Application-layer encryption, when you pair with the pairing code.** The code (or QR) exchanges a 256-bit AES-GCM key, and traffic on that link is encrypted with it on top of DTLS. Settings → Your devices shows **Encrypted** on each device that has a key. A bare device ID is no longer accepted as a pairing code.
+-   **Application-layer encryption, always on for paired devices.** The pairing code (or QR) exchanges a 256-bit AES-GCM key, and every message on that link — heartbeats and acknowledgements included — is encrypted with it on top of DTLS. There is no switch to turn it off. Settings → Your devices shows **Encrypted** on each device that has a key. A bare device ID is no longer accepted as a pairing code.
+-   **Offline Mode is authenticated and encrypted** with keys derived from its token; the token is never sent. See [Offline Mode](#offline-mode-no-signaling-server).
+-   **Recoverable deletions.** Files and folders another device deletes go to your trash (Obsidian's "Deleted files" setting decides which one), never straight to permanent deletion.
+-   **Plugins and settings only from paired devices.** Obsidian settings that can run code or hold secrets are only exchanged with devices that share a pairing key, or over Offline Mode.
 -   **The signaling server sees metadata, not notes.** In the default mode your devices register a stable ID with a public PeerJS server so they can find each other. It never handles note content, but it does see your device ID and IP address each session. Run your own PeerServer, or use Offline Mode, to avoid it entirely.
 -   **Know the limits.** By default, a device that knows your device ID can open a connection to you. The "strict security" setting under Advanced hardens this by refusing unrecognised and unencrypted peers; it is off by default because turning it on requires re-pairing existing devices. Offline Mode is token-authenticated regardless.
 
@@ -216,6 +235,7 @@ If a conflict occurs and a `(conflict on DATE)` file is created, a new icon (`sw
     -   Double-check that you pasted the full pairing code from the other device (Copy pairing code), not a short ID.
 -   **Status is "Can't reach the sync network":** The plugin couldn't connect to the signaling server (this is not Offline Mode). It will automatically keep retrying with an increasing backoff delay. Check your internet connection, or switch to Offline Mode if you have no internet at all.
 -   **A third device won't connect ("unable to reach the host"):** Extra IDs in the Your devices list are fine — unreachable ones are skipped without affecting the working links. If a row says **Not encrypted**, tap **Pair** (not Reconnect) and exchange the full code with *that* device. Under "strict security" an unpaired link is refused. See [Syncing three or more devices](#syncing-three-or-more-devices).
+-   **"… runs a different version of Obsidian Decentralized":** both devices must run the same version of the plugin. Update the one the notice names; they reconnect on their own afterwards.
 -   **Nearby devices don't appear:** Nearby discovery needs UDP multicast, which some VPNs, corporate networks, and firewalls block. Paste the pairing code or scan the QR instead. The other device must also have Connect devices open before a nearby tap will pair.
 
 ## 🤝 Contributing

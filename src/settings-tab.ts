@@ -59,7 +59,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('How much to show')
-            .setDesc('Auto just works — everything syncs the safe way. Manual lets you pick folders and extras. Advanced adds extra technical options.')
+            .setDesc('Auto just works — every note and file syncs, and so does your theme, CSS snippets and appearance settings. Manual lets you pick folders and extras. Advanced adds extra technical options.')
             .addDropdown(dd => dd
                 .addOption('auto', 'Auto (recommended)')
                 .addOption('manual', 'Manual')
@@ -123,11 +123,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName("When both devices change the same note")
-            .setDesc("If you edit a file here and on another device before they sync, choose what happens.")
+            .setName("When two devices change the same note")
+            .setDesc("If a note changes here and on another device before they sync, the more recent change is kept on every device. Choose what happens to the other one.")
             .addDropdown(dd => dd
-                .addOption('create-conflict-file', 'Keep both copies (safest)')
-                .addOption('last-write-wins', 'Keep the newest, drop the other')
+                .addOption('create-conflict-file', 'Keep it as a conflict copy (safest)')
+                .addOption('last-write-wins', 'Discard it')
                 .setValue(this.plugin.settings.conflictResolutionStrategy)
                 .onChange(async (value: 'create-conflict-file' | 'last-write-wins') => {
                     this.plugin.settings.conflictResolutionStrategy = value;
@@ -146,7 +146,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Also sync Obsidian settings (.obsidian)")
-            .setDesc("Risky. Copies themes, snippets, and plugin settings to your other devices. Only turn this on if they use the same plugins and Obsidian version — and make a backup first.")
+            .setDesc("Shares your theme, snippets, settings, hotkeys and other plugins (with their settings) between devices. The window layout stays per device, and this plugin's own settings are never shared. Plugins and settings only travel between devices paired with a pairing code, or joined in Offline Mode. Restart Obsidian after settings arrive. Use the same Obsidian version on each device, and make a backup first.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.syncObsidianConfig)
                 .onChange(async (value) => {
@@ -215,11 +215,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     }
 
     displayAdvancedSettings(containerEl: HTMLElement): void {
-        containerEl.createEl('h4', { text: 'Two-Device Enhancements' });
+        containerEl.createEl('h4', { text: 'Catching up' });
         
         new Setting(containerEl)
-            .setName("Enable Two-Device Optimizations")
-            .setDesc("If exactly one device is connected, enables Version Vectors, Merkle Tree syncing, and Role-based conflict resolution.")
+            .setName("Compare vaults when a device reconnects")
+            .setDesc("Quickly finds what changed while devices were apart and exchanges only that. With exactly one other device connected, also coordinates edits to the same note.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.enableTwoDeviceOptimizations)
                 .onChange(async (value) => {
@@ -227,21 +227,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
-            .setName("Enable End-to-End Encryption")
-            .setDesc("Uses AES-GCM encryption with a PSK exchanged during pairing. Highly recommended.")
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.enableEncryption)
-                .onChange(async (value) => {
-                    this.plugin.settings.enableEncryption = value;
-                    await this.plugin.saveSettings();
-                }));
-
         containerEl.createEl('h4', { text: 'Advanced Settings' });
 
         new Setting(containerEl)
-            .setName("Turbo Real-time")
-            .setDesc("WARNING: Streams live keystrokes instantly to avoid conflicts. Requires a flawless connection and a strict 2-device setup. Can be destructive if misused.")
+            .setName("Live typing (experimental)")
+            .setDesc("Streams keystrokes to the other device as you type. Only works with exactly two devices on a steady connection, and if both sides type in the same note at once, text can be lost. Off by default.")
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.enableRealtimeSync)
                 .onChange(async (value) => {
@@ -303,12 +293,13 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Tombstone Retention (Days)")
-            .setDesc("How long to remember deleted files. Peers offline longer than this might resurrect deleted files.")
+            .setDesc("How long to remember deleted files (1–3650 days). A device offline longer than this may bring deleted files back.")
             .addText(text => text
                 .setValue(this.plugin.settings.tombstoneRetentionDays?.toString() || "30")
                 .onChange(async (value) => {
                     const num = parseInt(value);
-                    this.plugin.settings.tombstoneRetentionDays = isNaN(num) ? DEFAULT_SETTINGS.tombstoneRetentionDays : Math.max(0, Math.min(num, 3650));
+                    // 0 used to be accepted and then silently treated as 30.
+                    this.plugin.settings.tombstoneRetentionDays = isNaN(num) ? DEFAULT_SETTINGS.tombstoneRetentionDays : Math.max(1, Math.min(num, 3650));
                     await this.plugin.saveSettings();
                 }));
 
@@ -326,7 +317,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Chunk Size (Bytes)")
-            .setDesc("Size of file chunks in bytes. Default is dynamic (starts at 64KB).")
+            .setDesc("Size of file chunks in bytes (64 KB–4 MB). Leave empty to adjust automatically: it starts at 512 KB, or 2 MB in Offline Mode.")
             .addText(text => text
                 .setPlaceholder("Auto")
                 .setValue(this.plugin.settings.chunkSize?.toString() || "")
@@ -343,8 +334,8 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.debounceDelay.toString())
                 .onChange(async (value) => {
                     const num = parseInt(value);
+                    // Read per change, so a new delay applies from the next edit.
                     this.plugin.settings.debounceDelay = isNaN(num) ? DEFAULT_SETTINGS.debounceDelay : Math.max(250, num);
-                    this.plugin.updateDebounceDelay();
                     await this.plugin.saveSettings();
                 }));
 
@@ -545,7 +536,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     if (this.plugin.settings.syncMode === 'advanced') {
                         settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
                             this.plugin.manualPingStart.set(peer.deviceId, Date.now());
-                            conn.send({ type: 'ping' });
+                            this.plugin.sendDirect(conn, { type: 'ping' });
                         }));
                     }
                 } else {
@@ -557,8 +548,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                         settingItem.addButton(btn => btn.setButtonText('Reconnect').setCta().onClick(() => {
                             if (this.plugin.peer && !this.plugin.peer.disconnected) {
                                 this.plugin.showNotice(`Reconnecting to ${peer.friendlyName}...`, 'important');
-                                const newConn = this.plugin.peer.connect(peer.deviceId, { reliable: true });
-                                this.plugin.setupConnection(newConn);
+                                this.plugin.dialPeer(peer.deviceId);
                             } else {
                                 this.plugin.showNotice("Cannot reconnect: this device cannot reach the sync network yet.", 'error');
                             }
@@ -610,7 +600,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                             return;
                         }
                         try {
-                            await navigator.clipboard.writeText(`${ip}\n${pin}`);
+                            await navigator.clipboard.writeText(`${ip}:${this.plugin.settings.directIpHostPort}\n${pin}`);
                             new Notice('IP and token copied.');
                         } catch {
                             new Notice('Select the IP and token and copy them (Ctrl+C / Cmd+C).');

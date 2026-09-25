@@ -7,7 +7,7 @@ import { PeerInfo, describeSyncPhase } from './types';
 import { originalPathFromConflictCopy } from './utils';
 import { buildPairingPayload, parsePairingInput, persistablePeerInfo } from './utils/pairing';
 import { isGenericDeviceName } from './utils/device-name';
-import type { LocalIpv4 } from './utils/net';
+import { formatHostForUrl, parseHostInput, type LocalIpv4 } from './utils/net';
 
 // The QR generator and scanner together account for over half the bundle, yet they
 // are only reachable from the pairing modal. Importing them dynamically keeps their
@@ -287,19 +287,15 @@ export class ConnectionModal extends Modal {
         this.statusMessage = 'Connecting… keep Connect devices open on both sides.';
         this.render();
 
-        // reliable:true is required — an unordered channel lets file-chunk-data
-        // overtake file-chunk-start, permanently breaking large-file transfers.
-        const conn = this.plugin.peer.connect(peerId, { reliable: true });
+        // dialPeer registers the plugin's handlers BEFORE 'open' fires. setupConnection
+        // attaches its own 'open' listener (which sends the handshake); registering it lazily
+        // inside our own open handler missed the event, so the handshake was never sent and
+        // pairing produced a half-open one-way connection.
+        const conn = this.plugin.dialPeer(peerId);
         if (!conn) {
             this.fail('Could not start the connection. Check that both devices are online and try again.');
             return;
         }
-
-        // Register the plugin's handlers BEFORE 'open' fires. setupConnection attaches
-        // its own 'open' listener (which sends the handshake); registering it lazily
-        // inside our own open handler missed the event, so the handshake was never
-        // sent and pairing produced a half-open one-way connection.
-        this.plugin.setupConnection(conn);
 
         if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
         this.connectTimeout = window.setTimeout(() => {
@@ -777,7 +773,7 @@ export class ConnectionModal extends Modal {
 
         if (client?.isFatalError) {
             container.createDiv({
-                text: 'The host rejected this token. Check the IP and token from the hosting device and try again.',
+                text: client.fatalReason || 'The host rejected this token. Check the IP and token from the hosting device and try again.',
                 cls: 'mod-warning'
             });
         }
@@ -790,19 +786,40 @@ export class ConnectionModal extends Modal {
         const pinInput = container.createEl('input', { type: 'text', placeholder: 'Security Token' });
         if (Platform.isMobile) { pinInput.style.width = '100%'; pinInput.style.marginBottom = '10px'; }
 
+        // A one-line input drops the line break from the host's "Copy IP and token" text,
+        // so split it here and fill both boxes.
+        ipInput.addEventListener('paste', (event: ClipboardEvent) => {
+            const parsed = parseHostInput(event.clipboardData?.getData('text') ?? '');
+            if (!parsed?.token) return;
+            event.preventDefault();
+            ipInput.value = parsed.port ? `${formatHostForUrl(parsed.host)}:${parsed.port}` : parsed.host;
+            pinInput.value = parsed.token;
+        });
+
         const connectBtn = container.createEl('button', { text: 'Connect', cls: 'mod-cta od-full-width' });
         connectBtn.onclick = async () => {
-            const host = ipInput.value.trim();
-            const token = pinInput.value.trim();
-            if (!host || !token) {
+            // Accepts "IP", "IP:port", "[IPv6]:port", or the host's "Copy IP and token" text.
+            const parsed = parseHostInput(ipInput.value);
+            const token = pinInput.value.trim() || parsed?.token || '';
+            if (!ipInput.value.trim() || !token) {
                 new Notice('Enter both the host IP and the token.');
                 return;
             }
-            this.plugin.settings.directIpHostAddress = host;
+            if (!parsed) {
+                new Notice('That does not look like an IP address. Enter the address shown on the hosting computer, like 192.168.1.20.');
+                return;
+            }
+            this.plugin.settings.directIpHostAddress = parsed.host;
+            if (parsed.port) this.plugin.settings.directIpHostPort = parsed.port;
             await this.plugin.saveSettings();
             this.statusState = 'connecting';
             this.statusMessage = 'Connecting to the offline host… keep this screen open.';
-            this.plugin.connectToDirectIpHost({ host, port: this.plugin.settings.directIpHostPort, pin: token });
+            try {
+                await this.plugin.connectToDirectIpHost({ host: parsed.host, port: this.plugin.settings.directIpHostPort, pin: token });
+            } catch (e: any) {
+                this.fail(`Could not connect: ${e?.message || e}`);
+                return;
+            }
             this.render();
             this.watchDirectIpClient();
         };
@@ -834,7 +851,8 @@ export class ConnectionModal extends Modal {
         };
 
         if (ip) {
-            const share = `${ip}\n${pin}`;
+            // With the port, so pasting this into the other device works on any port.
+            const share = `${ip}:${port}\n${pin}`;
             const copyBoth = container.createEl('button', { text: 'Copy IP and token', cls: 'od-full-width' });
             copyBoth.onclick = async () => {
                 try {
@@ -884,7 +902,7 @@ export class ConnectionModal extends Modal {
             const client = this.plugin.directIpClient;
             if (!client) return;
             if (client.isFatalError) {
-                this.fail('The host rejected this token. Check it and try again.');
+                this.fail(client.fatalReason || 'The host rejected this token. Check it and try again.');
                 return;
             }
             if (client.isLive) {
@@ -1122,30 +1140,30 @@ export class ConflictListModal extends Modal {
         }
         try {
             const backToList = () => this.reopenIfMoreRemain();
+            // The choice is an ordinary edit here, and the copy's removal an ordinary deletion:
+            // both sync. They used to be written with sync suppressed, so a device that picked
+            // the conflict copy kept it to itself, and a copy that had reached other devices
+            // was handed straight back by the next reconciliation.
+            const finish = async () => {
+                await this.app.fileManager.trashFile(conflictFile);
+                this.conflictCenter.resolveConflict(originalPath);
+                this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
+                this.reopenIfMoreRemain();
+            };
             if (this.plugin.isBinary(originalFile.extension)) {
                 new BinaryConflictResolutionModal(this.app, originalFile.name, async (choice) => {
-                    this.plugin.ignoreNextEventForPath(originalPath);
-                    if (choice === 'remote') {
-                        const remoteData = await this.app.vault.readBinary(conflictFile);
-                        await this.app.vault.modifyBinary(originalFile, remoteData);
+                    if (choice === 'copy') {
+                        await this.app.vault.modifyBinary(originalFile, await this.app.vault.readBinary(conflictFile));
                     }
-                    this.plugin.ignoreNextEventForPath(conflictPath);
-                    await this.app.vault.delete(conflictFile);
-                    this.conflictCenter.resolveConflict(originalPath);
-                    this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
-                    this.reopenIfMoreRemain();
+                    await finish();
                 }, backToList).open();
             } else {
-                const localContent = await this.app.vault.read(originalFile);
-                const remoteContent = await this.app.vault.read(conflictFile);
-                new ConflictResolutionModal(this.app, localContent, remoteContent, async (chosenContent) => {
-                    this.plugin.ignoreNextEventForPath(originalPath);
-                    await this.app.vault.modify(originalFile, chosenContent);
-                    this.plugin.ignoreNextEventForPath(conflictPath);
-                    await this.app.vault.delete(conflictFile);
-                    this.conflictCenter.resolveConflict(originalPath);
-                    this.plugin.showNotice(`${originalPath} has been resolved.`, 'info');
-                    this.reopenIfMoreRemain();
+                const currentContent = await this.app.vault.read(originalFile);
+                const copyContent = await this.app.vault.read(conflictFile);
+                new ConflictResolutionModal(this.app, currentContent, copyContent, async (chosenContent) => {
+                    // Keeping the current version changes nothing, so there is nothing to send.
+                    if (chosenContent !== currentContent) await this.app.vault.modify(originalFile, chosenContent);
+                    await finish();
                 }, backToList).open();
             }
         } catch (e) {
@@ -1179,6 +1197,10 @@ export class ConflictResolutionModal extends Modal {
         const { contentEl } = this;
         contentEl.addClass('obsidian-decentralized-diff-modal');
         contentEl.createEl('h2', { text: 'Resolve Conflict' });
+        contentEl.createEl('p', {
+            text: 'The current version is the newer one and is what your other devices have. The conflict copy holds the edit that lost — highlighted below as added or removed text.',
+            cls: 'od-text-muted',
+        });
         const dmp = new DiffMatchPatch();
         const diff = dmp.diff_main(this.localContent, this.remoteContent);
         dmp.diff_cleanupSemantic(diff);
@@ -1191,12 +1213,12 @@ export class ConflictResolutionModal extends Modal {
         }
         new Setting(contentEl)
             .addButton(btn => btn.setButtonText('Decide later').onClick(() => this.close()))
-            .addButton(btn => btn.setButtonText('Keep My Version').onClick(() => {
+            .addButton(btn => btn.setButtonText('Keep the current version').onClick(() => {
                 this.decided = true;
                 this.onResolve(this.localContent);
                 this.close();
             }))
-            .addButton(btn => btn.setButtonText('Use Their Version').setWarning().onClick(() => {
+            .addButton(btn => btn.setButtonText('Use the conflict copy').setWarning().onClick(() => {
                 this.decided = true;
                 this.onResolve(this.remoteContent);
                 this.close();
@@ -1214,7 +1236,7 @@ export class BinaryConflictResolutionModal extends Modal {
     constructor(
         app: App,
         private fileName: string,
-        private onResolve: (choice: 'local' | 'remote') => void,
+        private onResolve: (choice: 'current' | 'copy') => void,
         private onDismiss?: () => void,
     ) { super(app); }
     
@@ -1224,14 +1246,14 @@ export class BinaryConflictResolutionModal extends Modal {
         contentEl.createEl('p', { text: `The file "${this.fileName}" is a binary file (e.g. image, pdf, audio). Differences cannot be shown.` });
         new Setting(contentEl)
             .addButton(btn => btn.setButtonText('Decide later').onClick(() => this.close()))
-            .addButton(btn => btn.setButtonText('Keep My Version (Local)').onClick(() => {
+            .addButton(btn => btn.setButtonText('Keep the current version').onClick(() => {
                 this.decided = true;
-                this.onResolve('local');
+                this.onResolve('current');
                 this.close();
             }))
-            .addButton(btn => btn.setButtonText('Use Their Version (Remote)').setWarning().onClick(() => {
+            .addButton(btn => btn.setButtonText('Use the conflict copy').setWarning().onClick(() => {
                 this.decided = true;
-                this.onResolve('remote');
+                this.onResolve('copy');
                 this.close();
             }));
     }

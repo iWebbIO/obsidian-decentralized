@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, TFolder, TAbstractFile, Platform, debounce, MarkdownView, setIcon } from 'obsidian';
+import { Notice, Plugin, TFile, TFolder, TAbstractFile, Platform, debounce, Debouncer, MarkdownView, setIcon } from 'obsidian';
 import Peer, { DataConnection, PeerJSOption } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
 
@@ -13,6 +13,8 @@ import { DummyLANDiscovery, DesktopLANDiscovery } from './discovery';
 
 // Direct IP imports
 import { DirectIpServer, DirectIpClient } from './directip';
+import { ConfigSync, ConfigScope } from './core/ConfigSync';
+import { compareVectors, mergeVectors, newerVersion, pickVersion, hasOwnUnseenEdit, sanitizeVersionVector, VersionInfo } from './utils/versions';
 
 // Types & Constants imports
 import {
@@ -33,6 +35,7 @@ import {
     SyncState,
     PeerInfo,
     VaultManifest,
+    FileManifestEntry,
     DeviceRole,
     VersionVector,
     HandshakePayload,
@@ -75,6 +78,7 @@ import {
     ObsidianDecentralizedSettings,
     TwoDeviceState,
     DEFAULT_SETTINGS,
+    SETTINGS_VERSION,
     ILANDiscovery,
     FileBatchBinaryPayload
 } from './types';
@@ -96,11 +100,14 @@ import {
     unpackFrame,
     sanitizeVaultPath,
     taskQueueId,
-    toExactArrayBuffer
+    toExactArrayBuffer,
+    parseFolderList,
+    isWithinFolders,
+    hasHiddenSegment
 } from './utils';
 
 import { TimeoutManager } from './utils/Timeouts';
-import { persistablePeerInfo } from './utils/pairing';
+import { persistablePeerInfo, sanitizePeerInfo } from './utils/pairing';
 import { isGenericDeviceName, suggestedDeviceName } from './utils/device-name';
 import { collectLocalIpv4, preferLocalIpv4, type LocalIpv4 } from './utils/net';
 import { peerErrorUserMessage, shouldTearDownPeer } from './utils/peer-error';
@@ -112,9 +119,6 @@ const TEXT_EXTENSIONS = new Set(['md', 'txt', 'json', 'css', 'js', 'html', 'xml'
 
 /** Extensions still synced when 'syncAllFileTypes' is off. */
 const TEXT_WHITELIST = new Set(['md', 'css', 'js', 'json']);
-
-/** Subpaths of .obsidian/ that are safe to sync in 'auto' mode. */
-const AUTO_SAFE_CONFIG_PATHS = ['.obsidian/snippets/', '.obsidian/themes/', '.obsidian/appearance.json'];
 
 /**
  * Single shared diff-match-patch instance. It holds no per-call state across the
@@ -209,9 +213,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private pairingWindowTimer: number | null = null;
 
     private refreshLanBeacon() {
-        if (Platform.isMobile) return;
+        if (Platform.isMobile || this.unloaded) return;
         this.lanDiscovery?.startBroadcasting(this.getMyPeerInfo());
     }
+    /**
+     * Set first thing in onunload. Several callbacks outlive the plugin (PeerJS and
+     * DataConnection events fired by destroy(), in-flight promises, the pairing-window timer)
+     * and each of them used to be able to restart networking on a disabled instance.
+     */
+    private unloaded = false;
+    /** Fires if the current Peer never reaches the signalling server. */
+    private peerOpenTimeout: number | null = null;
     private clusterConnectionInterval: number | null = null;
     public pendingConnections: Set<string> = new Set();
     private pendingFileChunks: Map<string, {
@@ -236,6 +248,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private syncKeepAliveInterval: number | null = null;
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
     private lastStatusUpdate: number = 0;
+    /** A throttled status refresh still owed (see updateStatus). */
+    private statusTimer: number | null = null;
     private currentConcurrency = 16;
     private currentChunkSize = 512 * 1024;
     private targetChunkSize = 512 * 1024;
@@ -257,9 +271,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private statePath: string;
     private hashCachePath: string;
     public manualPingStart: Map<string, number> = new Map();
-    private debouncedSaveState: () => void;
-    private debouncedSaveHashCache: () => void;
-    private debouncedSaveQueue: () => void;
+    private debouncedSaveState: Debouncer<[], void>;
+    private debouncedSaveHashCache: Debouncer<[], void>;
+    private debouncedSaveQueue: Debouncer<[], void>;
     // Dirty flags: without them the debounced savers rewrote identical files on every
     // tick, since most call sites fire whether or not anything actually changed.
     private stateDirty: boolean = false;
@@ -268,7 +282,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private lastStateSaveAt: number = 0;
     private lastQueueSaveAt: number = 0;
     public failedSyncs: FailedSync[] = [];
-    private syncedHashes: Map<string, { hash: string, timestamp: number }> = new Map();
+    /**
+     * Content-hash cache: path -> SHA-256 of the file's bytes, with the size and mtime it was
+     * computed for. Manifests and the Merkle tree read it, so an entry is only trusted while
+     * the file still has that size and mtime (see cachedHashFor).
+     */
+    private syncedHashes: Map<string, { hash: string, timestamp: number, mtime?: number, size?: number }> = new Map();
+    /**
+     * One-shot record of content we just wrote because a peer sent it. If the resulting
+     * vault event slips past the ignore window, the send it triggers finds its own hash here
+     * and is dropped as an echo. Kept apart from the content cache: a Merkle build fills that
+     * cache with the CURRENT content, which made a queued genuine edit look like an echo.
+     */
+    private remoteEchoHashes: Map<string, { hash: string, at: number }> = new Map();
 
     // Bandwidth measurement & delta sync states
     private recentTransferSamples: { bytes: number, durationMs: number }[] = [];
@@ -276,13 +302,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private lastSentContent: Map<string, { content: string, timestamp: number }> = new Map();
 
     // Two-Device Mode State
-    public currentRole: DeviceRole | null = null;
     public twoDeviceState: TwoDeviceState = { fileVersions: {}, merkleTreeRoot: null };
+    public configSync!: ConfigSync;
     public tombstones: Record<string, number> = {};
     public currentSyncIsTwoDeviceMode: boolean | null = null;
     /** 0 means the cached Merkle tree is stale and must be rebuilt. */
     private merkleTreeBuiltAt: number = 0;
-    private syncDrainCallback: (() => void) | null = null;
+    /** Bumped by every vault change; a tree built across a change is not cached as current. */
+    private merkleGeneration = 0;
     
     // Pull-based Sync State
     private pullRetries: Map<string, number> = new Map();
@@ -306,7 +333,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // Real-time Editor Sync State
     public activeEditorLocks: Map<string, string> = new Map();
     private isApplyingRemoteEdit: boolean = false;
-    private debouncedEditorChange: (editor: any, info: any) => void;
+    private debouncedEditorChange: Debouncer<[any, TFile], Promise<void>>;
 
     async onload() {
         // Initialize Core Managers
@@ -388,23 +415,58 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         // Any vault mutation — local or applied from a peer — makes the cached Merkle
         // tree stale.
-        const onVaultEvent = (file: TAbstractFile) => {
+        const onVaultEvent = (file: TAbstractFile, kind?: 'modify') => {
             this.invalidateMerkleTree();
-            this.handleEvent(file);
+            this.handleEvent(file, kind);
         };
-        this.registerEvent(this.app.vault.on('create', onVaultEvent));
-        this.registerEvent(this.app.vault.on('modify', onVaultEvent));
-        this.registerEvent(this.app.vault.on('delete', (file) => {
-            // A removed path can no longer be assumed to exist.
-            this.forgetKnownFolders(file.path);
-            onVaultEvent(file);
-        }));
-        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-            this.invalidateMerkleTree();
-            this.forgetKnownFolders(oldPath);
-            this.handleRenameEvent(file, oldPath);
-        }));
+        // Obsidian reports every existing file as "created" while it loads the vault. Heard
+        // here, each startup counted every file as edited on this device — and an edit that
+        // never happened wins conflicts it should lose. Listen once loading is done.
+        this.app.workspace.onLayoutReady(() => {
+            if (this.unloaded) return;
+            this.registerEvent(this.app.vault.on('create', onVaultEvent));
+            this.registerEvent(this.app.vault.on('modify', (file) => onVaultEvent(file, 'modify')));
+            this.registerEvent(this.app.vault.on('delete', (file) => {
+                // A removed path can no longer be assumed to exist.
+                this.forgetKnownFolders(file.path);
+                onVaultEvent(file);
+            }));
+            this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+                this.invalidateMerkleTree();
+                this.forgetKnownFolders(oldPath);
+                this.handleRenameEvent(file, oldPath);
+            }));
+        });
         this.registerEvent(this.app.workspace.on('editor-change', (editor, info) => this.handleEditorChange(editor, info)));
+
+        this.configSync = new ConfigSync({
+            adapter: this.app.vault.adapter as any,
+            configDir: () => this.app.vault.configDir || '.obsidian',
+            ownPluginFolder: () => {
+                const configDir = this.app.vault.configDir || '.obsidian';
+                const dir = this.manifest.dir || `${configDir}/plugins/${this.manifest.id}`;
+                return dir.startsWith(configDir + '/') ? dir.slice(configDir.length + 1) : `plugins/${this.manifest.id}`;
+            },
+            scope: () => this.configScope(),
+            deviceId: () => this.settings.deviceId,
+            peerDeviceId: (peer) => this.realDeviceId(peer) ?? peer,
+            peerName: (peer) => this.clusterPeers.get(peer)?.friendlyName || 'another device',
+            // Offline Mode authenticates both ends with the join token; over the internet only
+            // a device sharing a pairing key qualifies.
+            trustedForCode: (peer) => this.getConnectionMode() === 'direct-ip' || !!this.peerKeyFor(peer),
+            connectedPeers: () => Array.from(this.connections.entries()).filter(([, c]) => c.open).map(([id]) => id),
+            send: (peer, message) => this.sendData(peer, message),
+            hash: (data) => this.getHash(data),
+            notify: (message) => this.showNotice(message, 'important', 15000),
+            log: (...args) => this.log(...args),
+            stateChanged: () => this.scheduleStateSave(),
+        });
+        this.registerEvent(this.app.workspace.on('css-change', () => { void this.configSync.scan(); }));
+        this.registerInterval(window.setInterval(() => { void this.configSync.scan(); }, Platform.isMobile ? 60000 : 30000));
+
+        // Durable state (version vectors, tombstones, queued work) before any device connects.
+        await this.loadState();
+        this.pruneTombstones();
 
         this.initializeConnectionManager();
         this.startHeartbeat();
@@ -417,12 +479,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         window.addEventListener('online',  this.networkChangeHandler);
         window.addEventListener('offline', this.networkChangeHandler);
         this.lanDiscovery.on('network-change', this.networkChangeHandler);
-        
-        await this.loadState();
-        this.pruneTombstones();
     }
 
     onunload() {
+        this.unloaded = true;
+
         // Remove centralized network-change listeners
         if (this.networkChangeHandler) {
             window.removeEventListener('online',  this.networkChangeHandler);
@@ -431,30 +492,64 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.networkChangeHandler = null;
         }
 
-        // These three are plain window timers, not registerInterval/timeoutManager ones, so
-        // nothing clears them for us. Left running, a disabled instance keeps calling
-        // initializePeer() and races the next load for the same PeerJS id — which the broker
-        // answers with unavailable-id, and only an Obsidian restart recovers from.
+        // Plain window timers, not registerInterval/timeoutManager ones, so nothing clears
+        // them for us. Left running, a disabled instance keeps calling initializePeer() and
+        // races the next load for the same PeerJS id.
         if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
-        if (this.peerReconnectFallbackTimeout) { clearTimeout(this.peerReconnectFallbackTimeout); this.peerReconnectFallbackTimeout = null; }
         if (this.clusterConnectionInterval) { clearInterval(this.clusterConnectionInterval); this.clusterConnectionInterval = null; }
+        // Re-broadcast the LAN beacon when the pairing window closes — which, on an unloaded
+        // plugin, meant reopening a UDP socket that nothing would ever close again.
+        if (this.pairingWindowTimer !== null) { window.clearTimeout(this.pairingWindowTimer); this.pairingWindowTimer = null; }
 
-        this.peer?.destroy();
+        // Stop a running sync quietly: its phase, idle and keep-alive timers would otherwise
+        // fire into the disabled plugin and pop "Sync stopped" after the user turned it off.
+        this.abortSync(undefined, { silent: true });
+        this.rejectAllPendingAcks('Plugin unloaded');
+        for (const request of this.pendingLockRequests.values()) {
+            window.clearTimeout(request.timeout);
+            request.resolve(false);
+        }
+        this.pendingLockRequests.clear();
+
+        this.destroyPeer();
         this.lanDiscovery.stop();
         this.directIpServer?.stop();
         this.directIpClient?.stop();
-
-        this.activeTransfers.clear();
         this.connections.clear();
-        
-        // Safely destroy all background timeouts and queue processes
-        this.queueManager.clear();
-        this.timeoutManager.clearAll();
 
-        // Force immediate saves on unload instead of waiting out the debounce windows.
+        // An upload cut off here stays as a paused record so the next session re-sends the
+        // file; a partial download is useless without its sender.
+        for (const [id, transfer] of this.activeTransfers) {
+            if (transfer.direction === 'upload') transfer.status = 'paused';
+            else this.activeTransfers.delete(id);
+        }
+
+        // Save now instead of waiting out the debounce windows, and BEFORE the queue is
+        // disposed: this used to clear the queue first and then persist the empty result, so
+        // every change still waiting to go out was lost on each disable or restart.
+        this.debouncedSaveState.cancel();
+        this.debouncedSaveHashCache.cancel();
+        this.debouncedSaveQueue.cancel();
+        this.debouncedEditorChange.cancel();
+        this.configSync?.dispose();
+        this.clearStatusTimer();
         void this.saveState(true);
         void this.saveHashCache(true);
         void this.saveQueueState(true);
+
+        this.queueManager.dispose();
+        this.timeoutManager.dispose();
+        document.body.classList.remove('od-hide-native-sync');
+    }
+
+    /** Fail every transfer and sync-message waiter, clearing their timers. */
+    private rejectAllPendingAcks(reason: string) {
+        const acks = Array.from(this.pendingAcks.values());
+        this.pendingAcks.clear();
+        for (const ack of acks) ack.reject(new Error(reason));
+        const syncAcks = Array.from(this.pendingSyncAcks.values());
+        this.pendingSyncAcks.clear();
+        for (const ack of syncAcks) ack.reject(new Error(reason));
     }
 
     // --- Core Two-Device Infrastructure ---
@@ -467,8 +562,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return this.isTwoDeviceMode() ? Array.from(this.connections.keys())[0] : null;
     }
 
+    /**
+     * Which of two paired devices leads Merkle reconciliation (the lower device ID). Compares
+     * real IDs: an Offline Mode client knows its host only as 'direct-ip-host', and comparing
+     * against that literal gave both ends the same role.
+     */
     getMyRole(peerId: string): DeviceRole {
-        return this.settings.deviceId < peerId ? 'primary' : 'secondary';
+        const theirs = this.realDeviceId(peerId) ?? peerId;
+        return this.settings.deviceId < theirs ? 'primary' : 'secondary';
     }
 
     // --- Version Vectors ---
@@ -476,27 +577,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.twoDeviceState.fileVersions[path]) this.twoDeviceState.fileVersions[path] = {};
         this.twoDeviceState.fileVersions[path][this.settings.deviceId] = (this.twoDeviceState.fileVersions[path][this.settings.deviceId] || 0) + 1;
         this.scheduleStateSave();
-    }
-
-    mergeVersions(local: VersionVector, remote: VersionVector): VersionVector {
-        const merged: VersionVector = {};
-        const keys = new Set([...Object.keys(local), ...Object.keys(remote)]);
-        for (const k of keys) {
-            merged[k] = Math.max(local[k] || 0, remote[k] || 0);
-        }
-        return merged;
-    }
-
-    isNewerThan(v1: VersionVector, v2: VersionVector): boolean {
-        let hasGreater = false;
-        const keys = new Set([...Object.keys(v1), ...Object.keys(v2)]);
-        for (const k of keys) {
-            const val1 = v1[k] || 0;
-            const val2 = v2[k] || 0;
-            if (val1 < val2) return false;
-            if (val1 > val2) hasGreater = true;
-        }
-        return hasGreater;
     }
 
     // --- Merkle Tree Vault Diffing ---
@@ -513,6 +593,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async buildMerkleTree(): Promise<MerkleNode> {
         const MERKLE_SURROGATE_SIZE = 5 * 1024 * 1024;
         const tree: MerkleNode = { hash: '', children: {} };
+        const generation = this.merkleGeneration;
         const allFiles = this.app.vault.getAllLoadedFiles();
 
         // Two passes. The first resolves every file's hash, reading and digesting the
@@ -528,7 +609,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const hashes = new Map<string, string>();
         const uncached: TFile[] = [];
         for (const file of syncable) {
-            const cached = this.syncedHashes.get(file.path)?.hash;
+            const cached = this.cachedHashFor(file);
             if (cached) {
                 hashes.set(file.path, cached);
             } else if (file.stat.size > MERKLE_SURROGATE_SIZE) {
@@ -542,9 +623,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (uncached.length > 0) {
             this.log(`Merkle: hashing ${uncached.length} uncached file(s).`);
             await mapWithConcurrency(uncached, 8, async (file) => {
+                const stat = { mtime: file.stat.mtime, size: file.stat.size };
                 const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
                 const hash = await this.getHash(content);
-                this.updateHashCache(file.path, hash);
+                this.updateHashCache(file.path, hash, stat);
                 hashes.set(file.path, hash);
             });
         }
@@ -602,7 +684,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         await computeHashes(tree);
         this.twoDeviceState.merkleTreeRoot = tree;
-        this.merkleTreeBuiltAt = Date.now();
+        // A file changed while this was being built (hashing yields): the tree may already be
+        // stale, so use it this once but build afresh next time. Caching it made a deletion
+        // made right after connecting invisible, and reconciliation reported "in sync".
+        this.merkleTreeBuiltAt = generation === this.merkleGeneration ? Date.now() : 0;
         this.scheduleStateSave();
         return tree;
     }
@@ -622,6 +707,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     private invalidateMerkleTree() {
+        this.merkleGeneration++;
         this.merkleTreeBuiltAt = 0;
     }
 
@@ -680,7 +766,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async loadState() {
         let state = await this.readJson(this.statePath);
-        if (!state) {
+        // No state.json at all is a first run, not a failure worth reporting.
+        if (!state && (await this.app.vault.adapter.exists(this.statePath) || await this.app.vault.adapter.exists(this.statePath + '.bak'))) {
             console.warn('Primary state.json failed — attempting backup recovery...');
             state = await this.readJson(this.statePath + '.bak');
             if (state) this.showNotice('We restored sync info from a backup file.', 'warning');
@@ -695,6 +782,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             if (state.failedSyncs) this.failedSyncs = state.failedSyncs;
             if (state.tombstones) this.tombstones = state.tombstones;
+            this.configSync?.load(state.configSync);
             if (state.twoDeviceState) {
                 this.twoDeviceState = state.twoDeviceState;
                 if (!this.twoDeviceState.fileVersions) this.twoDeviceState.fileVersions = {};
@@ -740,6 +828,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             failedSyncs: this.failedSyncs,
             twoDeviceState: this.twoDeviceState,
             tombstones: this.tombstones,
+            configSync: this.configSync?.state,
         });
         await this.writeJsonAtomic(this.statePath, json);
     }
@@ -754,27 +843,65 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     /** Mark durable state as needing a write and schedule the debounced save. */
     private scheduleStateSave() {
         this.stateDirty = true;
+        // onunload has already written the final copy; a late write could land after the
+        // next instance loaded and overwrite what it saved.
+        if (this.unloaded) return;
         this.debouncedSaveState();
     }
 
     /** Queue contents changed. Persisted separately from state.json, on its own cadence. */
     private scheduleQueueSave() {
         this.queueDirty = true;
+        if (this.unloaded) return;
         this.debouncedSaveQueue();
     }
 
-    updateHashCache(path: string, hash: string) {
+    /**
+     * @param stat size and mtime of the bytes that were hashed. Without them the entry can
+     *   never be trusted by cachedHashFor(), so callers that know them should pass them.
+     */
+    updateHashCache(path: string, hash: string, stat?: { mtime: number; size: number }) {
         if (this.syncedHashes.has(path)) {
             this.syncedHashes.delete(path);
         }
-        this.syncedHashes.set(path, { hash, timestamp: Date.now() });
+        this.syncedHashes.set(path, { hash, timestamp: Date.now(), mtime: stat?.mtime, size: stat?.size });
         if (this.syncedHashes.size > MAX_HASH_CACHE_SIZE) {
             const oldestPath = this.syncedHashes.keys().next().value;
             if (oldestPath) this.syncedHashes.delete(oldestPath);
         }
         // Cache-only mutation: this used to trigger a full state write per hashed file.
         this.hashCacheDirty = true;
-        this.debouncedSaveHashCache();
+        if (!this.unloaded) this.debouncedSaveHashCache();
+    }
+
+    /**
+     * The cached hash of `file`'s current content, or undefined when there is none or it was
+     * computed for different bytes. The cache used to be trusted blindly, and two things put
+     * wrong hashes in it: an incoming update recorded the PEER's hash even when it was then
+     * rejected (local newer, conflict copy), and edits made outside Obsidian never updated
+     * it. Either way a full sync or Merkle comparison then saw matching hashes for different
+     * files and silently skipped them.
+     */
+    private cachedHashFor(file: TFile): string | undefined {
+        const entry = this.syncedHashes.get(file.path);
+        if (!entry || entry.mtime !== file.stat.mtime || entry.size !== file.stat.size) return undefined;
+        return entry.hash;
+    }
+
+    /** Remember that `path` now holds content a peer sent, with hash `hash`. */
+    private noteRemoteWrite(path: string, hash: string | undefined) {
+        if (!hash) return;
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (file instanceof TFile) this.updateHashCache(path, hash, file.stat);
+        this.remoteEchoHashes.set(path, { hash, at: Date.now() });
+    }
+
+    /** True (once) when `hash` is exactly the content a peer just gave us for `path`. */
+    private isRemoteEcho(path: string, hash: string): boolean {
+        const entry = this.remoteEchoHashes.get(path);
+        if (!entry) return false;
+        this.remoteEchoHashes.delete(path);
+        return !!hash && entry.hash === hash;
     }
 
     pruneTombstones() {
@@ -791,8 +918,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (pruned) this.scheduleStateSave();
     }
 
-    async loadSettings() { 
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData()); 
+    async loadSettings() {
+        // Deep-copy the defaults: a shallow merge handed out DEFAULT_SETTINGS' own nested
+        // objects, so pairing keys, known peers and blocked IDs were written into the shared
+        // defaults themselves and leaked into anything else that read them.
+        const defaults: ObsidianDecentralizedSettings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+        const stored = (await this.loadData()) ?? {};
+        this.settings = Object.assign(defaults, stored);
+        // Merge the nested server config field by field so an older data.json that lacks a
+        // field keeps its default rather than an undefined.
+        this.settings.customPeerServerConfig = {
+            ...JSON.parse(JSON.stringify(DEFAULT_SETTINGS.customPeerServerConfig)),
+            ...(stored.customPeerServerConfig ?? {}),
+        };
         // Invalidate folder filter caches whenever settings are (re-)loaded
         this._cachedExcludedFolders = null;
         this._cachedIncludedFolders = null;
@@ -805,11 +943,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         if (!this.settings.peerKeys) this.settings.peerKeys = {};
         if (!Array.isArray(this.settings.blockedPeers)) this.settings.blockedPeers = [];
+        await this.migrateSettings(stored);
         this.applyHideNativeSync(); 
         if (this.settings.knownPeers) {
             this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, persistablePeerInfo(p)));
         }
     }
+    /** One-time changes to settings saved by earlier versions. */
+    private async migrateSettings(stored: Partial<ObsidianDecentralizedSettings>) {
+        // A data.json without a version predates versioning (1); a fresh install has nothing
+        // to migrate.
+        const from = typeof stored.settingsVersion === 'number'
+            ? stored.settingsVersion
+            : (Object.keys(stored).length ? 1 : SETTINGS_VERSION);
+        if (from >= SETTINGS_VERSION) return;
+        if (from < 2) {
+            // Real-time keystroke sync defaulted to on and rewrote the open editor from the
+            // network; it is opt-in now, including for installs that never touched it.
+            this.settings.enableRealtimeSync = false;
+        }
+        this.settings.settingsVersion = SETTINGS_VERSION;
+        await this.saveData(this.settings);
+    }
+
     async saveSettings() {
         await this.saveData(this.settings);
         // Invalidate folder filter caches so isPathSyncable picks up the new values immediately
@@ -818,17 +974,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // A PSK may have been added, rotated or removed — drop cached CryptoKeys so a
         // stale key is never reused for a peer.
         this.invalidateCryptoKey();
+        void this.configSync?.onSettingsChanged();
     }
     async saveKnownPeers() {
         this.settings.knownPeers = Array.from(this.clusterPeers.values()).map(persistablePeerInfo);
         await this.saveSettings();
     }
 
-    /**
-     * Kept for the settings tab. Per-path debouncers read settings.debounceDelay when
-     * they are armed, so a changed delay applies to subsequent events with no rebuild.
-     */
-    public updateDebounceDelay() { /* no-op: delay is read per event */ }
 
     applyHideNativeSync() {
         if (this.settings.hideNativeSyncStatus) {
@@ -858,6 +1010,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' | 'warning' | 'transient' = 'info', timeout?: number) {
+        // Work still settling after a disable must not pop toasts for a plugin that is off.
+        if (this.unloaded) {
+            this.log(`[notice after unload] ${message}`);
+            return;
+        }
         // 'transient' is connection-lifecycle churn (dropped/reconnecting/closed). A flaky
         // network fires it in a loop, so it never reaches a toast at all — not even when
         // showToasts is on. The status bar reports the very same state continuously
@@ -908,12 +1065,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         new Notice(message, timeout);
     }
 
-    public getConflictStrategy() { 
-        if (this.isTwoDeviceMode() && this.settings.enableTwoDeviceOptimizations) return 'role-based';
-        return this.settings.syncMode === 'auto' ? 'create-conflict-file' : this.settings.conflictResolutionStrategy; 
+    /**
+     * The newer version always wins. By default the device whose edit lost keeps it as a
+     * conflict copy; "last write wins" (manual mode) drops it instead. A saved
+     * 'create-conflict-file' means the default: it used to keep the incoming version as the
+     * copy on every device, so each device kept its own version and they never converged.
+     */
+    public getConflictStrategy(): 'newest-with-copy' | 'last-write-wins' {
+        if (this.settings.syncMode !== 'auto' && this.settings.conflictResolutionStrategy === 'last-write-wins') return 'last-write-wins';
+        return 'newest-with-copy';
     }
     public shouldSyncAllFileTypes() { return this.settings.syncMode === 'auto' ? true : this.settings.syncAllFileTypes; }
-    public shouldSyncObsidianConfig() { return this.settings.syncMode === 'auto' ? true : this.settings.syncObsidianConfig; }
+    public shouldSyncObsidianConfig() { return this.configScope() !== 'off'; }
+    /**
+     * Which Obsidian settings sync: Automatic mode shares the look (theme, CSS snippets,
+     * appearance settings); the manual opt-in adds settings, hotkeys and other plugins.
+     */
+    public configScope(): ConfigScope {
+        if (this.settings.syncMode === 'auto') return 'appearance';
+        return this.settings.syncObsidianConfig ? 'full' : 'off';
+    }
     // Respect the explicit connectionMode even in 'auto' sync mode: hard-forcing
     // 'peerjs' here made the "Switch to Offline Mode" UI a no-op for default-profile
     // users — the UI showed Direct-IP while the runtime kept using PeerJS.
@@ -928,8 +1099,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private generateTransferId(path: string): string { return `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
     
     // --- File System Events ---
-    private handleEvent(file: TAbstractFile) {
-        if (this.shouldIgnoreEvent(file.path)) return;
+    private handleEvent(file: TAbstractFile, kind?: 'modify') {
+        // A change right after we wrote a peer's version is either that write coming back or
+        // a real edit on top of it: handleFileChange compares contents to tell. Silencing the
+        // path for two seconds instead dropped any edit made in that window — it was never
+        // counted or sent.
+        const checkContent = kind === 'modify' && this.remoteEchoHashes.has(file.path);
+        if (!checkContent && this.shouldIgnoreEvent(file.path)) return;
         if (!this.isPathSyncable(file.path)) return;
 
         // Record local state even with no peer connected. This used to return here first, so
@@ -937,14 +1113,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // bump, and — because the tombstone is written inside handleFileDelete — no record of
         // the deletion at all. On the next connection the stale hash made the vaults look
         // identical, and peers resurrected files that had been deleted offline.
-        if (!this.hasPeers()) {
+        if (!this.hasPeers() && !checkContent) {
             if (!this.app.vault.getAbstractFileByPath(file.path)) {
                 this.syncedHashes.delete(file.path);
-                if (this.isTwoDeviceMode()) this.incrementVersion(file.path);
+                this.recordLocalEdit(file.path);
                 this.tombstones[file.path] = Date.now();
             } else {
                 this.syncedHashes.delete(file.path);
-                if (this.isTwoDeviceMode()) this.incrementVersion(file.path);
+                this.recordLocalEdit(file.path);
                 this.clearTombstone(file.path);
             }
             this.scheduleStateSave();
@@ -995,17 +1171,35 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private async handleFileChange(file: TAbstractFile) { 
         await this.runLocked(file.path, async () => { 
             this.log(`Processing debounced change for: ${file.path}`); 
-            
+
+            // Our own write of a peer's version is not an edit here: no version bump, no send,
+            // and no edit lock — locking would hold back the sender's next edits to the note.
+            if (file instanceof TFile) {
+                const echo = this.remoteEchoHashes.get(file.path);
+                if (echo) {
+                    this.remoteEchoHashes.delete(file.path);
+                    const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
+                    if (await this.getHash(content) === echo.hash) {
+                        this.ignoreEvents.delete(file.path);
+                        return;
+                    }
+                }
+            }
+
             if (this.isTwoDeviceMode() && !this.heldLocks.has(file.path) && file instanceof TFile && !this.isBinary(file.extension)) {
                 await this.requestLock(file.path);
             }
 
             if (file instanceof TFile) {
-                if (this.isTwoDeviceMode()) this.incrementVersion(file.path);
+                this.recordLocalEdit(file.path);
                 this.syncedHashes.delete(file.path);
                 // Recreating a deleted file must retract our deletion record, or the next
                 // manifest still advertises it as deleted and peers remove their copy.
                 this.clearTombstone(file.path);
+                if (!this.hasPeers()) {
+                    this.scheduleStateSave();
+                    return;
+                }
                 await this.sendFileUpdate(file);
             } else if (file instanceof TFolder) {
                 this.addToQueueTask(null, { taskType: 'send-folder-create', path: file.path });
@@ -1019,8 +1213,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (!this.isPathSyncable(file.path)) return; 
             this.log(`Processing delete: ${file.path}`); 
             this.syncedHashes.delete(file.path);
-            if (file instanceof TFile) { 
-                if (this.isTwoDeviceMode()) this.incrementVersion(file.path); 
+            if (file instanceof TFile) {
+                this.recordLocalEdit(file.path);
                 this.tombstones[file.path] = Date.now(); 
                 this.scheduleStateSave(); 
                 this.addToQueueTask(null, { taskType: 'send-delete', path: file.path }); 
@@ -1030,40 +1224,53 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }); 
     }
     
-    private async handleRenameEvent(file: TAbstractFile, oldPath: string) { 
+    private async handleRenameEvent(file: TAbstractFile, oldPath: string) {
         if (oldPath === file.path) return;
         // Acquire locks in sorted order to prevent deadlock between concurrent renames (e.g. A→B and B→A)
         const [firstLock, secondLock] = [oldPath, file.path].sort();
-        await this.runLocked(firstLock, async () => { 
-            await this.runLocked(secondLock, async () => { 
-                if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return; 
-                if (!this.isPathSyncable(file.path) && !this.isPathSyncable(oldPath)) return; 
-                if (!this.hasPeers()) return; 
-                this.log(`Processing rename: ${oldPath} -> ${file.path}`); 
-                this.ignoreNextEventForPath(file.path); 
-                this.ignoreNextEventForPath(oldPath); 
-                
-                const cached = this.syncedHashes.get(oldPath);
-                if (cached) {
-                    this.syncedHashes.set(file.path, cached);
-                    this.syncedHashes.delete(oldPath);
-                    this.scheduleStateSave();
+        await this.runLocked(firstLock, async () => {
+            await this.runLocked(secondLock, async () => {
+                if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return;
+                const wasSynced = this.isPathSyncable(oldPath);
+                const isSynced = this.isPathSyncable(file.path);
+                if (!wasSynced && !isSynced) return;
+                this.log(`Processing rename: ${oldPath} -> ${file.path}`);
+
+                if (file instanceof TFile) {
+                    // Recorded even with no peer connected: an offline rename used to return
+                    // before this, leaving the file's hash and version vector under a path
+                    // that no longer exists.
+                    this.moveFileRecords(oldPath, file.path);
+                    this.recordLocalEdit(file.path);
+                    if (!this.hasPeers()) return;
+                    this.ignoreNextEventForPath(file.path);
+                    this.ignoreNextEventForPath(oldPath);
+                    if (!wasSynced) {
+                        // Moved in from a folder this device does not sync: peers have never
+                        // seen it, so a rename would give them nothing to move.
+                        void this.sendFileUpdate(file, undefined, true);
+                    } else {
+                        this.addToQueueTask(null, { taskType: 'send-rename', oldPath, newPath: file.path });
+                    }
+                } else if (file instanceof TFolder) {
+                    // Its files each get their own rename event and follow individually.
+                    if (!this.hasPeers() || !wasSynced) return;
+                    this.ignoreNextEventForPath(file.path);
+                    this.ignoreNextEventForPath(oldPath);
+                    this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId: this.generateTransferId(file.path) });
                 }
-                const vector = this.twoDeviceState.fileVersions[oldPath];
-                if (vector) {
-                    this.twoDeviceState.fileVersions[file.path] = vector;
-                    delete this.twoDeviceState.fileVersions[oldPath];
-                    this.scheduleStateSave();
-                }
-                
-                if (file instanceof TFile) { 
-                    if (this.isTwoDeviceMode()) { this.incrementVersion(oldPath); this.incrementVersion(file.path); } 
-                    this.addToQueueTask(null, { taskType: 'send-rename', oldPath, newPath: file.path }); 
-                } else if (file instanceof TFolder) { 
-                    this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId: this.generateTransferId(file.path) }); 
-                } 
-            }); 
-        }); 
+            });
+        });
+    }
+
+    /**
+     * Count a local change in the file's version vector — every local change, connected or
+     * not, however many devices are connected. The vectors are how every device tells "made
+     * with the other's change in hand" from "changed independently", and conflicts are
+     * decided from them; an edit that went uncounted could lose to an older copy.
+     */
+    private recordLocalEdit(path: string) {
+        this.incrementVersion(path);
     }
 
     // --- Real-time Editor Sync ---
@@ -1137,6 +1344,42 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public invalidateCryptoKey(peerId?: string) {
         if (peerId) this.cryptoKeys.delete(peerId);
         else this.cryptoKeys.clear();
+    }
+
+    /**
+     * The pairing key that governs traffic with `peerId`, or null when that link carries no
+     * application-layer encryption. Sending and receiving both ask this one question: the
+     * send side encrypting under one rule while the receive side refused plaintext under
+     * another is how every paired link came to reject its own heartbeats and acks.
+     *
+     * Offline Mode never uses pairing keys. The host knows a client by its device ID while
+     * the client knows the host as 'direct-ip-host', so a key left over from an earlier Quick
+     * Pair applied on one side only and neither could read the other. Offline Mode is
+     * encrypted by its own transport instead.
+     */
+    public peerKeyFor(peerId: string | null | undefined): string | null {
+        if (!peerId || this.getConnectionMode() === 'direct-ip') return null;
+        return this.settings.peerKeys[peerId] || null;
+    }
+
+    /** `payload` in the form it must travel to `peerId`: encrypted whenever a key applies. */
+    private async toWire(peerId: string | null, payload: any): Promise<any> {
+        return peerId && this.peerKeyFor(peerId) ? this.encryptPayload(payload, peerId) : payload;
+    }
+
+    /**
+     * Send a small control message immediately, outside the queue: heartbeat pings, pongs,
+     * acks, sync-acks. These used to go out as raw conn.send() — plaintext, which a paired
+     * peer refuses — so an idle paired link was dropped by the heartbeat and no transfer or
+     * sync step on it was ever acknowledged.
+     */
+    public sendDirect(conn: { peer: string; open?: boolean; send: (data: any) => void }, payload: any): void {
+        void this.toWire(conn.peer, payload)
+            .then(wire => {
+                if (conn.open === false) return;
+                conn.send(wire);
+            })
+            .catch(e => this.log(`Could not send ${payload?.type} to ${conn.peer}:`, e));
     }
 
     /**
@@ -1352,16 +1595,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         });
     }
 
-    public abortSync(error?: SyncError) {
+    /**
+     * @param opts.silent skip the user-facing notice (used on unload, where the user just
+     *   turned the plugin off and a "Sync stopped" toast would be noise).
+     */
+    public abortSync(error?: SyncError, opts?: { silent?: boolean }) {
         if (!this.syncState.isSyncing) return;
+        const syncPeer = this.syncState.peerId;
         this.transitionToPhase(SyncPhase.ABORTING);
         this.syncState.isSyncing = false;
         this.currentSyncIsTwoDeviceMode = null;
-        this.syncDrainCallback = null;
         this.queueManager.clear();
         this.scheduleQueueSave();
         this.scheduleStateSave();
-        this.activeTransfers.clear();
+        // Only this sync's transfers. Clearing them all also discarded paused uploads to
+        // other devices, which are the only record that those devices still need a file.
+        for (const [id, transfer] of this.activeTransfers) {
+            if (transfer.peerId === syncPeer) this.activeTransfers.delete(id);
+        }
         this.syncState.pendingPulls.clear();
         this.syncState.allowedPulls.clear();
         this.syncState.activeBatches.clear();
@@ -1376,17 +1627,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.pullCursor = 0;
         this.syncState.peerId = null;
         this.peerFileSizes = {};
-        if (this.syncIdleTimeout) { clearTimeout(this.syncIdleTimeout); this.syncIdleTimeout = null; }
+        this.sentManifestMtimes = new Map();
+        this.timeoutManager.clearTimeout(this.syncIdleTimeout);
+        this.syncIdleTimeout = null;
         if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
         if (this.syncState.phaseTimeoutHandle) { clearTimeout(this.syncState.phaseTimeoutHandle); this.syncState.phaseTimeoutHandle = null; }
-        
+
         const errorMessage = error ? error.message : "Sync aborted manually.";
-        this.pendingAcks.forEach(ack => ack.reject(new Error(errorMessage)));
-        this.pendingAcks.clear();
-        this.pendingSyncAcks.forEach(ack => ack.reject(new Error(errorMessage)));
-        this.pendingSyncAcks.clear();
-        
-        if (error) {
+        this.rejectAllPendingAcks(errorMessage);
+
+        if (opts?.silent) {
+            this.log(`Sync aborted silently${error ? ` [${error.category}]: ${error.message}` : '.'}`);
+        } else if (error) {
             if (error.category === SyncErrorCategory.TIMEOUT_ERROR && error.message === "Sync idle timeout reached. Connection may have dropped.") {
                 this.showNotice("Sync stalled — nothing moved for a while. Try Force full sync.", "warning");
             } else {
@@ -1486,10 +1738,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private processQueue() {
         this.queueManager.setConcurrencyLimit(this.getConcurrencyLimit());
-        if (this.syncDrainCallback) {
-            this.queueManager.setSyncDrainCallback(this.syncDrainCallback);
-            this.syncDrainCallback = null;
-        }
         this.queueManager.resume();
     }
 
@@ -1512,20 +1760,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             this.syncState.currentFileSize = file.stat.size;
                         }
                         // NOTE: lastSentContent eviction is handled by the 60-s cleanupPendingChunks interval
+                        const statAtRead = { mtime: file.stat.mtime, size: file.stat.size };
                         let content: string | ArrayBuffer = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
                         let encoding: 'utf8' | 'binary' | 'base64' = this.isBinary(file.extension) ? 'binary' : 'utf8';
                         let hash = '';
                         try { hash = await this.getHash(content); } catch(e) {}
-                        
-                        if (!task.forceFull && this.syncedHashes.get(file.path)?.hash === hash) {
+
+                        if (!task.forceFull && this.isRemoteEcho(file.path, hash)) {
                             this.log(`Ignoring echo event for ${file.path}`);
                             success = true;
                             return;
                         }
-                        if (hash) this.updateHashCache(file.path, hash);
+                        if (hash) this.updateHashCache(file.path, hash, statAtRead);
                         
                         let isCompressedText = false;
-                        let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[file.path] : undefined;
+                        // A snapshot taken when the send was queued wins: a conflict reply must
+                        // carry the vector from before this device folded in the other side's.
+                        let vv = task.versionVector ?? this.twoDeviceState.fileVersions[file.path];
                         
                         if (!this.isBinary(file.extension)) {
                             if (this.settings.enableDeltaSync && !task.forceFull) {
@@ -1582,12 +1833,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     // before queueing this task, but it was never put on the wire, so the
                     // receiver's edit-versus-delete branch could never run and every remote
                     // delete applied unconditionally — destroying concurrent local edits.
-                    let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[task.path] : undefined;
-                    item.data = { type: 'file-delete', path: task.path, transferId: this.generateTransferId(task.path), versionVector: vv };
+                    if (this.app.vault.getAbstractFileByPath(task.path)) {
+                        // Recreated since the deletion was queued: telling peers to delete
+                        // it now would remove a file this device has.
+                        this.log(`Not sending the deletion of ${task.path}: it exists again.`);
+                        success = true;
+                        return;
+                    }
+                    const vv = this.twoDeviceState.fileVersions[task.path];
+                    item.data = { type: 'file-delete', path: task.path, transferId: this.generateTransferId(task.path), versionVector: vv, deletedAt: this.tombstones[task.path] };
                 } else if (task.taskType === 'send-folder-create') {
                     item.data = { type: 'folder-create', path: task.path, transferId: this.generateTransferId(task.path) };
                 } else if (task.taskType === 'send-rename') {
-                    let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[task.newPath] : undefined;
+                    const vv = this.twoDeviceState.fileVersions[task.newPath];
                     item.data = { type: 'file-rename', oldPath: task.oldPath, newPath: task.newPath, transferId: this.generateTransferId(task.newPath), versionVector: vv };
                 } else if (task.taskType === 'send-file-batch') {
                     // Read and compress the batch's files concurrently. Serially this was
@@ -1707,14 +1965,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (!transferId) throw new Error("Transfer ID missing for chunked transfer");
                 
                 if (peerId) {
-                    const ackPromise = new Promise<void>((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 300000);
-                        this.pendingAcks.set(transferId!, {
-                            resolve: () => { clearTimeout(timeout); resolve(); },
-                            reject: (e) => { clearTimeout(timeout); reject(e); },
-                            peerId: peerId!
-                        });
-                    });
+                    const ackPromise = this.expectAck(transferId, peerId, 300000);
 
                     // file-chunk-start.fileHash must describe the bytes actually on the
                     // wire. fileData.fileHash is the hash of the ORIGINAL content, which
@@ -1729,10 +1980,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     item.data = null as any;
                 }
             } else {
-                let finalPayload = data;
-                if (this.settings.enableEncryption && peerId && this.settings.peerKeys[peerId]) {
-                    finalPayload = await this.encryptPayload(data, peerId);
-                }
+                const finalPayload = peerId ? await this.toWire(peerId, data) : data;
 
                 const isBatchItem = item.task && (item.task as any).batchId;
                 const isSmallFile = (data.type === 'file-update' || data.type === 'file-delta');
@@ -1740,14 +1988,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const skipAck = (isBatchItem && isSmallFile && isDirectIp) || data.type === 'file-batch-binary';
 
                 if (isSmallFile && peerId && !skipAck) {
-                    const ackPromise = new Promise<void>((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error(`Transfer ${transferId} timed out`)), 60000);
-                        this.pendingAcks.set(transferId!, {
-                            resolve: () => { clearTimeout(timeout); resolve(); },
-                            reject: (e) => { clearTimeout(timeout); reject(e); },
-                            peerId: peerId!
-                        });
-                    });
+                    const ackPromise = this.expectAck(transferId!, peerId, 60000);
 
                     await this.sendPayloadTo(peerId, finalPayload);
                     await ackPromise;
@@ -1777,10 +2018,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     // failures surfaced as unhandled rejections and the sends raced.
                     for (const pId of Array.from(this.connections.keys())) {
                         try {
-                            const pPayload = (this.settings.enableEncryption && this.settings.peerKeys[pId])
-                                ? await this.encryptPayload(data, pId)
-                                : data;
-                            await this.sendPayloadTo(pId, pPayload);
+                            await this.sendPayloadTo(pId, await this.toWire(pId, data));
                         } catch (e) {
                             this.log(`Broadcast to ${pId} failed`, e);
                         }
@@ -1827,6 +2065,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.log(`Re-queueing.`);
                     item.retryable = true;
                 }
+            } else if (this.unloaded) {
+                // Work cut short by unloading is saved as paused and resumed next time.
+                return;
             } else {
                 console.error(`Error processing queue item ${transferId}:`, e);
                 item.retryable = true;
@@ -1913,6 +2154,30 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
+    /**
+     * Register a waiter for the peer's ack of `transferId`, failing after `timeoutMs`.
+     *
+     * The promise is created before the send it waits for, so if the send itself throws (the
+     * link dropped mid-file) nothing ever awaits it — and the close handler then rejects it,
+     * which surfaced as an "Uncaught (in promise)" error on every interrupted transfer. The
+     * rejection is marked handled here; awaiting the returned promise still throws.
+     */
+    private expectAck(transferId: string, peerId: string, timeoutMs: number): Promise<void> {
+        const ack = new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                this.pendingAcks.delete(transferId);
+                reject(new Error(`Transfer ${transferId} timed out`));
+            }, timeoutMs);
+            this.pendingAcks.set(transferId, {
+                resolve: () => { clearTimeout(timeout); resolve(); },
+                reject: (e) => { clearTimeout(timeout); reject(e); },
+                peerId,
+            });
+        });
+        ack.catch(() => { /* observed by whoever awaits it, if anyone still does */ });
+        return ack;
+    }
+
     rejectPendingAck(transferId: string, reason: string) {
         if (this.pendingAcks.has(transferId)) {
             this.pendingAcks.get(transferId)!.reject(new Error(reason));
@@ -1964,21 +2229,43 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public reinitializeConnectionManager() {
-        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
+        if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
         if (this.clusterConnectionInterval) { clearInterval(this.clusterConnectionInterval); this.clusterConnectionInterval = null; }
-        this.peer?.destroy();
+        this.destroyPeer();
         this.directIpClient?.stop();
         this.directIpServer?.stop();
         this.directIpClient = null;
         this.directIpServer = null;
         this.connections.clear();
-        this.activeTransfers.clear();
+        this.settleTransfersAfterDisconnect();
         this.initializeConnectionManager();
     }
 
+    /**
+     * After links drop: keep interrupted uploads as paused records, so the file is sent again
+     * when that device is back, and drop downloads, which cannot continue without their sender.
+     * Clearing everything here used to discard the only record of what a peer still needed.
+     */
+    private settleTransfersAfterDisconnect(peerId?: string) {
+        for (const [id, transfer] of this.activeTransfers) {
+            if (peerId !== undefined && transfer.peerId !== peerId) continue;
+            if (transfer.direction === 'upload') {
+                transfer.status = 'paused';
+                transfer.lastUpdate = Date.now();
+            } else {
+                this.activeTransfers.delete(id);
+                // Release the preallocated reassembly buffer too. These were only ever
+                // reclaimed by the five-minute sweeper, so a peer that connected and dropped
+                // repeatedly could pin gigabytes of memory.
+                this.pendingFileChunks.delete(id);
+            }
+        }
+    }
+
     initializeConnectionManager(onOpen?: (id: string) => void) {
-        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
-        
+        if (this.unloaded) return;
+        if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
+
         if (!Platform.isMobile) {
             this.lanDiscovery.startBroadcasting(this.getMyPeerInfo());
             this.lanDiscovery.startListening();
@@ -1991,7 +2278,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
+    /**
+     * Tear down the current Peer so that none of its events can act on the plugin again.
+     *
+     * `this.peer` is cleared BEFORE destroy(). PeerJS's destroy() first runs disconnect(),
+     * which emits 'disconnected' while `destroyed` is still false; our handler answered that
+     * with reconnect(), which reopens the signalling socket — and destroy() never closes it
+     * again. The orphaned socket kept this device's ID registered, so the next Peer (after a
+     * mode switch, a re-enable or a plugin update) was refused with unavailable-id until
+     * Obsidian restarted. Every handler now ignores events from a Peer that is not current.
+     */
+    private destroyPeer() {
+        const peer = this.peer;
+        this.peer = null;
+        if (this.peerOpenTimeout !== null) { window.clearTimeout(this.peerOpenTimeout); this.peerOpenTimeout = null; }
+        if (this.peerReconnectFallbackTimeout !== null) { window.clearTimeout(this.peerReconnectFallbackTimeout); this.peerReconnectFallbackTimeout = null; }
+        if (!peer) return;
+        try {
+            peer.destroy();
+        } catch (e) {
+            this.log('Destroying the PeerJS peer threw', e);
+        }
+    }
+
     initializePeer(onOpen?: (id: string) => void) {
+        if (this.unloaded) return;
         if (this.peer && !this.peer.destroyed) {
             if (this.peer.disconnected) {
                 // A disconnected (but not destroyed) peer can be revived without a full re-init.
@@ -2004,27 +2315,37 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             return;
         }
-        if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
-        this.peer?.destroy();
+        if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
+        this.destroyPeer();
         this.updateStatus({ text: 'Connecting...', icon: 'plug', spin: true, state: 'loading' });
 
         let peerOptions: PeerJSOption = {};
         if (this.settings.useCustomPeerServer) { peerOptions = { ...this.settings.customPeerServerConfig }; }
 
         this.log(`Attempting to connect to PeerJS server (Attempt: ${this.peerInitAttempts + 1})...`);
+        let peer: Peer;
         try {
-            this.peer = new Peer(this.settings.deviceId, peerOptions);
+            peer = new Peer(this.settings.deviceId, peerOptions);
         } catch (e) {
             this.handlePeerError(e);
             return;
         }
+        this.peer = peer;
+        // A replaced or destroyed Peer keeps firing events (destroy() itself emits two);
+        // none of them may touch the plugin's current state.
+        const isCurrent = () => this.peer === peer && !this.unloaded;
 
-        const connectionTimeout = setTimeout(() => { this.log('PeerJS connection timed out.'); this.handlePeerError(new Error("Connection timed out")); }, 15000);
+        this.peerOpenTimeout = window.setTimeout(() => {
+            this.peerOpenTimeout = null;
+            if (!isCurrent() || peer.open) return;
+            this.log('PeerJS connection timed out.');
+            this.handlePeerError(new Error("Connection timed out"));
+        }, 15000);
 
-        this.peer.on('open', (id) => {
-            clearTimeout(connectionTimeout);
+        peer.on('open', (id) => {
+            if (!isCurrent()) return;
+            if (this.peerOpenTimeout !== null) { window.clearTimeout(this.peerOpenTimeout); this.peerOpenTimeout = null; }
             // Cancel the reconnect fallback timer now that the peer is back online.
-            // This used to live in a second, separate 'open' listener.
             if (this.peerReconnectFallbackTimeout !== null) {
                 clearTimeout(this.peerReconnectFallbackTimeout);
                 this.peerReconnectFallbackTimeout = null;
@@ -2040,31 +2361,54 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             onOpen?.(id);
         });
 
-        this.peer.on('connection', (conn) => { this.log("Incoming PeerJS connection from:", conn.peer); this.setupConnection(conn); });
-        this.peer.on('error', (err) => { clearTimeout(connectionTimeout); this.handlePeerError(err); });
-        this.peer.on('disconnected', () => {
+        peer.on('connection', (conn) => {
+            if (!isCurrent()) {
+                conn.close();
+                return;
+            }
+            this.log("Incoming PeerJS connection from:", conn.peer);
+            this.setupConnection(conn);
+        });
+        peer.on('error', (err) => {
+            if (!isCurrent()) return;
+            this.handlePeerError(err);
+        });
+        peer.on('disconnected', () => {
+            if (!isCurrent() || peer.destroyed) return;
             this.showNotice('Sync network disconnected. Attempting to reconnect...', 'transient');
             this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' });
-            // Attempt lightweight reconnect first (Phase 3.1)
-            if (this.peer && !this.peer.destroyed) {
-                this.peer.reconnect();
-                // Arm a fallback in case peer.reconnect() stalls silently
-                if (this.peerReconnectFallbackTimeout !== null) clearTimeout(this.peerReconnectFallbackTimeout);
-                this.peerReconnectFallbackTimeout = window.setTimeout(() => {
-                    this.peerReconnectFallbackTimeout = null;
-                    // If still disconnected after the window, fall through to full re-init
-                    if (this.peer && this.peer.disconnected) {
-                        this.log('PeerJS reconnect() stalled — falling back to full re-initialization.');
-                        this.handlePeerError(new Error('Reconnect timed out'));
-                    }
-                }, 15000);
+            // Attempt lightweight reconnect first
+            try {
+                peer.reconnect();
+            } catch (e) {
+                this.log('PeerJS reconnect() refused', e);
+                this.handlePeerError(e);
+                return;
             }
+            // Arm a fallback in case peer.reconnect() stalls silently
+            if (this.peerReconnectFallbackTimeout !== null) clearTimeout(this.peerReconnectFallbackTimeout);
+            this.peerReconnectFallbackTimeout = window.setTimeout(() => {
+                this.peerReconnectFallbackTimeout = null;
+                // If still disconnected after the window, fall through to full re-init
+                if (isCurrent() && peer.disconnected) {
+                    this.log('PeerJS reconnect() stalled — falling back to full re-initialization.');
+                    this.handlePeerError(new Error('Reconnect timed out'));
+                }
+            }, 15000);
         });
-        this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'transient'); this.handlePeerError(new Error("Peer closed.")); });
+        peer.on('close', () => {
+            if (!isCurrent()) return;
+            this.showNotice('Sync connection closed permanently.', 'transient');
+            this.handlePeerError(new Error("Peer closed."));
+        });
     }
 
     private handlePeerError(err: any) {
-        console.error("PeerJS Error:", err);
+        if (this.unloaded) return;
+        // A cluster member that is simply offline surfaces as peer-unavailable every retry
+        // cycle; it is routine, so it stays out of the error console.
+        if (err?.type === 'peer-unavailable') this.log('PeerJS:', err?.message || err);
+        else console.error("PeerJS Error:", err);
 
         if (!shouldTearDownPeer(err || {}, this.connections.size)) {
             this.log(`PeerJS error (${err?.type || err?.message || 'unknown'}) — keeping ${this.connections.size} live link(s).`);
@@ -2077,11 +2421,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             return;
         }
 
-        this.peer?.destroy();
-        this.peer = null;
+        this.destroyPeer();
         this.connections.forEach(conn => conn.close());
         this.connections.clear();
-        this.activeTransfers.clear();
+        this.settleTransfersAfterDisconnect();
 
         this.updateStatus({ text: peerErrorUserMessage(err), icon: 'alert-triangle', state: 'error' });
 
@@ -2090,13 +2433,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (err?.type === 'unavailable-id' && this.peerInitAttempts === 0) {
             this.showNotice('This device ID is already in use — usually because this vault was copied from another computer. Open Settings and tap New ID on this device, then pair again.', 'warning', 12000);
         }
-    
+
         this.peerInitAttempts++;
         const backoff = Math.min(30000, this.peerInitAttempts * 2000);
         this.showNotice(`Sync connection failed. Retrying in ${backoff / 1000}s...`, 'transient');
-    
+
         if (this.peerInitRetryTimeout) clearTimeout(this.peerInitRetryTimeout);
         this.peerInitRetryTimeout = window.setTimeout(() => {
+            this.peerInitRetryTimeout = null;
+            if (this.unloaded) return;
             this.updateStatus({ text: 'Retrying connection...', icon: 'refresh-cw', spin: true, state: 'loading' });
             this.initializePeer();
         }, backoff);
@@ -2104,62 +2449,48 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     setupConnection(conn: DataConnection, pin?: string) {
         this.pendingConnections.add(conn.peer);
-        conn.on('open', async () => {
+        conn.on('open', () => {
             this.pendingConnections.delete(conn.peer);
             this.log("DataConnection open with:", conn.peer);
-            
-            const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin, protocolVersion: PROTOCOL_VERSION };
-            if (this.settings.peerKeys[conn.peer]) {
-                try {
-                    // encryptPayload already returns the wire envelope
-                    // { type:'encrypted-frame', data } — wrapping it again produces a
-                    // payload the receiver can never decrypt.
-                    const encrypted = await this.encryptPayload(payload, conn.peer);
-                    conn.send(encrypted);
-                } catch(e) {
-                    // Do NOT fall back to sending this in the clear. We hold a key for this
-                    // peer, so a plaintext handshake is exactly the downgrade the receive-side
-                    // gate now rejects, and it contradicts encryptPayload's own contract.
-                    this.log("Failed to encrypt handshake; closing connection instead of sending it in the clear", e);
-                    this.showNotice('Could not encrypt the connection to a paired device. Try re-pairing it.', 'error');
-                    conn.close();
-                    return;
-                }
-            } else {
-                conn.send(payload);
-            }
-            // Role announcement is deferred to handleHandshake (after conn is in this.connections)
-            // to avoid isTwoDeviceMode() seeing wrong connections.size
-            this.resumeTransfers(conn.peer);
+            // Role announcement and resuming interrupted uploads wait for handleHandshake, once
+            // the connection is registered and the peer has proved who it is.
+            void this.sendHandshake(conn, pin);
         });
-        conn.on('data', async (raw: any) => {
-            this.handleRawIncomingData(raw, conn).catch(e => {
-                this.log("Unhandled error in incoming data listener", e);
-            });
+        // Decryption is asynchronous, so messages handled independently can finish out of
+        // order: a file-chunk-data that overtakes its file-chunk-start is dropped as unknown,
+        // and the transfer never completes. Each message waits for the previous one from this
+        // connection. Only decrypt-and-dispatch is serialised — processIncomingData runs
+        // detached, so a slow handler does not hold up pings.
+        let inbound: Promise<void> = Promise.resolve();
+        conn.on('data', (raw: any) => {
+            inbound = inbound
+                .then(() => this.handleRawIncomingData(raw, conn))
+                .catch(e => this.log("Unhandled error in incoming data listener", e));
         });
         conn.on('close', () => {
-            this.pendingConnections.delete(conn.peer);
             const peerId = conn.peer;
+            if (this.unloaded) return;
+            if (this.connections.get(peerId) !== conn) {
+                // A connection that never finished its handshake, or a duplicate that lost the
+                // tie-break. Tearing down per-peer state here used to knock out the live link
+                // to the same device — the one that is still in `connections`.
+                if (!this.connections.has(peerId)) this.pendingConnections.delete(peerId);
+                this.log(`Closed a non-current connection with ${peerId}.`);
+                return;
+            }
+            this.pendingConnections.delete(peerId);
             this.log("DataConnection closed with:", peerId);
             this.connections.delete(peerId);
             this.lastHeard.delete(peerId);
             this.manualPingStart.delete(peerId);
             this.lastSuccessfulMessageTime.delete(peerId);
-            
+
             // Clear remote locks from this peer
             for (const [path, lock] of this.remoteLocks.entries()) {
                 if (lock.peerId === peerId) this.remoteLocks.delete(path);
             }
 
-            for (const [id, transfer] of this.activeTransfers.entries()) {
-                if (transfer.peerId === peerId && transfer.direction === 'download') {
-                    this.activeTransfers.delete(id);
-                    // Release the preallocated reassembly buffer too. These were only ever
-                    // reclaimed by the five-minute sweeper, so a peer that connected and
-                    // dropped repeatedly could pin gigabytes of memory.
-                    this.pendingFileChunks.delete(id);
-                }
-            }
+            this.settleTransfersAfterDisconnect(peerId);
             this.updateStatus();
 
             // Fix: Abort sync immediately if the connection to the syncing peer closes mid-sync
@@ -2189,6 +2520,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         });
     }
 
+    /**
+     * Introduce this device on `conn`: encrypted whenever a key applies, and never downgraded.
+     * We hold a key for this peer, so a plaintext handshake is exactly what its receive-side
+     * gate refuses — and what an impersonator would send.
+     */
+    private async sendHandshake(conn: DataConnection, pin?: string) {
+        const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin, protocolVersion: PROTOCOL_VERSION };
+        if (!this.peerKeyFor(conn.peer)) {
+            conn.send(payload);
+            return;
+        }
+        try {
+            // encryptPayload already returns the wire envelope { type:'encrypted-frame', data };
+            // wrapping it again produces a payload the receiver can never decrypt.
+            conn.send(await this.encryptPayload(payload, conn.peer));
+        } catch (e) {
+            this.log("Failed to encrypt handshake; closing connection instead of sending it in the clear", e);
+            this.showNotice('Could not encrypt the connection to a paired device. Try re-pairing it.', 'error');
+            conn.close();
+        }
+    }
+
     async handleRawIncomingData(raw: any, conn: DataConnection) {
         let data = raw;
         let wasEncrypted = false;
@@ -2206,14 +2559,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         if (raw && raw.type === 'encrypted-frame') {
-            if (this.settings.peerKeys[conn.peer]) {
+            if (this.peerKeyFor(conn.peer)) {
                 try {
                     data = await this.decryptPayload(raw, conn.peer);
                 } catch(e) {
                     this.log("Decryption failed, ignoring message", e);
                     return;
                 }
-            } else if (this.getActivePsk()) {
+            } else if (this.getConnectionMode() === 'peerjs' && this.getActivePsk()) {
                 // A peer pairing via the active QR code has no stored key yet. Adopt the
                 // active PSK provisionally, and roll it back if it does not decrypt.
                 // getActivePsk() returns null once the pairing window has closed.
@@ -2224,6 +2577,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.unblockPeer(conn.peer);
                     await this.saveSettings();
                     this.log(`Successfully authenticated new peer ${conn.peer} via active PSK`);
+                    // Our own handshake went out when the link opened — in plaintext, since we
+                    // had no key yet — and the pairing device, which does hold the key, refused
+                    // it. Without a second, encrypted one it never registered this link, and
+                    // its Connect screen reported a failed pairing.
+                    void this.sendHandshake(conn);
                 } catch(e) {
                     delete this.settings.peerKeys[conn.peer];
                     this.invalidateCryptoKey(conn.peer);
@@ -2241,15 +2599,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // encrypted-frame fell through and was processed as trusted, so a peer could skip the
         // envelope entirely rather than needing the key. Reject plaintext from any peer we
         // hold a key for.
-        if (!wasEncrypted && this.settings.peerKeys[conn.peer]) {
-            this.log(`Refusing unencrypted message from ${conn.peer}, which has an encryption key.`);
-            this.showNotice('Refused an unencrypted message from a paired device. If this repeats, re-pair the devices.', 'warning');
+        if (!wasEncrypted && this.peerKeyFor(conn.peer)) {
+            this.log(`Refusing unencrypted ${raw?.type} from ${conn.peer}, which has an encryption key.`);
+            // One plaintext handshake is expected while pairing: the other device sends it
+            // before it has adopted the key, then repeats it encrypted. Warn about anything else.
+            if (raw?.type !== 'handshake') {
+                this.showNotice('Refused an unencrypted message from a paired device. If this repeats, re-pair the devices.', 'warning');
+            }
             return;
         }
 
         // Under strict security the handshake is the only thing allowed before a key exists;
-        // everything else from an unknown peer is dropped.
-        if (this.settings.strictSecurity && !wasEncrypted && raw?.type !== 'handshake') {
+        // everything else from an unknown peer is dropped. Offline Mode is exempt: the host
+        // has already checked the joining device's token, and its frames never carry a
+        // pairing key.
+        if (this.settings.strictSecurity && this.getConnectionMode() === 'peerjs' && !wasEncrypted && raw?.type !== 'handshake') {
             this.log(`Strict security: dropping ${raw?.type} from unauthenticated peer ${conn.peer}.`);
             return;
         }
@@ -2257,72 +2621,48 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.processIncomingData(data, conn);
     }
     
-    async resumeTransfers(peerId: string) {
-        const transfersToResume = Array.from(this.activeTransfers.values())
-            .filter(t => t.peerId === peerId && t.status === 'paused' && t.direction === 'upload');
-
-        for (const t of transfersToResume) {
-            this.log(`Resuming transfer ${t.id} to ${peerId}`);
-            t.status = 'active';
-            this.updateStatus();
-            
-            const file = this.app.vault.getAbstractFileByPath(t.path);
+    /**
+     * Re-send uploads to `peerId` that a dropped link or a restart interrupted.
+     *
+     * They restart from the first chunk, through the normal send path. Continuing mid-file
+     * never worked: the receiver discards its partial reassembly when the link drops (and has
+     * nothing at all after a restart), so the resumed chunks were rejected as belonging to an
+     * unknown transfer — while the queue had already written the file off as sent.
+     */
+    resumeTransfers(peerId: string) {
+        let resumed = 0;
+        for (const [id, transfer] of this.activeTransfers) {
+            if (transfer.peerId !== peerId || transfer.direction !== 'upload' || transfer.status !== 'paused') continue;
+            this.activeTransfers.delete(id);
+            const file = this.app.vault.getAbstractFileByPath(transfer.path);
             if (file instanceof TFile) {
-                let content: ArrayBuffer;
-                if (t.compressed) {
-                    const textContent = await this.app.vault.read(file);
-                    content = compressText(textContent);
-                } else {
-                    content = await this.app.vault.readBinary(file);
-                }
-                
-                const ackPromise = new Promise<void>((resolve, reject) => {
-                    const timeout = setTimeout(() => reject(new Error(`Transfer ${t.id} timed out`)), 60000);
-                    this.pendingAcks.set(t.id, {
-                        resolve: () => { clearTimeout(timeout); resolve(); },
-                        reject: (e) => { clearTimeout(timeout); reject(e); },
-                        peerId: peerId
-                    });
-                });
-
-                try {
-                    const vv = this.twoDeviceState.fileVersions[t.path];
-                    await this.sendFileInChunks(t.peerId, t.path, file.stat.mtime, content, t.id, t.processedChunks, t.compressed, vv);
-                    await ackPromise;
-                    this.log(`Resumed transfer ${t.id} completed.`);
-                    this.activeTransfers.delete(t.id);
-                    this.scheduleStateSave();
-                } catch (e) {
-                    if (e.message === 'Paused') this.log(`Transfer ${t.id} paused again.`);
-                    else this.log(`Resumed transfer ${t.id} failed:`, e);
-                } finally {
-                    if (this.pendingAcks.has(t.id)) {
-                        this.pendingAcks.get(t.id)!.resolve();
-                        this.pendingAcks.delete(t.id);
-                    }
-                }
-            } else {
-                this.activeTransfers.delete(t.id);
-                this.scheduleStateSave();
+                void this.sendFileUpdate(file, peerId, true);
+                resumed++;
             }
         }
+        if (resumed > 0) this.log(`Re-sending ${resumed} interrupted upload(s) to ${peerId}.`);
+        this.scheduleStateSave();
+        this.updateStatus();
     }
 
     startHeartbeat() {
-        this.registerInterval(window.setInterval(() => {
-            const now = Date.now();
-            this.connections.forEach((conn, peerId) => {
-                if (conn.open) {
-                    // Send directly to bypass the sync queue
-                    conn.send({ type: 'ping' });
-                    const last = this.lastHeard.get(peerId);
-                    if (last && now - last > 20000) { // Increased timeout to 20 seconds
-                        this.log(`Peer ${peerId} timed out (Heartbeat).`);
-                        conn.close();
-                    }
+        this.registerInterval(window.setInterval(() => this.heartbeatTick(), 5000));
+    }
+
+    /** One heartbeat round: ping every open link and drop any that has gone silent for 20 s. */
+    heartbeatTick() {
+        const now = Date.now();
+        this.connections.forEach((conn, peerId) => {
+            if (conn.open) {
+                // Direct, bypassing the sync queue, but encrypted like everything else.
+                this.sendDirect(conn, { type: 'ping' });
+                const last = this.lastHeard.get(peerId);
+                if (last && now - last > 20000) {
+                    this.log(`Peer ${peerId} timed out (Heartbeat).`);
+                    conn.close();
                 }
-            });
-        }, 5000)); // Check every 5 seconds
+            }
+        });
     }
     
     startSyncKeepAlive() {
@@ -2336,7 +2676,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
                 this.syncState.missedPings++;
                 const conn = this.connections.get(this.syncState.peerId);
-                if (conn && conn.open) conn.send({ type: 'sync-ping' });
+                if (conn && conn.open) this.sendDirect(conn, { type: 'sync-ping' });
             } else {
                 if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
             }
@@ -2360,7 +2700,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         if (data.messageId && data.type !== 'sync-ack' && conn) {
-            conn.send({ type: 'sync-ack', messageId: data.messageId });
+            this.sendDirect(conn, { type: 'sync-ack', messageId: data.messageId });
             // Dedup: sendSyncMessage retries after 30s even if the first copy was merely
             // slow — re-processing a control message (e.g. request-batch) corrupts sync
             // state, so ack duplicates but process each messageId only once.
@@ -2379,22 +2719,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (ack) { ack.resolve(); this.pendingSyncAcks.delete(data.messageId); }
             return;
         }
+        if (!this.canonicalizePeerPaths(data)) {
+            this.log(`Dropping ${data.type} from ${conn?.peer}: it names an unsafe path.`);
+            return;
+        }
         
         try {
             switch (data.type) {
                 case 'handshake': this.handleHandshake(data, conn!); break;
-                case 'role-announcement': 
-                    if (this.isTwoDeviceMode()) {
-                        this.log(`Role announcement from ${data.deviceId}: ${data.role}`);
-                        // Validation: my role should be opposite
-                        if (data.role === this.currentRole) {
-                            this.log(`Role conflict detected! Re-evaluating.`);
-                            this.currentRole = this.getMyRole(data.deviceId);
-                        }
-                    }
-                    break;
+                // Retired with role-based conflict resolution; nothing on v4 sends it.
+                case 'role-announcement': break;
                 case 'cluster-gossip': this.handleClusterGossip(data); break;
-                case 'companion-pair': this.handleCompanionPair(data); break;
+                case 'companion-pair': void this.handleCompanionPair(data, conn); break;
                 case 'ack':
                     if (this.pendingAcks.has(data.transferId)) {
                         this.log(`Ack received for ${data.transferId}.`);
@@ -2412,19 +2748,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     }
                     break;
                 case 'file-update': 
-                    this.applyFileUpdate(data).then(() => {
-                        if (conn && data.transferId && !data.skipAck) conn.send({ type: 'ack', transferId: data.transferId });
+                    this.applyFileUpdate(data, conn?.peer).then(() => {
+                        if (conn && data.transferId && !data.skipAck) this.sendDirect(conn, { type: 'ack', transferId: data.transferId });
                         this.resetIdleTimeout();
                     }).catch(e => {
                         this.log(`Failed to apply file update: ${data.path}`, e);
                         if (conn && data.transferId && !data.skipAck) {
                             const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
-                            conn.send({ type: 'nack', transferId: data.transferId, reason });
+                            this.sendDirect(conn, { type: 'nack', transferId: data.transferId, reason });
                         }
                     }); 
                     break;
                 case 'file-batch-binary':
-                    this.applyFileBatchBinary(data).then((results) => {
+                    this.applyFileBatchBinary(data, conn?.peer).then((results) => {
                         this.resetIdleTimeout();
                         // NOTE: do NOT send 'batch-complete' from here. The batchId belongs to
                         // OUR pull batch — echoing it back would be misread by the sender's
@@ -2440,25 +2776,25 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     break;
                 case 'file-delta':
                     this.applyFileDelta(data).then(() => {
-                        if (conn && data.transferId) conn.send({ type: 'ack', transferId: data.transferId });
+                        if (conn && data.transferId) this.sendDirect(conn, { type: 'ack', transferId: data.transferId });
                         this.resetIdleTimeout();
                     }).catch(e => {
                         this.log(`Failed to apply delta: ${data.path}`, e);
                         if (conn && data.transferId) {
                             const reason = (e instanceof Error && e.message.includes('IntegrityError')) ? 'integrity-failure' : 'write-error';
-                            conn.send({ type: 'nack', transferId: data.transferId, reason });
+                            this.sendDirect(conn, { type: 'nack', transferId: data.transferId, reason });
                         }
                     });
                     break;
                 case 'file-delete':
                     // Unlike file-update and file-delta this had no error handling at all, so
                     // a failed delete surfaced only as an unhandled rejection.
-                    this.applyFileDelete(data).catch(e => {
+                    this.applyFileDelete(data, conn?.peer).catch(e => {
                         this.log(`Failed to apply remote delete for ${data.path}`, e);
                         this.showNotice(`Could not delete ${data.path} — it may still exist on this device.`, 'error');
                     });
                     break;
-                case 'file-rename': this.applyFileRename(data); break;
+                case 'file-rename': void this.applyFileRename(data, conn); break;
                 case 'folder-create': this.applyFolderCreate(data); break;
                 case 'folder-delete': this.applyFolderDelete(data); break;
                 case 'folder-rename': this.applyFolderRename(data); break;
@@ -2475,15 +2811,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 case 'request-batch': await this.handleRequestBatch(data, conn!); break;
                 case 'batch-complete': this.handleBatchComplete(data, conn!); break;
                 
-                case 'full-sync-complete': 
-                    this.peerSyncComplete.set(conn!.peer, true);
-                    this.checkFullSyncCompletion(conn!.peer);
+                case 'full-sync-complete':
+                    if (!this.syncState.isSyncing || this.syncState.peerId !== conn?.peer) break;
+                    this.peerSyncComplete.set(conn.peer, true);
+                    // The peer will request nothing more; what it never took is moot.
+                    this.syncState.allowedPulls.clear();
+                    this.checkFullSyncCompletion(conn.peer);
                     break;
                 case 'request-file': this.handleRequestFile(data, conn!); break;
                 case 'file-chunk-start': this.handleFileChunkStart(data, conn); break;
                 case 'file-chunk-data': await this.handleFileChunkData(data, conn!); break;
                 
-                case 'ping': conn?.send({ type: 'pong' }); break;
+                case 'ping': if (conn) this.sendDirect(conn, { type: 'pong' }); break;
                 case 'pong': 
                     if (this.manualPingStart.has(conn!.peer)) {
                         const start = this.manualPingStart.get(conn!.peer)!;
@@ -2492,7 +2831,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         this.showNotice(`${this.clusterPeers.get(conn!.peer)?.friendlyName || 'The other device'} replied in ${rtt} ms`, 'important');
                     }
                     break;
-                case 'sync-ping': conn?.send({ type: 'sync-pong' }); this.resetIdleTimeout(); break;
+                case 'sync-ping': if (conn) this.sendDirect(conn, { type: 'sync-pong' }); this.resetIdleTimeout(); break;
                 case 'sync-pong': this.syncState.missedPings = 0; this.resetIdleTimeout(); break;
                     
                 case 'cluster-forget': this.handleClusterForget(data); break;
@@ -2513,6 +2852,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 case 'merkle-root': await this.handleMerkleRoot(data, conn!); break;
                 case 'merkle-node-request': await this.handleMerkleNodeRequest(data, conn!); break;
                 case 'merkle-node-response': await this.handleMerkleNodeResponse(data, conn!); break;
+
+                // Obsidian settings
+                case 'config-manifest': if (conn) void this.configSync.handleManifest(data, conn.peer).catch(e => this.log('Config sync failed', e)); break;
+                case 'config-request': if (conn) void this.configSync.handleRequest(data, conn.peer).catch(e => this.log('Config sync failed', e)); break;
+                case 'config-file': if (conn) void this.configSync.handleFile(data, conn.peer).catch(e => this.log('Config sync failed', e)); break;
+                case 'config-delete': if (conn) void this.configSync.handleDelete(data, conn.peer).catch(e => this.log('Config sync failed', e)); break;
             }
         } catch (e) {
             this.log(`Error processing incoming data (type: ${data.type}):`, e);
@@ -2522,17 +2867,45 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
+    /**
+     * Rewrite a peer message's path fields to canonical vault paths, once, before any handler
+     * sees them. The scope checks normalised a copy while the vault calls used the raw
+     * string, so `./a//b.md` passed as `a/b.md` but was written as given. Returns false when a
+     * path is unusable (absolute, `..`, NUL, ...).
+     */
+    private canonicalizePeerPaths(data: any): boolean {
+        // Version vectors from a peer are merged into our own state; one with non-numeric or
+        // absurd counts would poison every later comparison for that file.
+        if ('versionVector' in data) data.versionVector = sanitizeVersionVector(data.versionVector);
+        if ('deletedAt' in data && !(typeof data.deletedAt === 'number' && Number.isFinite(data.deletedAt))) delete data.deletedAt;
+        for (const field of ['path', 'oldPath', 'newPath']) {
+            const value = data[field];
+            if (value === undefined) continue;
+            // Merkle traversal names the vault root with an empty path.
+            if (field === 'path' && value === '' && (data.type === 'merkle-node-request' || data.type === 'merkle-node-response')) continue;
+            const safe = sanitizeVaultPath(value);
+            if (safe === null) return false;
+            data[field] = safe;
+        }
+        return true;
+    }
+
     handleHandshake(data: HandshakePayload, conn: DataConnection) {
-        // V3 changed the wire format incompatibly. Refuse mismatched peers up front —
-        // letting them through would mean silently dropped messages at best and a
-        // half-applied sync at worst.
-        if ((data.protocolVersion || 0) !== PROTOCOL_VERSION) {
-            this.showNotice(
-                'Update Obsidian Decentralized on the other device to the same version.',
-                'error', 12000
-            );
-            this.log(`Rejecting handshake from ${conn.peer}: protocol v${data.protocolVersion || 'unknown'} (expected v${PROTOCOL_VERSION})`);
+        const peerInfo = sanitizePeerInfo(data.peerInfo);
+        if (!peerInfo) {
+            this.log(`Rejecting handshake from ${conn.peer}: missing or malformed device info.`);
             conn.close();
+            return;
+        }
+        // Over PeerJS the connection itself says who dialled; a handshake claiming another
+        // ID would file this device's details under someone else's entry.
+        if (this.getConnectionMode() === 'peerjs') peerInfo.deviceId = conn.peer;
+
+        // Refuse mismatched versions up front — letting them through would mean silently
+        // dropped messages at best and a half-applied sync at worst.
+        const theirVersion = typeof data.protocolVersion === 'number' ? data.protocolVersion : 0;
+        if (theirVersion !== PROTOCOL_VERSION) {
+            this.refuseIncompatiblePeer(conn, peerInfo.friendlyName, theirVersion);
             return;
         }
         // Strict security: only peers we already share a key with, or one arriving during an
@@ -2545,6 +2918,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             return;
         }
         if (this.settings.strictSecurity
+            && this.getConnectionMode() === 'peerjs'
             && !this.settings.peerKeys[conn.peer]
             && !this.getActivePsk()) {
             this.showNotice(
@@ -2555,49 +2929,97 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             conn.close();
             return;
         }
-        this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'important', 4000);
+        const existing = this.connections.get(conn.peer);
+        if (this.getConnectionMode() === 'peerjs' && existing && existing !== conn && existing.open) {
+            // Two links to the same device. Each end must keep the SAME one, or each closes
+            // the link the other kept. Overwriting the map entry (as this used to) left an
+            // orphan whose later close took the live link down.
+            //  - Glare (each side dialled one): keep the link dialled by the lower device ID.
+            //  - A re-dial (one side dialled both, e.g. pairing again): keep the newer link.
+            //    Both ends see the two handshakes in the same order, so both keep this one.
+            const lowerIsMe = this.settings.deviceId < conn.peer;
+            const dialledThis = this.dialledConnections.has(conn);
+            const keepThis = dialledThis === this.dialledConnections.has(existing)
+                ? true
+                : dialledThis === lowerIsMe;
+            if (!keepThis) {
+                this.log(`Duplicate connection with ${conn.peer}; keeping the existing one.`);
+                conn.close();
+                return;
+            }
+            this.log(`Duplicate connection with ${conn.peer}; replacing the existing one.`);
+            // Swap first so the old link's close handler sees it is no longer current.
+            this.connections.set(conn.peer, conn);
+            existing.close();
+        }
+        this.showNotice(`Connected to ${peerInfo.friendlyName}`, 'important', 4000);
+        this.incompatiblePeers.delete(conn.peer);
         this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn);
-        this.clusterPeers.set(conn.peer, persistablePeerInfo(data.peerInfo));
+        this.clusterPeers.set(conn.peer, peerInfo);
         this.updateStatus();
         this.saveKnownPeers();
         const existingPeers = Array.from(this.clusterPeers.values());
         
         if (this.getConnectionMode() === 'direct-ip') {
             if (!data.isResponse) {
-                this.sendData(conn.peer, { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: data.pin, isResponse: true, protocolVersion: PROTOCOL_VERSION } as any);
+                this.sendData(conn.peer, { type: 'handshake', peerInfo: this.getMyPeerInfo(), isResponse: true, protocolVersion: PROTOCOL_VERSION } as any);
             }
         } else {
             this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers.map(persistablePeerInfo) });
-            this.broadcastData({ type: 'cluster-gossip', peers: [persistablePeerInfo(this.getMyPeerInfo()), persistablePeerInfo(data.peerInfo)] });
+            this.broadcastData({ type: 'cluster-gossip', peers: [persistablePeerInfo(this.getMyPeerInfo()), peerInfo] });
         }
         
-        if (this.isTwoDeviceMode()) {
-            this.currentRole = this.getMyRole(conn.peer);
-            this.sendData(conn.peer, { type: 'role-announcement', role: this.currentRole, deviceId: this.settings.deviceId });
-
-            // Auto-reconciliation: the primary initiates a cheap Merkle-root exchange so
-            // paired vaults converge automatically after a reconnect. Without this trigger
-            // the whole Merkle diffing path was dead code — nothing ever sent 'merkle-root'.
-            if (this.settings.enableTwoDeviceOptimizations && this.currentRole === 'primary' && !this.syncState.isSyncing) {
-                this.getMerkleTree()
-                    .then(tree => this.sendData(conn.peer, { type: 'merkle-root', rootHash: tree.hash }))
-                    .catch(e => this.log('Failed to build Merkle tree for auto-reconciliation', e));
-            }
+        // Auto-reconciliation: a cheap Merkle-root exchange on every (re)connection, so
+        // changes made while two devices were apart reach each other and any conflict is
+        // settled by the usual rule. This used to run only while exactly one device was
+        // connected, so in a group of three, two devices that had been apart never compared
+        // notes. The device with the lower ID starts, so each pair runs one exchange.
+        if (this.settings.enableTwoDeviceOptimizations && this.getMyRole(conn.peer) === 'primary' && !this.syncState.isSyncing) {
+            this.getMerkleTree()
+                .then(tree => this.sendData(conn.peer, { type: 'merkle-root', rootHash: tree.hash }))
+                .catch(e => this.log('Failed to build Merkle tree for auto-reconciliation', e));
         }
+
+        this.resumeTransfers(conn.peer);
+        void this.configSync.onPeerConnected(conn.peer).catch(e => this.log('Config sync failed', e));
+    }
+
+    /**
+     * Peers whose handshake carried a different protocol version, with when to try them again.
+     * A refused peer redials every few seconds; without this each attempt ended in another
+     * error toast here, and our own reconnect loop kept dialling it too.
+     */
+    private incompatiblePeers: Map<string, number> = new Map();
+    private static readonly INCOMPATIBLE_RETRY_MS = 10 * 60 * 1000;
+
+    private refuseIncompatiblePeer(conn: DataConnection, name: string, theirVersion: number) {
+        const firstTime = !this.incompatiblePeers.has(conn.peer);
+        this.incompatiblePeers.set(conn.peer, Date.now() + ObsidianDecentralizedPlugin.INCOMPATIBLE_RETRY_MS);
+        this.log(`Rejecting handshake from ${conn.peer}: protocol v${theirVersion || 'unknown'} (expected v${PROTOCOL_VERSION})`);
+        if (firstTime) {
+            const which = theirVersion > PROTOCOL_VERSION ? 'this device' : name;
+            this.showNotice(
+                `${name} runs a different version of Obsidian Decentralized. Update the plugin on ${which} so both match, then they will reconnect.`,
+                'error', 12000
+            );
+        }
+        conn.close();
     }
 
     handleClusterGossip(data: ClusterGossipPayload) {
-        if (this.getConnectionMode() !== 'peerjs') return;
+        if (this.getConnectionMode() !== 'peerjs' || !Array.isArray(data.peers)) return;
         let hasNew = false;
-        data.peers.forEach(peerInfo => {
-            if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) return;
-            if (this.isBlocked(peerInfo.deviceId)) return;
+        for (const raw of data.peers.slice(0, 256)) {
+            const peerInfo = sanitizePeerInfo(raw);
+            if (!peerInfo) continue;
+            if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) continue;
+            if (this.isBlocked(peerInfo.deviceId)) continue;
             if (!this.clusterPeers.has(peerInfo.deviceId)) {
-                this.clusterPeers.set(peerInfo.deviceId, persistablePeerInfo(peerInfo));
+                this.clusterPeers.set(peerInfo.deviceId, peerInfo);
                 hasNew = true;
             }
-        });
+        }
         if (hasNew) {
             this.saveKnownPeers();
             this.updateStatus();
@@ -2605,39 +3027,68 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
-    async handleCompanionPair(data: CompanionPairPayload) {
-        if (this.isBlocked(data.peerInfo.deviceId)) return;
-        this.settings.companionPeerId = data.peerInfo.deviceId; await this.saveSettings();
-        this.clusterPeers.set(data.peerInfo.deviceId, persistablePeerInfo(data.peerInfo));
-        this.showNotice(`${data.peerInfo.friendlyName} is now your primary sync partner.`, 'important', 4000);
+    async handleCompanionPair(data: CompanionPairPayload, conn?: DataConnection | null) {
+        const peerInfo = sanitizePeerInfo(data.peerInfo);
+        if (!peerInfo) return;
+        // Only the device on the other end of this link can make itself our partner.
+        if (conn && this.getConnectionMode() === 'peerjs') peerInfo.deviceId = conn.peer;
+        if (this.isBlocked(peerInfo.deviceId)) return;
+        this.settings.companionPeerId = peerInfo.deviceId;
+        await this.saveSettings();
+        this.clusterPeers.set(peerInfo.deviceId, peerInfo);
+        this.showNotice(`${peerInfo.friendlyName} is now your primary sync partner.`, 'important', 4000);
         this.tryToConnectToClusterPeers();
     }
 
+    /** Connections this device dialled, as opposed to accepted; glare resolution needs it. */
+    private dialledConnections = new WeakSet<object>();
+
+    /**
+     * Dial `peerId` and wire the connection up. Every outgoing connection goes through here
+     * so handleHandshake can tell which side initiated each link.
+     *
+     * reliable:true is required — an unordered channel lets file-chunk-data overtake
+     * file-chunk-start, permanently breaking large-file transfers.
+     */
+    public dialPeer(peerId: string): DataConnection | null {
+        if (this.unloaded || !this.peer || this.peer.disconnected || this.peer.destroyed) return null;
+        const conn = this.peer.connect(peerId, { reliable: true });
+        if (!conn) return null;
+        this.dialledConnections.add(conn);
+        this.setupConnection(conn);
+        return conn;
+    }
+
     tryToConnectToClusterPeers() {
-        if (this.getConnectionMode() !== 'peerjs') return;
-        
+        if (this.unloaded || this.getConnectionMode() !== 'peerjs') return;
+
         const attemptConnection = () => {
-            if (!this.peer || this.peer.disconnected) return;
-            
+            if (this.unloaded || !this.peer || this.peer.disconnected) return;
+
             const connectToPeer = (peerId: string) => {
                 if (peerId === this.settings.deviceId) return;
                 if (this.isBlocked(peerId)) return;
                 if (this.connections.has(peerId) || this.pendingConnections.has(peerId)) return;
-                
-                this.log(`Attempting to connect to cluster peer ${peerId}`); 
+                const retryIncompatibleAt = this.incompatiblePeers.get(peerId);
+                if (retryIncompatibleAt !== undefined && Date.now() < retryIncompatibleAt) return;
+
+                this.log(`Attempting to connect to cluster peer ${peerId}`);
                 this.pendingConnections.add(peerId);
-                const conn = this.peer!.connect(peerId, { reliable: true }); 
-                if (conn) {
-                    this.setupConnection(conn);
-                    setTimeout(() => {
-                        if (this.pendingConnections.has(peerId)) {
-                            this.pendingConnections.delete(peerId);
-                            this.log(`Pending connection to ${peerId} timed out. Removing from pending set.`);
-                        }
-                    }, 15000);
-                } else {
+                const conn = this.dialPeer(peerId);
+                if (!conn) {
                     this.pendingConnections.delete(peerId);
+                    return;
                 }
+                // An offline peer never answers, and PeerJS neither opens nor closes the
+                // attempt. Give up on this one after 15 s so the next round can dial again,
+                // and close it so PeerJS drops its negotiator instead of accumulating one per
+                // retry.
+                this.timeoutManager.setTimeout(() => {
+                    if (conn.open || this.connections.get(peerId) === conn) return;
+                    this.log(`Pending connection to ${peerId} timed out. Removing from pending set.`);
+                    this.pendingConnections.delete(peerId);
+                    try { conn.close(); } catch (_) { /* never opened */ }
+                }, 15000);
             };
 
             const companionId = this.settings.companionPeerId;
@@ -2647,11 +3098,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (peerId !== companionId) connectToPeer(peerId);
             }
         };
-        
+
         attemptConnection();
         if (!this.clusterConnectionInterval) {
-            this.clusterConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS); 
-            // Fix: Do not register this dynamically recreated interval to avoid leaking in Obsidian core's internal list.
+            // Deliberately not registerInterval(): this one is torn down and recreated with the
+            // connection manager, and onunload clears it explicitly.
+            this.clusterConnectionInterval = window.setInterval(attemptConnection, COMPANION_RECONNECT_INTERVAL_MS);
         }
     }
 
@@ -2675,7 +3127,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         } else if (mode === 'direct-ip') {
             if (this.directIpClient) {
                 this.log('Network change: triggering DirectIpClient reconnect.');
-                this.directIpClient.triggerReconnect();
+                this.directIpClient.triggerReconnect({ resetBackoff: true });
             }
         }
     }
@@ -2763,6 +3215,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.connections.get(deviceId)?.close();
         this.connections.delete(deviceId);
         this.clusterPeers.delete(deviceId);
+        // Paused uploads to it will never resume; left behind they held the status bar on
+        // "Sync paused" for good.
+        for (const [id, transfer] of this.activeTransfers) {
+            if (transfer.peerId === deviceId) this.activeTransfers.delete(id);
+        }
+        this.scheduleStateSave();
         delete this.settings.peerKeys[deviceId];
         this.invalidateCryptoKey(deviceId);
         if (this.settings.companionPeerId === deviceId) this.settings.companionPeerId = undefined;
@@ -2947,10 +3405,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.lastQueueSaveAt = Date.now();
         try {
             // Only 'task' items are persistable: they name a vault path and are re-derived
-            // from the vault on replay. 'data' items can hold an ArrayBuffer, which
-            // JSON.stringify turns into {} — reloading those produced silently corrupt
-            // queue entries that could never be sent.
-            const persistable = this.queueManager.getQueue().filter(item => !!item.task && !item.data);
+            // from the vault on replay. A built payload is dropped — it can hold an
+            // ArrayBuffer, which JSON.stringify turns into {}, and reloading that produced
+            // silently corrupt entries that could never be sent.
+            const persistable = this.queueManager.getQueue()
+                .filter(item => !!item.task)
+                .map(({ data: _payload, retryable: _retryable, seq: _seq, ...task }) => task);
             await this.writeJsonAtomic(`${this.manifest.dir}/queue.json`, JSON.stringify(persistable));
         } catch (e) {
             console.error('Failed to save queue state:', e);
@@ -3019,7 +3479,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let lastYieldTime = Date.now();
         const transferStartTime = Date.now();
         
-        const encryptFor = this.settings.enableEncryption && !!this.settings.peerKeys[peerId];
+        const encryptFor = !!this.peerKeyFor(peerId);
 
         if (startIndex === 0) {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector, totalBytes: fileContent.byteLength, chunkSize };
@@ -3218,19 +3678,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const computedHash = await this.getHash(reassembled.buffer);
                 if (transfer.fileHash && computedHash && transfer.fileHash !== computedHash) {
                     this.log(`Integrity check failed for chunked transfer ${transfer.path}. Rejecting.`);
-                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
+                    this.sendDirect(conn, { type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
                     return;
                 }
 
-                await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId, compressed: transfer.compressed, versionVector: transfer.versionVector });
-                this.sendData(conn.peer, { type: 'ack', transferId: payload.transferId }); this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
+                await this.applyFileUpdate({ type: 'file-update', path: transfer.path, content: reassembled.buffer, mtime: transfer.mtime, encoding: 'binary', transferId: payload.transferId, compressed: transfer.compressed, versionVector: transfer.versionVector }, conn.peer);
+                // Replies go out directly: through the queue they waited at the lowest priority
+                // behind bulk transfers, long enough for the sender's ack timer to expire.
+                this.sendDirect(conn, { type: 'ack', transferId: payload.transferId });
+                this.log(`Reassembly complete for ${transfer.path}, sent ack.`);
             } catch (e) {
                 this.log(`Failed to apply chunked file update: ${transfer.path}`, e);
-                if (e instanceof Error && e.message.includes('IntegrityError')) {
-                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'integrity-failure' });
-                } else {
-                    this.sendData(conn.peer, { type: 'nack', transferId: payload.transferId, reason: 'write-error' });
-                }
+                const reason = e instanceof Error && e.message.includes('IntegrityError') ? 'integrity-failure' : 'write-error';
+                this.sendDirect(conn, { type: 'nack', transferId: payload.transferId, reason });
             }
         }
     }
@@ -3274,6 +3734,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
 
+        for (const [p, echo] of this.remoteEchoHashes) {
+            if (now - echo.at > 60000) this.remoteEchoHashes.delete(p);
+        }
+
         // Sweep expired ignore markers. shouldIgnoreEvent only deletes an entry when the
         // path is read again, so paths that never receive another event — and every
         // 'conflict:<path>' cooldown key, which is never read through that helper — leaked
@@ -3295,16 +3759,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 throw new Error("IntegrityError: File not found for delta sync");
             }
             
-            if (this.isTwoDeviceMode() && data.versionVector) {
-                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
-                if (this.isNewerThan(localVV, data.versionVector) && !this.isNewerThan(data.versionVector, localVV)) {
-                    return;
-                }
-            } else if (data.mtime <= existingFile.stat.mtime + this.settings.mtimeTolerance &&
-                       data.mtime >= existingFile.stat.mtime - this.settings.mtimeTolerance) {
-                // Within mtime tolerance — fall through to baseHash check below instead of
-                // silently dropping the delta. If baseHash matches, the delta is valid and
-                // should be applied; if not, IntegrityError is thrown and triggers full resend.
+            // A delta applies only on top of exactly the content it was made from (the base
+            // hash check below); anything else fails over to a full send, where conflicts are
+            // decided. One made from an older version than ours is simply stale.
+            const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+            if (compareVectors(data.versionVector, localVV) === 'before') {
+                this.log(`Ignoring a delta for ${data.path}: this device's version already includes it.`);
+                return;
             }
 
             const localContent = await this.app.vault.read(existingFile);
@@ -3325,18 +3786,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             this.ignoreNextEventForPath(data.path);
             await this.app.vault.modify(existingFile, newContent, { mtime: data.mtime });
-            
-            if (this.isTwoDeviceMode() && data.versionVector) {
-                this.twoDeviceState.fileVersions[data.path] = data.versionVector;
-                this.scheduleStateSave();
-            }
-            
-            const newHash = await this.getHash(newContent);
-            this.updateHashCache(data.path, newHash);
+            this.adoptVector(data.path, mergeVectors(localVV, data.versionVector));
+
+            this.noteRemoteWrite(data.path, await this.getHash(newContent));
         });
     }
 
-    async applyFileUpdate(data: FileUpdatePayload) {
+    /**
+     * @param fromPeer the device that sent the update, when known. Needed to answer a stale
+     *   copy of a file we deleted, and to break ties between concurrent edits.
+     */
+    async applyFileUpdate(data: FileUpdatePayload, fromPeer?: string) {
         if (!this.isPathSyncable(data.path)) return;
 
         if (data.compressed && data.content instanceof ArrayBuffer) {
@@ -3352,28 +3812,69 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (data.fileHash && computedHash && data.fileHash !== computedHash) {
             throw new Error('IntegrityError: fileHash mismatch');
         }
+        // From here on fileHash is the verified hash of the content we hold. It is recorded
+        // only if that content actually lands in the vault: this used to cache it up front,
+        // so an update that was then rejected (local newer, conflict copy) left the peer's
+        // hash filed against our different content.
+        data.fileHash = computedHash || data.fileHash;
 
         await this.runLocked(data.path, async () => {
-            if (computedHash) {
-                this.updateHashCache(data.path, computedHash);
-            }
-
             const existingFile = this.app.vault.getAbstractFileByPath(data.path);
             if (!existingFile) {
-                await this.handleNewFileCreation(data);
-                if (this.isTwoDeviceMode() && data.versionVector) {
-                    this.twoDeviceState.fileVersions[data.path] = data.versionVector;
-                    this.scheduleStateSave();
-                }
+                if (this.deletionOutranks(data, fromPeer)) return;
+                await this.handleNewFileCreation(data, fromPeer);
+                this.adoptVector(data.path, mergeVectors(this.twoDeviceState.fileVersions[data.path], data.versionVector));
             } else if (existingFile instanceof TFile) {
-                await this.handleFileModification(data, existingFile);
+                await this.handleFileModification(data, existingFile, fromPeer);
             } else {
                 this.log(`Received file update for a path that is a folder: ${data.path}. Ignoring.`);
             }
         });
     }
 
-    private async handleNewFileCreation(data: FileUpdatePayload) {
+    /**
+     * True when this device's deletion of `data.path` beats the copy a peer just sent, so the
+     * copy must not come back. Deletions made while offline were resurrected exactly this way:
+     * reconciliation on reconnect pushed the other device's older copy, and it was recreated
+     * here and its tombstone cleared. Same rule as edits: the vectors decide when one side
+     * saw the other's change (a copy edited after the peer learned of the deletion wins; a
+     * copy the deletion already covered loses), and otherwise the later of deletion and edit.
+     * The sender is then told to delete its copy too.
+     */
+    private deletionOutranks(data: FileUpdatePayload, fromPeer?: string): boolean {
+        const deletedAt = this.tombstones[data.path];
+        if (deletedAt === undefined) return false;
+        const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+        const remoteVV = data.versionVector || {};
+        const deletion: VersionInfo = { mtime: deletedAt, vv: localVV, deviceId: this.settings.deviceId };
+        const copy: VersionInfo = { mtime: data.mtime, vv: remoteVV, hash: data.fileHash, deviceId: this.realDeviceId(fromPeer) };
+        if (pickVersion(deletion, copy) === 'b') return false;
+        this.log(`Not recreating ${data.path}: it was deleted here after that copy was last changed.`);
+        if (fromPeer) {
+            this.adoptVector(data.path, mergeVectors(localVV, remoteVV));
+            this.addToQueueTask(fromPeer, { taskType: 'send-delete', path: data.path });
+        }
+        return true;
+    }
+
+    /** Write a peer's version over `file`, preserving its mtime, and remember we did. */
+    private async writeRemoteVersion(file: TFile, data: FileUpdatePayload) {
+        this.ignoreNextEventForPath(file.path);
+        if (data.encoding === 'binary' || data.encoding === 'base64') {
+            await this.app.vault.modifyBinary(file, data.content as ArrayBuffer, { mtime: data.mtime });
+        } else {
+            await this.app.vault.modify(file, data.content as string, { mtime: data.mtime });
+        }
+        this.noteRemoteWrite(file.path, data.fileHash);
+    }
+
+    /** The device ID behind a connection key ('direct-ip-host' names the host's real ID). */
+    private realDeviceId(peerKey?: string | null): string | null {
+        if (!peerKey) return null;
+        return this.clusterPeers.get(peerKey)?.deviceId || peerKey;
+    }
+
+    private async handleNewFileCreation(data: FileUpdatePayload, fromPeer?: string) {
         this.log(`Creating new file: ${data.path}`);
         // The path exists again, so any deletion record for it is stale. Left in place it
         // would keep being advertised in our manifest and make peers delete their copy.
@@ -3385,15 +3886,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await this.ensureFolderExists(folderPath);
             }
             if (data.encoding === 'binary' || data.encoding === 'base64') {
-                await this.app.vault.createBinary(data.path, data.content as ArrayBuffer);
+                await this.app.vault.createBinary(data.path, data.content as ArrayBuffer, { mtime: data.mtime });
             } else {
-                await this.app.vault.create(data.path, data.content as string);
+                await this.app.vault.create(data.path, data.content as string, { mtime: data.mtime });
             }
+            this.noteRemoteWrite(data.path, data.fileHash);
         } catch (e) {
             if (e instanceof Error && e.message.includes("File already exists")) {
                 this.log(`File ${data.path} already exists, falling back to modification.`);
                 const file = this.app.vault.getAbstractFileByPath(data.path);
-                if (file instanceof TFile) await this.handleFileModification(data, file);
+                if (file instanceof TFile) await this.handleFileModification(data, file, fromPeer);
             } else {
                 console.error("File creation error:", e);
                 this.showNotice(`Could not create ${data.path} on this device.`, 'error');
@@ -3436,7 +3938,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
-    private async handleFileModification(data: FileUpdatePayload, existingFile: TFile) {
+    private async handleFileModification(data: FileUpdatePayload, existingFile: TFile, fromPeer?: string) {
         try {
             const localContent = (data.encoding === 'binary' || data.encoding === 'base64')
                 ? await this.app.vault.readBinary(existingFile)
@@ -3446,62 +3948,39 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 ? await this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
                 : localContent === data.content;
 
+            const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+            const remoteVV = data.versionVector || {};
+
             if (contentIsSame) {
                 this.log(`Ignoring update (content is identical): ${data.path}`);
-                if (this.isTwoDeviceMode() && data.versionVector) {
-                    this.twoDeviceState.fileVersions[data.path] = this.mergeVersions(this.twoDeviceState.fileVersions[data.path] || {}, data.versionVector);
-                    this.scheduleStateSave();
-                }
+                if (data.fileHash) this.updateHashCache(data.path, data.fileHash, existingFile.stat);
+                this.adoptVector(data.path, mergeVectors(localVV, remoteVV));
                 return;
             }
 
-            if (this.isTwoDeviceMode() && data.versionVector) {
-                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
-                const remoteVV = data.versionVector;
-                const isRemoteNewer = this.isNewerThan(remoteVV, localVV);
-                const isLocalNewer = this.isNewerThan(localVV, remoteVV);
-
-                if (isRemoteNewer && !isLocalNewer) {
-                    this.log(`Applying update (remote vector dominates): ${data.path}`);
-                    this.ignoreNextEventForPath(data.path);
-                    if (data.encoding === 'binary' || data.encoding === 'base64') {
-                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
-                    } else {
-                        await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
-                    }
-                    this.twoDeviceState.fileVersions[data.path] = remoteVV;
-                    this.scheduleStateSave();
-                    return;
-                } else if (isLocalNewer && !isRemoteNewer) {
-                    this.log(`Ignoring update (local vector dominates): ${data.path}`);
-                    return;
-                } else {
-                    await this.resolveConflict(data, existingFile, localContent);
-                    return;
-                }
+            // Version vectors order edits causally, which beats comparing two devices'
+            // clocks: the version made with the other already in hand wins.
+            const order = compareVectors(remoteVV, localVV);
+            if (order === 'after') {
+                this.log(`Applying update (it includes this device's version): ${data.path}`);
+                await this.writeRemoteVersion(existingFile, data);
+                this.adoptVector(data.path, mergeVectors(localVV, remoteVV));
+                return;
             }
-
-            if (data.mtime > existingFile.stat.mtime + this.settings.mtimeTolerance) {
-                this.log(`Applying update (remote is newer): ${data.path}`);
-                this.ignoreNextEventForPath(data.path);
-                if (data.encoding === 'binary' || data.encoding === 'base64') {
-                    await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
-                } else {
-                    await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
-                }
+            if (order === 'before') {
+                this.log(`Ignoring update (this device's version already includes it): ${data.path}`);
+                // The sender is behind; offer it ours rather than leave it stale until the
+                // next full sync.
+                this.replyWithOurVersion(existingFile, fromPeer, localVV);
                 return;
             }
 
-            if (data.mtime < existingFile.stat.mtime - this.settings.mtimeTolerance) {
-                this.log(`Ignoring update (local is newer): ${data.path}`);
-                return;
-            }
-
-            await this.resolveConflict(data, existingFile, localContent);
+            // Changed on both sides independently, or no record tells the versions apart.
+            await this.resolveConflict(data, existingFile, localContent, fromPeer);
         } catch (e) {
             if (e instanceof Error && (e.message.includes("File not found") || e.message.includes("no such file"))) {
                 this.log(`File ${data.path} not found during modification, falling back to creation.`);
-                await this.handleNewFileCreation(data);
+                await this.handleNewFileCreation(data, fromPeer);
             } else {
                 console.error(`Error modifying file ${data.path}:`, e);
                 throw e;
@@ -3509,67 +3988,77 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
-    private async resolveConflict(data: FileUpdatePayload, existingFile: TFile, localContent: string | ArrayBuffer) {
-        const strategy = this.getConflictStrategy();
-        this.log(`Conflict detected for: ${data.path}. Strategy: ${strategy}`);
+    /**
+     * Both devices changed the file without seeing each other's change (or nothing records
+     * which came first). The more recent change wins on every device — see pickVersion, which
+     * every device evaluates identically — and the losing version is not thrown away: the
+     * device whose own edit lost saves it as a conflict copy first. "Last write wins" (a
+     * manual-mode opt-out) skips the copy.
+     *
+     * This used to depend on how many devices happened to be connected: with one, the device
+     * "role" decided and the other edit was silently overwritten; with two or more, a newer
+     * copy overwrote without a copy and near-simultaneous edits left each device keeping its
+     * own version.
+     */
+    private async resolveConflict(data: FileUpdatePayload, existingFile: TFile, localContent: string | ArrayBuffer, fromPeer: string | undefined) {
+        const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+        const remoteVV = data.versionVector || {};
+        const merged = mergeVectors(localVV, remoteVV);
+        const local: VersionInfo = { mtime: existingFile.stat.mtime, vv: localVV, hash: await this.getHash(localContent).catch(() => undefined), deviceId: this.settings.deviceId };
+        const remote: VersionInfo = { mtime: data.mtime, vv: remoteVV, hash: data.fileHash, deviceId: this.realDeviceId(fromPeer) };
 
-        switch (strategy) {
-            case 'role-based':
-                if (this.currentRole === 'primary') {
-                    this.log(`Conflict resolved by 'role-based' (Primary wins - keeping local): ${data.path}`);
-                    const localVV = this.twoDeviceState.fileVersions[data.path] || {};
-                    const merged = this.mergeVersions(localVV, data.versionVector || {});
-                    merged[this.settings.deviceId] = (merged[this.settings.deviceId] || 0) + 1;
-                    this.twoDeviceState.fileVersions[data.path] = merged;
-                    this.scheduleStateSave();
-                    
-                    // Debounce re-send to prevent tight conflict resolution loops:
-                    // if we just resolved this path, skip the immediate re-send.
-                    // The file will be sent on next edit or full sync.
-                    const lastResolved = this.ignoreEvents.get(`conflict:${data.path}`);
-                    if (!lastResolved || Date.now() > lastResolved) {
-                        this.ignoreEvents.set(`conflict:${data.path}`, Date.now() + 5000);
-                        if (this.twoDevicePeerId) {
-                            this.sendFileUpdate(existingFile, this.twoDevicePeerId, true);
-                        }
-                    } else {
-                        this.log(`Skipping re-send for ${data.path} — conflict cooldown active`);
-                    }
-                } else {
-                    this.log(`Conflict resolved by 'role-based' (Secondary yields - adopting remote): ${data.path}`);
-                    this.ignoreNextEventForPath(existingFile.path);
-                    if (data.encoding === 'binary' || data.encoding === 'base64') {
-                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
-                    } else {
-                        await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
-                    }
-                    this.twoDeviceState.fileVersions[data.path] = data.versionVector || {};
-                }
-                break;
+        if (newerVersion(remote, local) === 'b') {
+            this.log(`Conflicting versions of ${data.path}: this device's is newer. Sending it back.`);
+            // Sent with our vector from BEFORE merging theirs, so the other device sees the
+            // same conflict, reaches the same verdict and keeps its own version as a copy.
+            // Merging first made ours look like a plain successor, and it overwrote its edit.
+            this.replyWithOurVersion(existingFile, fromPeer, localVV);
+            this.adoptVector(data.path, merged);
+            return;
+        }
 
-            case 'last-write-wins':
-                if (data.mtime > existingFile.stat.mtime) {
-                    this.log(`Conflict resolved by 'last-write-wins' (remote wins): ${data.path}`);
-                    this.ignoreNextEventForPath(existingFile.path);
-                    if (data.encoding === 'binary' || data.encoding === 'base64') {
-                        await this.app.vault.modifyBinary(existingFile, data.content as ArrayBuffer, { mtime: data.mtime });
-                    } else {
-                        await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
-                    }
-                } else {
-                    this.log(`Conflict resolved by 'last-write-wins' (local wins): ${data.path}`);
-                }
-                break;
-
-            case 'create-conflict-file':
-            default:
-                this.log(`Creating conflict file for: ${data.path}`);
-                await this.createConflictFile(data);
-                break;
+        // Only an edit made on this device is worth a copy here. A version that came from
+        // another device is kept by the device that made it, if it lost there; and content
+        // no edit here ever touched (vaults that differed before the plugin was installed)
+        // simply takes the newer version, so a first sync does not litter copies.
+        const keepCopy = this.getConflictStrategy() === 'newest-with-copy'
+            && hasOwnUnseenEdit(localVV, remoteVV, this.settings.deviceId);
+        this.log(`Conflicting versions of ${data.path}: the other device's is newer.${keepCopy ? ' Keeping ours as a conflict copy.' : ''}`);
+        const copy = keepCopy ? await this.createConflictCopy(data.path, localContent) : null;
+        await this.writeRemoteVersion(existingFile, data);
+        this.adoptVector(data.path, merged);
+        if (copy) {
+            const from = this.clusterPeers.get(fromPeer ?? '')?.friendlyName || 'another device';
+            this.showNotice(`${existingFile.name} was also changed on ${from}. The newer version was kept; this device's version is saved as ${copy.split('/').pop()} — use “Resolve sync conflicts” to compare them.`, 'important', 12000);
         }
     }
 
-    async applyFileBatchBinary(data: FileBatchBinaryPayload): Promise<{ succeeded: string[], failed: string[] }> {
+    /**
+     * Send our version of `file` to `peer` (the device that just sent an older or losing one),
+     * with `vector` rather than whatever the file's vector is by the time the send runs.
+     * Rate-limited per path and peer: two devices answering each other must not loop.
+     */
+    private replyWithOurVersion(file: TFile, peer: string | undefined, vector: VersionVector) {
+        if (!peer) return;
+        const key = `${peer}\0${file.path}`;
+        const now = Date.now();
+        if ((this.replyCooldowns.get(key) ?? 0) > now) {
+            this.log(`Not answering ${peer} about ${file.path} again so soon.`);
+            return;
+        }
+        for (const [k, until] of this.replyCooldowns) if (until <= now) this.replyCooldowns.delete(k);
+        this.replyCooldowns.set(key, now + 5000);
+        this.addToQueueTask(peer, { taskType: 'send-file', path: file.path, mtime: file.stat.mtime, forceFull: true, versionVector: { ...vector } });
+    }
+
+    private replyCooldowns = new Map<string, number>();
+
+    private adoptVector(path: string, vector: VersionVector) {
+        this.twoDeviceState.fileVersions[path] = vector;
+        this.scheduleStateSave();
+    }
+
+    async applyFileBatchBinary(data: FileBatchBinaryPayload, fromPeer?: string): Promise<{ succeeded: string[], failed: string[] }> {
         const results = { succeeded: [] as string[], failed: [] as string[] };
         // A Uint8Array body is parsed in place; unpackTLVToFiles slices out each file's
         // content, so nothing keeps the batch alive afterwards.
@@ -3590,6 +4079,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // renderer and can exhaust file handles.
         const BATCH_WRITE_CONCURRENCY = 8;
         const settled = await mapWithConcurrency(unpacked, BATCH_WRITE_CONCURRENCY, async (fileData) => {
+            const safePath = sanitizeVaultPath(fileData.path);
+            if (safePath === null) {
+                this.log(`Batch ${data.batchId}: dropping an entry with an unsafe path.`);
+                throw String(fileData.path);
+            }
+            fileData.path = safePath;
             try {
                 let contentStr = '';
                 let contentBuf: ArrayBuffer | null = null;
@@ -3628,7 +4123,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     // Already decompressed above; the TLV format carries no hash or version
                     // vector, so conflict resolution falls back to mtime comparison.
                     compressed: false,
-                } as FileUpdatePayload);
+                } as FileUpdatePayload, fromPeer);
 
                 // Progress is counted once, in handleBatchComplete, which is authoritative for
                 // the batch. Counting here too made the UI report up to twice filesTotal.
@@ -3650,62 +4145,112 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return results;
     }
 
-    async createConflictFile(data: FileUpdatePayload) {
+    /**
+     * Write `content` to a fresh "(conflict on DATE)" path next to `originalPath` and list it in
+     * the Conflict Center. Returns the copy's path, or null if none could be made.
+     */
+    private async createConflictCopy(originalPath: string, content: string | ArrayBuffer | Uint8Array): Promise<string | null> {
         // getConflictPath is string surgery on a peer-supplied path, so validate before it
         // is used to create anything.
-        if (!this.isPathSyncable(data.path)) return;
-        const conflictPath = this.getConflictPath(data.path);
-        if (!sanitizeVaultPath(conflictPath)) return;
-        this.ignoreNextEventForPath(conflictPath);
+        if (!this.isPathSyncable(originalPath)) return null;
+        const conflictPath = this.getConflictPath(originalPath);
+        if (!sanitizeVaultPath(conflictPath)) return null;
+        // Not silenced: the copy syncs like any note, so the losing edit is kept on every
+        // device and the conflict can be resolved from any of them.
         const folderPath = conflictPath.substring(0, conflictPath.lastIndexOf('/'));
         if (folderPath) await this.ensureFolderExists(folderPath);
-        if (data.encoding === 'binary' || data.encoding === 'base64') {
-            await this.app.vault.createBinary(conflictPath, data.content as ArrayBuffer);
+        if (typeof content === 'string') {
+            await this.app.vault.create(conflictPath, content);
         } else {
-            await this.app.vault.create(conflictPath, data.content as string);
+            await this.app.vault.createBinary(conflictPath, toExactArrayBuffer(content));
         }
-        this.conflictCenter.addConflict(data.path, conflictPath);
-        this.showNotice(`Conflict on ${data.path}. Open Conflict Center (left ribbon, or “Resolve sync conflicts”) to choose a version.`, 'important', 12000);
+        this.conflictCenter.addConflict(originalPath, conflictPath);
+        return conflictPath;
     }
 
-    async applyFileDelete(data: FileDeletePayload) {
-        if (!this.isPathSyncable(data.path)) return;
-        await this.runLocked(data.path, async () => {
-            if (this.isTwoDeviceMode() && data.versionVector) {
-                const localVV = this.twoDeviceState.fileVersions[data.path] || {};
-                const remoteVV = data.versionVector;
-                const isRemoteNewer = this.isNewerThan(remoteVV, localVV);
+    /**
+     * Remove something because a peer asked to, into whichever trash the user configured
+     * (Settings → Files and links → Deleted files), so a mistaken or hostile request is
+     * recoverable. These used to be permanent vault.delete() calls.
+     */
+    private async trashForPeer(file: TAbstractFile) {
+        this.ignoreNextEventForPath(file.path);
+        await this.app.fileManager.trashFile(file);
+    }
 
-                if (!isRemoteNewer) {
-                    // Local edit wins (local is strictly newer, or there's a concurrent conflict).
-                    // We merge the remote vector, increment local version, and push the local file back to the peer.
-                    this.log(`Edit-vs-delete conflict: local edit wins for ${data.path}`);
-                    const merged = this.mergeVersions(localVV, remoteVV);
-                    merged[this.settings.deviceId] = (merged[this.settings.deviceId] || 0) + 1;
-                    this.twoDeviceState.fileVersions[data.path] = merged;
-                    this.scheduleStateSave();
-
-                    const file = this.app.vault.getAbstractFileByPath(data.path);
-                    if (file instanceof TFile && this.twoDevicePeerId) {
-                        this.sendFileUpdate(file, this.twoDevicePeerId, true);
-                    }
-                    return;
-                } else {
-                    // Remote delete dominates. Update version vector to reflect the deletion.
-                    this.twoDeviceState.fileVersions[data.path] = remoteVV;
-                    this.scheduleStateSave();
+    /** Every file and folder below `folder`, split by whether this device syncs it. */
+    private collectFolderContents(folder: TFolder) {
+        const files: TFile[] = [];
+        const folders: TFolder[] = [];
+        let hasOutOfScope = false;
+        const walk = (current: TFolder) => {
+            for (const child of current.children) {
+                if (child instanceof TFile) {
+                    if (this.isPathSyncable(child.path)) files.push(child);
+                    else hasOutOfScope = true;
+                } else if (child instanceof TFolder) {
+                    folders.push(child);
+                    if (!this.isPathSyncable(child.path)) hasOutOfScope = true;
+                    walk(child);
                 }
             }
+        };
+        walk(folder);
+        return { files, folders, hasOutOfScope };
+    }
 
-            this.tombstones[data.path] = Date.now();
+    async applyFileDelete(data: FileDeletePayload, fromPeer?: string) {
+        if (!this.isPathSyncable(data.path)) return;
+        await this.runLocked(data.path, async () => {
+            const existingFile = this.app.vault.getAbstractFileByPath(data.path);
+            // A file-delete names one file. If a folder sits at that path, deleting it would
+            // take its whole contents along.
+            if (existingFile && !(existingFile instanceof TFile)) {
+                this.log(`Ignoring file-delete for ${data.path}: it is a folder here.`);
+                return;
+            }
+
+            const localVV = this.twoDeviceState.fileVersions[data.path] || {};
+            const remoteVV = data.versionVector || {};
+            const merged = mergeVectors(localVV, remoteVV);
+
+            if (!existingFile) {
+                // Already gone here (the same deletion arriving twice, or deleted on both
+                // sides): nothing to defend, just record what the peer knows.
+                this.adoptVector(data.path, merged);
+                if (this.tombstones[data.path] === undefined) {
+                    this.tombstones[data.path] = data.deletedAt ?? Date.now();
+                    this.scheduleStateSave();
+                }
+                return;
+            }
+
+            // Edit versus delete: the vectors decide when one side saw the other's change;
+            // otherwise the later of the edit and the deletion wins, on both devices. Only a
+            // deletion from an older peer, which says neither when nor what it deleted, is
+            // applied as it stands.
+            const deletion: VersionInfo = { mtime: data.deletedAt ?? 0, vv: remoteVV, deviceId: this.realDeviceId(fromPeer) };
+            const ours: VersionInfo = { mtime: existingFile.stat.mtime, vv: localVV, deviceId: this.settings.deviceId };
+            const legacy = data.deletedAt === undefined && compareVectors(remoteVV, localVV) !== 'before';
+            if (!legacy && pickVersion(deletion, ours) === 'b') {
+                this.log(`Keeping ${data.path}: it was changed here after the other device deleted it.`);
+                this.replyWithOurVersion(existingFile, fromPeer, localVV);
+                this.adoptVector(data.path, merged);
+                return;
+            }
+            if (hasOwnUnseenEdit(localVV, remoteVV, this.settings.deviceId)) {
+                const from = this.clusterPeers.get(fromPeer ?? '')?.friendlyName || 'another device';
+                this.showNotice(`${existingFile.name} was deleted on ${from} after it was changed here. This device's version is in the trash.`, 'important', 12000);
+            }
+            this.adoptVector(data.path, merged);
+
+            this.tombstones[data.path] = data.deletedAt ?? Date.now();
             this.scheduleStateSave();
             this.syncedHashes.delete(data.path);
-            const existingFile = this.app.vault.getAbstractFileByPath(data.path);
             if (existingFile) {
                 try {
                     this.log(`Deleting file: ${data.path}`);
-                    this.ignoreNextEventForPath(data.path);
-                    await this.app.vault.delete(existingFile);
+                    await this.trashForPeer(existingFile);
                 } catch (e) {
                     console.error(`Error deleting file: ${data.path}`, e);
                     this.showNotice(`Could not delete ${data.path} on this device.`, 'error');
@@ -3714,89 +4259,167 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         });
     }
 
-    async applyFileRename(data: FileRenamePayload) { 
-        if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; 
+    async applyFileRename(data: FileRenamePayload, conn?: DataConnection | null) {
+        // Both ends must be in scope here. Requiring only one let a peer move a synced note
+        // into the config folder (plugin code), or move an excluded note into a synced folder
+        // and then simply ask for it.
+        if (!this.isPathSyncable(data.oldPath) || !this.isPathSyncable(data.newPath)) {
+            this.log(`Ignoring rename ${data.oldPath} -> ${data.newPath}: outside this device's sync scope.`);
+            return;
+        }
         const [firstLock, secondLock] = [data.oldPath, data.newPath].sort();
         await this.runLocked(firstLock, async () => {
             await this.runLocked(secondLock, async () => {
-                const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath); 
-                if (fileToRename instanceof TFile) { 
-                    try { 
-                        this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`); 
-                        this.ignoreNextEventForPath(data.newPath); 
-                        const cached = this.syncedHashes.get(data.oldPath); 
-                        if (cached) { 
-                            this.syncedHashes.set(data.newPath, cached); 
-                            this.syncedHashes.delete(data.oldPath); 
-                        } 
-                        if (data.versionVector) {
-                            this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
-                            delete this.twoDeviceState.fileVersions[data.oldPath];
-                        }
-                        this.scheduleStateSave(); 
-                        await this.app.vault.rename(fileToRename, data.newPath); 
-                    } catch (e) { 
-                        console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); 
-                        this.showNotice(`Could not rename ${data.oldPath} on this device.`, 'error'); 
-                    } 
-                } else {
-                    const newFile = this.app.vault.getAbstractFileByPath(data.newPath);
-                    if (newFile instanceof TFile && data.versionVector) {
-                        this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
-                        delete this.twoDeviceState.fileVersions[data.oldPath];
-                        this.scheduleStateSave();
+                const fileToRename = this.app.vault.getAbstractFileByPath(data.oldPath);
+                const target = this.app.vault.getAbstractFileByPath(data.newPath);
+                if (fileToRename instanceof TFile && !target) {
+                    try {
+                        this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`);
+                        this.ignoreNextEventForPath(data.oldPath);
+                        this.ignoreNextEventForPath(data.newPath);
+                        this.moveFileRecords(data.oldPath, data.newPath, data.versionVector);
+                        const parent = data.newPath.substring(0, data.newPath.lastIndexOf('/'));
+                        if (parent) await this.ensureFolderExists(parent);
+                        await this.app.vault.rename(fileToRename, data.newPath);
+                    } catch (e) {
+                        console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e);
+                        this.showNotice(`Could not rename ${data.oldPath} on this device.`, 'error');
                     }
+                } else if (target instanceof TFile) {
+                    // Already renamed here (or the rename arrived after the file itself).
+                    if (data.versionVector) {
+                        this.adoptVector(data.newPath, mergeVectors(this.twoDeviceState.fileVersions[data.newPath], data.versionVector));
+                        delete this.twoDeviceState.fileVersions[data.oldPath];
+                    }
+                } else if (!fileToRename && !target && conn) {
+                    // We never had the file under its old name, so there is nothing to move.
+                    // Ask for it under the new one instead of silently missing it.
+                    this.sendDirect(conn, { type: 'request-file', path: data.newPath });
                 }
             });
         });
     }
 
-    async applyFolderCreate(data: FolderCreatePayload) { 
-        if (!this.isPathSyncable(data.path)) return; 
+    /**
+     * Carry a file's cached hash and version vector over to its new path, and record the old
+     * path as deleted. Without that tombstone a device that missed the rename still had the
+     * old name, nothing said it was gone, and a full sync sent it back as a duplicate.
+     */
+    private moveFileRecords(oldPath: string, newPath: string, versionVector?: VersionVector) {
+        const cached = this.syncedHashes.get(oldPath);
+        if (cached) {
+            this.syncedHashes.set(newPath, cached);
+            this.syncedHashes.delete(oldPath);
+            this.hashCacheDirty = true;
+        }
+        // Merged, not replaced: a peer's rename of a note edited here must not forget that edit.
+        const vector = mergeVectors(this.twoDeviceState.fileVersions[oldPath], versionVector);
+        if (Object.keys(vector).length) this.twoDeviceState.fileVersions[newPath] = vector;
+        delete this.twoDeviceState.fileVersions[oldPath];
+        this.tombstones[oldPath] = Date.now();
+        delete this.tombstones[newPath];
+        this.scheduleStateSave();
+    }
+
+    async applyFolderCreate(data: FolderCreatePayload) {
+        if (!this.isPathSyncable(data.path)) return;
         await this.runLocked(data.path, async () => {
-            if (this.app.vault.getAbstractFileByPath(data.path)) return; 
-            this.log(`Creating folder: ${data.path}`); 
-            this.ignoreNextEventForPath(data.path); 
-            try { 
-                await this.app.vault.createFolder(data.path); 
-            } catch (e) { 
-                console.error(`Failed to create folder ${data.path}`, e); 
-            } 
+            if (this.app.vault.getAbstractFileByPath(data.path)) return;
+            this.log(`Creating folder: ${data.path}`);
+            this.ignoreNextEventForPath(data.path);
+            try {
+                await this.app.vault.createFolder(data.path);
+            } catch (e) {
+                console.error(`Failed to create folder ${data.path}`, e);
+            }
         });
     }
 
-    async applyFolderDelete(data: FolderDeletePayload) { 
-        if (!this.isPathSyncable(data.path)) return; 
+    /**
+     * Delete a folder the peer deleted — but only what this device syncs. The peer never saw
+     * anything this device keeps out of sync (an excluded subfolder, say), and a recursive
+     * delete used to destroy that local-only content along with the rest.
+     */
+    async applyFolderDelete(data: FolderDeletePayload) {
+        if (!this.isPathSyncable(data.path)) return;
         await this.runLocked(data.path, async () => {
-            const folder = this.app.vault.getAbstractFileByPath(data.path); 
-            if (folder instanceof TFolder) { 
-                this.log(`Deleting folder: ${data.path}`); 
-                this.ignoreNextEventForPath(data.path, 5000); 
-                try { 
-                    await this.app.vault.delete(folder, true); 
-                } catch (e) { 
-                    console.error(`Failed to delete folder ${data.path}`, e); 
-                } 
-            } 
+            const folder = this.app.vault.getAbstractFileByPath(data.path);
+            if (!(folder instanceof TFolder) || folder.isRoot()) return;
+            const { files, folders, hasOutOfScope } = this.collectFolderContents(folder);
+            this.log(`Deleting folder: ${data.path}${hasOutOfScope ? ' (keeping content this device does not sync)' : ''}`);
+
+            const now = Date.now();
+            for (const file of files) {
+                // Record each deletion, so a third device still holding the file cannot bring
+                // it back through a later full sync.
+                this.tombstones[file.path] = now;
+                this.syncedHashes.delete(file.path);
+            }
+            this.scheduleStateSave();
+
+            try {
+                if (hasOutOfScope) {
+                    for (const file of files) await this.trashForPeer(file);
+                } else {
+                    for (const sub of folders) this.ignoreNextEventForPath(sub.path, 5000);
+                    for (const file of files) this.ignoreNextEventForPath(file.path, 5000);
+                    this.ignoreNextEventForPath(folder.path, 5000);
+                    await this.app.fileManager.trashFile(folder);
+                }
+            } catch (e) {
+                console.error(`Failed to delete folder ${data.path}`, e);
+                this.showNotice(`Could not delete the folder ${data.path} on this device.`, 'error');
+            }
         });
     }
 
-    async applyFolderRename(data: FolderRenamePayload) { 
-        if (!this.isPathSyncable(data.oldPath) && !this.isPathSyncable(data.newPath)) return; 
+    async applyFolderRename(data: FolderRenamePayload) {
+        if (!this.isPathSyncable(data.oldPath) || !this.isPathSyncable(data.newPath)) {
+            this.log(`Ignoring folder rename ${data.oldPath} -> ${data.newPath}: outside this device's sync scope.`);
+            return;
+        }
         const [firstLock, secondLock] = [data.oldPath, data.newPath].sort();
         await this.runLocked(firstLock, async () => {
             await this.runLocked(secondLock, async () => {
-                const folder = this.app.vault.getAbstractFileByPath(data.oldPath); 
-                if (folder instanceof TFolder) { 
-                    this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`); 
-                    this.ignoreNextEventForPath(data.oldPath); 
-                    this.ignoreNextEventForPath(data.newPath); 
-                    try { 
-                        await this.app.vault.rename(folder, data.newPath); 
-                    } catch (e) { 
-                        console.error(`Failed to rename folder ${data.oldPath}`, e); 
-                    } 
-                } 
+                const folder = this.app.vault.getAbstractFileByPath(data.oldPath);
+                if (!(folder instanceof TFolder) || folder.isRoot()) return;
+                if (this.app.vault.getAbstractFileByPath(data.newPath)) {
+                    this.log(`Not renaming folder ${data.oldPath}: ${data.newPath} already exists.`);
+                    return;
+                }
+                const { files, folders, hasOutOfScope } = this.collectFolderContents(folder);
+                const moved = (path: string) => data.newPath + path.slice(data.oldPath.length);
+                this.log(`Renaming folder: ${data.oldPath} -> ${data.newPath}`);
+                try {
+                    if (hasOutOfScope) {
+                        // Moving the whole folder would carry content this device keeps out of
+                        // sync into the new location — possibly one it does sync. Move only
+                        // what the peer knows about.
+                        for (const file of files) {
+                            const target = moved(file.path);
+                            const parent = target.substring(0, target.lastIndexOf('/'));
+                            if (parent) await this.ensureFolderExists(parent);
+                            this.ignoreNextEventForPath(file.path);
+                            this.ignoreNextEventForPath(target);
+                            this.moveFileRecords(file.path, target);
+                            await this.app.vault.rename(file, target);
+                        }
+                    } else {
+                        this.ignoreNextEventForPath(data.oldPath);
+                        this.ignoreNextEventForPath(data.newPath);
+                        for (const item of [...files, ...folders]) {
+                            this.ignoreNextEventForPath(item.path);
+                            this.ignoreNextEventForPath(moved(item.path));
+                        }
+                        for (const file of files) this.moveFileRecords(file.path, moved(file.path));
+                        const parent = data.newPath.substring(0, data.newPath.lastIndexOf('/'));
+                        if (parent) await this.ensureFolderExists(parent);
+                        await this.app.vault.rename(folder, data.newPath);
+                    }
+                    this.forgetKnownFolders(data.oldPath);
+                } catch (e) {
+                    console.error(`Failed to rename folder ${data.oldPath}`, e);
+                }
             });
         });
     }
@@ -3831,7 +4454,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.resetIdleTimeout();
         
         try {
-            const localManifest = await this.buildVaultManifest(); 
+            const localManifest = await this.buildVaultManifest();
+            // Remember what we advertised: the plan may only delete files named here, and only
+            // while they are unchanged since.
+            this.sentManifestMtimes = new Map(
+                localManifest.filter(e => e.type === 'file').map(e => [e.path, (e as FileManifestEntry).mtime])
+            );
             this.log(`Sending sync request with ${localManifest.length} items.`); 
             await this.sendSyncMessage(peerId, { type: 'request-full-sync', manifest: localManifest }); 
         } catch (e) {
@@ -3855,77 +4483,86 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
     
+    /** The node at `path` in a Merkle tree ('' is the root), or null if the tree has none. */
+    private merkleNodeAt(tree: MerkleNode, path: string): MerkleNode | null {
+        if (path === '') return tree;
+        let node: MerkleNode = tree;
+        for (const part of path.split('/')) {
+            const next = node.children?.[part];
+            if (!next) return null;
+            node = next;
+        }
+        return node;
+    }
+
     async handleMerkleNodeRequest(data: MerkleNodeRequestPayload, conn: DataConnection) {
         this.resetIdleTimeout();
         const tree = this.twoDeviceState.merkleTreeRoot;
-        if (!tree) return;
-        
-        let targetNode = tree;
-        if (data.path !== '') {
-            const parts = data.path.split('/');
-            for (const p of parts) {
-                if (targetNode.children && targetNode.children[p]) {
-                    targetNode = targetNode.children[p];
-                } else {
-                    return; // Node not found
-                }
-            }
-        }
-        
+        if (!tree || typeof data.path !== 'string') return;
+        const targetNode = this.merkleNodeAt(tree, data.path);
+        if (!targetNode) return;
+
         const childHashes: Record<string, string> = {};
+        const folders: string[] = [];
         if (targetNode.children) {
             for (const [key, node] of Object.entries(targetNode.children)) {
                 childHashes[key] = node.hash;
+                if (node.children) folders.push(key);
             }
         }
-        this.sendData(conn.peer, { type: 'merkle-node-response', path: data.path, children: childHashes });
+        this.sendData(conn.peer, { type: 'merkle-node-response', path: data.path, children: childHashes, folders });
     }
-    
+
     async handleMerkleNodeResponse(data: MerkleNodeResponsePayload, conn: DataConnection) {
         this.resetIdleTimeout();
         const tree = this.twoDeviceState.merkleTreeRoot;
-        if (!tree) return;
-        
-        let targetNode = tree;
-        if (data.path !== '') {
-            const parts = data.path.split('/');
-            for (const p of parts) {
-                if (targetNode.children && targetNode.children[p]) targetNode = targetNode.children[p];
-            }
-        }
-        
-        const myChildren = targetNode.children || {};
+        if (!tree || typeof data.path !== 'string' || !data.children || typeof data.children !== 'object') return;
+
+        // A folder we do not have compares against nothing. This used to stop at the deepest
+        // folder we DID have and compare the peer's children against that folder's, sending
+        // requests for paths that exist on neither side.
+        const myChildren = this.merkleNodeAt(tree, data.path)?.children ?? {};
         const remoteChildren = data.children;
-        
+        // Which of the peer's children are folders. Older peers do not say, and the fallback
+        // guessed from a dot in the name — so a folder like "v1.2" was requested as a file
+        // and an extension-less file as a folder, and neither ever synced.
+        const remoteFolders = Array.isArray(data.folders) ? new Set(data.folders) : null;
+
         const allKeys = new Set([...Object.keys(myChildren), ...Object.keys(remoteChildren)]);
-        
+
         for (const key of allKeys) {
-            const myHash = myChildren[key]?.hash;
+            const myNode = myChildren[key];
+            const myHash = myNode?.hash;
             const remoteHash = remoteChildren[key];
+            if (myHash === remoteHash) continue;
             const fullPath = data.path ? `${data.path}/${key}` : key;
-            
-            if (myHash !== remoteHash) {
-                const file = this.app.vault.getAbstractFileByPath(fullPath);
-                if (file instanceof TFolder || (!file && !fullPath.includes('.'))) {
-                    this.sendData(conn.peer, { type: 'merkle-node-request', path: fullPath });
+            if (sanitizeVaultPath(fullPath) !== fullPath || !this.isPathSyncable(fullPath)) continue;
+
+            const file = this.app.vault.getAbstractFileByPath(fullPath);
+            const isFolder = file instanceof TFolder
+                || !!myNode?.children
+                || (remoteFolders ? remoteFolders.has(key) : (!file && !fullPath.includes('.')));
+            if (isFolder) {
+                this.sendData(conn.peer, { type: 'merkle-node-request', path: fullPath });
+            } else if (!myHash && remoteHash) {
+                if (!file && this.tombstones[fullPath] !== undefined) {
+                    // Deleted here while the devices were apart. Pulling it back would undo
+                    // the deletion; send the deletion instead and let the peer's version
+                    // vectors decide whether an edit it made since outranks it.
+                    this.addToQueueTask(conn.peer, { taskType: 'send-delete', path: fullPath });
                 } else {
-                    if (!myHash && remoteHash) {
-                        this.sendData(conn.peer, { type: 'request-file', path: fullPath });
-                    } else if (file instanceof TFile) {
-                        // Exchange BOTH directions: push ours and pull theirs. Each side's
-                        // conflict resolution (version vectors / role-based) then picks the
-                        // same winner deterministically. Pushing only our copy left the peer
-                        // stale whenever its version-vector dominated ours.
-                        //
-                        // forceFull is required: buildMerkleTree caches every file's content
-                        // hash in syncedHashes, and that cache is global rather than per-peer,
-                        // so the echo guard in processQueueItem would drop every reconciliation
-                        // send as a self-echo.
-                        this.sendFileUpdate(file, conn.peer, true);
-                        if (remoteHash) {
-                            this.sendData(conn.peer, { type: 'request-file', path: fullPath });
-                        }
-                    }
+                    this.sendData(conn.peer, { type: 'request-file', path: fullPath });
+                }
+            } else if (file instanceof TFile) {
+                // Exchange BOTH directions: push ours and pull theirs. Each side's conflict
+                // resolution then picks the same winner deterministically. Pushing only our
+                // copy left the peer stale whenever its version vector dominated ours.
+                //
+                // forceFull: the peer asked for this state explicitly, so it must never be
+                // dropped as an echo.
+                this.sendFileUpdate(file, conn.peer, true);
+                if (remoteHash) {
+                    this.sendData(conn.peer, { type: 'request-file', path: fullPath });
                 }
             }
         }
@@ -3936,7 +4573,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`Received a sync request from ${conn.peer}, but a sync is already in progress in phase ${this.syncState.currentPhase}. Declining.`);
             // Say so rather than going quiet. If both devices start a sync at the same moment
             // each was left waiting on the other until the 120 s planning timeout fired.
-            try { conn.send({ type: 'sync-busy' }); } catch (_) { /* peer already gone */ }
+            this.sendDirect(conn, { type: 'sync-busy' });
             return;
         }
         try {
@@ -3966,7 +4603,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.startSyncKeepAlive();
             this.resetIdleTimeout();
         
-            const remoteManifest = data.manifest; 
+            const remoteManifest = this.scopeRemoteManifest(data.manifest);
             const localManifest = await this.buildVaultManifest(); 
             const remoteIndex = new Map(remoteManifest.map(item => [item.path, item])); 
             const localIndex = new Map(localManifest.map(item => [item.path, item])); 
@@ -3976,6 +4613,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const filesReceiverMustDelete: string[] = [];
             const filesInitiatorMustDelete: string[] = [];
             const fileSizes: Record<string, number> = {};
+            // When, and with what vector, each side's winning deletions happened: recorded as
+            // the tombstone on the device that applies them, so a later comparison against an
+            // edit elsewhere uses the real deletion time rather than "when the sync ran".
+            const deletions: Record<string, { at: number; vv?: VersionVector }> = {};
+            const myDeletions = new Map<string, { at: number; vv?: VersionVector }>();
             
             const allPaths = new Set([...localIndex.keys(), ...remoteIndex.keys()]);
             
@@ -3994,7 +4636,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (localItem.type !== 'file' || remoteItem.type !== 'file') continue;
                 if (localItem.hash) continue;
                 if (localItem.size !== remoteItem.size) continue;
-                if (Math.abs(localItem.mtime - remoteItem.mtime) <= this.settings.mtimeTolerance) continue;
+                // Close times with no recorded edits on either side are taken as the same
+                // file below; everything else of equal size needs the hash to tell.
+                if (Math.abs(localItem.mtime - remoteItem.mtime) <= this.settings.mtimeTolerance
+                    && compareVectors(localItem.versionVector, remoteItem.versionVector) === 'equal') continue;
                 needsHash.push(path);
             }
 
@@ -4003,9 +4648,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await mapWithConcurrency(needsHash, 8, async (path) => {
                     const file = this.app.vault.getAbstractFileByPath(path);
                     if (!(file instanceof TFile)) return;
+                    const stat = { mtime: file.stat.mtime, size: file.stat.size };
                     const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
                     const hash = await this.getHash(content);
-                    this.updateHashCache(path, hash);
+                    this.updateHashCache(path, hash, stat);
                     const item = localIndex.get(path);
                     if (item && item.type === 'file') item.hash = hash;
                 });
@@ -4027,63 +4673,33 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         this.peerFileSizes[path] = remoteItem.size;
                     }
                 } else if (localItem && remoteItem) {
+                    if (localItem.type === 'folder' || remoteItem.type === 'folder') continue;
+                    // One rule for every pair, the same one each device applies on receipt:
+                    // the vectors decide when one side saw the other's change, otherwise the
+                    // more recent change wins (a deletion's time is when it happened). The
+                    // device receiving the winner keeps its own losing edit as a copy.
+                    const local: VersionInfo = { mtime: localItem.mtime, vv: localItem.versionVector, hash: localItem.hash, deviceId: this.settings.deviceId };
+                    const remote: VersionInfo = { mtime: remoteItem.mtime, vv: remoteItem.versionVector, hash: remoteItem.hash, deviceId: this.realDeviceId(conn.peer) };
                     if (localItem.type === 'file' && remoteItem.type === 'file') {
-                        let conflictResolved = false;
-                        if (this.currentSyncIsTwoDeviceMode && localItem.versionVector && remoteItem.versionVector) {
-                            const isLocalNewer = this.isNewerThan(localItem.versionVector, remoteItem.versionVector);
-                            const isRemoteNewer = this.isNewerThan(remoteItem.versionVector, localItem.versionVector);
-                            if (isLocalNewer && !isRemoteNewer) {
-                                filesReceiverWillSend.push(path);
-                                fileSizes[path] = localItem.size;
-                                conflictResolved = true;
-                            }
-                            else if (isRemoteNewer && !isLocalNewer) {
-                                filesInitiatorMustSend.push(path);
-                                this.peerFileSizes[path] = remoteItem.size;
-                                conflictResolved = true;
-                            }
-                            else if (!isLocalNewer && !isRemoteNewer) {
-                                if (localItem.hash && remoteItem.hash && localItem.hash === remoteItem.hash) {
-                                    conflictResolved = true;
-                                } else {
-                                    const role = this.getMyRole(conn.peer);
-                                    if (role === 'primary') {
-                                        filesReceiverWillSend.push(path);
-                                        fileSizes[path] = localItem.size;
-                                    } else {
-                                        filesInitiatorMustSend.push(path);
-                                        this.peerFileSizes[path] = remoteItem.size;
-                                    }
-                                    conflictResolved = true;
-                                }
-                            }
-                        } 
-                        
-                        if (!conflictResolved) {
-                            if (localItem.size !== remoteItem.size) {
-                                if (localItem.mtime > remoteItem.mtime) { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
-                                else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
-                            } else if (Math.abs(localItem.mtime - remoteItem.mtime) > this.settings.mtimeTolerance) {
-                                // Resolved by the concurrent pre-pass above; may still be
-                                // undefined if the file vanished in the meantime.
-                                const lHash = localItem.hash ?? this.syncedHashes.get(path)?.hash;
-                                if (remoteItem.hash && lHash === remoteItem.hash) {
-                                    // Match
-                                } else {
-                                    if (localItem.mtime > remoteItem.mtime) { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
-                                    else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
-                                }
-                            }
-                        }
-                    } else if (localItem.type === 'deleted' && remoteItem.type === 'file') {
-                        // Tombstone mtime = deletion time; file mtime = last modification time.
-                        // Comparing directly is intentional: if the file was modified AFTER it
-                        // was deleted on the other side, the newer modification takes precedence.
-                        if (localItem.mtime > remoteItem.mtime) filesInitiatorMustDelete.push(path);
+                        if (localItem.hash && remoteItem.hash && localItem.hash === remoteItem.hash) continue;
+                        // No recorded change on either side, same size, (nearly) the same time
+                        // and nothing to show the contents differ: the same file.
+                        if (compareVectors(localItem.versionVector, remoteItem.versionVector) === 'equal'
+                            && localItem.size === remoteItem.size
+                            && !(localItem.hash && remoteItem.hash)
+                            && Math.abs(localItem.mtime - remoteItem.mtime) <= this.settings.mtimeTolerance) continue;
+                        if (pickVersion(local, remote) === 'a') { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
                         else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
+                    } else if (localItem.type === 'deleted' && remoteItem.type === 'file') {
+                        if (pickVersion(local, remote) === 'a') {
+                            filesInitiatorMustDelete.push(path);
+                            deletions[path] = { at: localItem.mtime, vv: localItem.versionVector };
+                        } else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
                     } else if (localItem.type === 'file' && remoteItem.type === 'deleted') {
-                        if (remoteItem.mtime > localItem.mtime) filesReceiverMustDelete.push(path);
-                        else { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
+                        if (pickVersion(local, remote) === 'b') {
+                            filesReceiverMustDelete.push(path);
+                            myDeletions.set(path, { at: remoteItem.mtime, vv: remoteItem.versionVector });
+                        } else { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
                     }
                 }
             }
@@ -4098,28 +4714,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log("Vaults are completely identical. No sync needed.");
             }
             
-            await this.sendSyncMessage(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes }); ; 
+            await this.sendSyncMessage(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes, deletions });
             
             for (const path of filesReceiverMustDelete) {
-                await this.runLocked(path, async () => {
-                    const file = this.app.vault.getAbstractFileByPath(path);
-                    if (file) {
-                        try {
-                            this.ignoreNextEventForPath(path);
-                            await this.app.vault.delete(file);
-                            this.syncedHashes.delete(path);
-                            if (this.isTwoDeviceMode()) {
-                                this.incrementVersion(path);
-                            }
-                            this.tombstones[path] = Date.now();
-                            this.scheduleStateSave();
-                        } catch (e) {
-                            this.log(`Failed to delete file ${path}:`, e);
-                        }
-                    }
-                });
+                const entry = localIndex.get(path);
+                await this.deleteForSyncPlan(path, entry && entry.type !== 'folder' ? entry.mtime : undefined, myDeletions.get(path));
             }
-            
+
             this.syncState.allowedPulls = new Set(filesReceiverWillSend);
             this.syncState.pendingPulls = new Set(filesInitiatorMustSend);
             this.initPullOrder(this.syncState.pendingPulls);
@@ -4130,6 +4731,65 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
     
+    /** Paths and mtimes of the files in the manifest we last sent with request-full-sync. */
+    private sentManifestMtimes: Map<string, number> = new Map();
+
+    /**
+     * The peer's manifest, reduced to well-formed entries inside this device's sync scope.
+     * Anything else would be pulled only to be refused on arrival — and counted as synced.
+     */
+    private scopeRemoteManifest(manifest: unknown): VaultManifest {
+        if (!Array.isArray(manifest)) {
+            throw new SyncError(SyncErrorCategory.PROTOCOL_ERROR, "Received an invalid manifest.", false, "Update the plugin on both devices.");
+        }
+        const scoped: VaultManifest = [];
+        for (const item of manifest) {
+            if (!item || typeof item !== 'object') continue;
+            const path = sanitizeVaultPath(item.path);
+            if (path === null || !this.isPathSyncable(path)) continue;
+            if (item.type === 'folder') {
+                scoped.push({ type: 'folder', path });
+            } else if (item.type === 'file' || item.type === 'deleted') {
+                const mtime = Number(item.mtime);
+                const size = Number(item.size);
+                if (!Number.isFinite(mtime) || !Number.isFinite(size)) continue;
+                const hash = typeof item.hash === 'string' && item.hash.length <= 256 ? item.hash : undefined;
+                scoped.push({ type: item.type, path, mtime, size, hash, versionVector: sanitizeVersionVector(item.versionVector) });
+            }
+        }
+        return scoped;
+    }
+
+    /**
+     * Delete a file because a sync plan says it was deleted elsewhere — only if it is a file
+     * this device syncs and it still has the mtime the plan was computed from, so an edit
+     * made while the plan was in flight survives.
+     */
+    private async deleteForSyncPlan(path: string, expectedMtime: number | undefined, deletion?: { at: number; vv?: VersionVector }) {
+        await this.runLocked(path, async () => {
+            const file = this.app.vault.getAbstractFileByPath(path);
+            if (!(file instanceof TFile) || !this.isPathSyncable(path)) {
+                this.log(`Sync plan: not deleting ${path} (not a synced file here).`);
+                return;
+            }
+            if (expectedMtime === undefined || file.stat.mtime !== expectedMtime) {
+                this.log(`Sync plan: not deleting ${path} (changed since the manifest, or never advertised).`);
+                return;
+            }
+            try {
+                this.syncedHashes.delete(path);
+                // Record the deletion as the other device made it, not as a new one here.
+                if (deletion?.vv) this.adoptVector(path, mergeVectors(this.twoDeviceState.fileVersions[path], deletion.vv));
+                else this.incrementVersion(path);
+                this.tombstones[path] = deletion?.at ?? Date.now();
+                this.scheduleStateSave();
+                await this.trashForPeer(file);
+            } catch (e) {
+                this.log(`Failed to delete file ${path}:`, e);
+            }
+        });
+    }
+
     async handleSyncPlan(data: SyncPlanPayload, conn: DataConnection) {
         if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
         if (this.syncState.currentPhase !== SyncPhase.PLANNING && this.syncState.currentPhase !== SyncPhase.REQUESTING) {
@@ -4145,34 +4805,36 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`Sync plan: I must pull ${data.filesReceiverWillSend.length}, They pull ${data.filesInitiatorMustSend.length}`); 
             this.syncState.filesTotal = data.filesReceiverWillSend.length + data.filesInitiatorMustSend.length;
             
-            for (const path of data.filesInitiatorMustDelete || []) {
-                await this.runLocked(path, async () => {
-                    const file = this.app.vault.getAbstractFileByPath(path);
-                    if (file) {
-                        try {
-                            this.ignoreNextEventForPath(path);
-                            await this.app.vault.delete(file);
-                            this.syncedHashes.delete(path);
-                            if (this.isTwoDeviceMode()) {
-                                this.incrementVersion(path);
-                            }
-                            this.tombstones[path] = Date.now();
-                            this.scheduleStateSave();
-                        } catch (e) {
-                            this.log(`Failed to delete file ${path}:`, e);
-                        }
-                    }
-                });
+            // The plan is the peer's word, so each deletion is checked against what WE
+            // advertised: a path we never sent, a folder, anything outside our scope, or a file
+            // edited since the manifest went out is left alone. These deletes used to run
+            // unchecked — any path, folders included.
+            for (const raw of Array.isArray(data.filesInitiatorMustDelete) ? data.filesInitiatorMustDelete : []) {
+                const path = sanitizeVaultPath(raw);
+                const deletion = path && data.deletions && typeof data.deletions === 'object' ? data.deletions[raw] : undefined;
+                if (path) await this.deleteForSyncPlan(path, this.sentManifestMtimes.get(path),
+                    deletion && Number.isFinite(deletion.at) ? { at: deletion.at, vv: sanitizeVersionVector(deletion.vv) } : undefined);
             }
-            
-            const receiverWillSendSet = new Set(data.filesReceiverWillSend);
-            for (const [path, size] of Object.entries(data.fileSizes)) {
+
+            // Pull only what this device syncs: anything else would be refused on arrival yet
+            // counted as received.
+            const inScope = (paths: unknown): string[] => (Array.isArray(paths) ? paths : [])
+                .map(p => sanitizeVaultPath(p))
+                .filter((p): p is string => p !== null && this.isPathSyncable(p));
+            const willPull = inScope(data.filesReceiverWillSend);
+            const willServe = inScope(data.filesInitiatorMustSend);
+            this.syncState.filesTotal = willPull.length + willServe.length;
+
+            const willPullSet = new Set(willPull);
+            const sizes = data.fileSizes && typeof data.fileSizes === 'object' ? data.fileSizes : {};
+            for (const [path, size] of Object.entries(sizes)) {
+                if (typeof size !== 'number' || !Number.isFinite(size)) continue;
                 this.peerFileSizes[path] = size;
-                if (receiverWillSendSet.has(path)) this.syncState.bytesTotal += size;
+                if (willPullSet.has(path)) this.syncState.bytesTotal += size;
             }
-            
-            this.syncState.allowedPulls = new Set(data.filesInitiatorMustSend);
-            this.syncState.pendingPulls = new Set(data.filesReceiverWillSend);
+
+            this.syncState.allowedPulls = new Set(willServe);
+            this.syncState.pendingPulls = willPullSet;
             this.initPullOrder(this.syncState.pendingPulls);
 
             this.requestNextBatch(conn.peer);
@@ -4431,23 +5093,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
     
+    /**
+     * `full-sync-complete` means "I will request nothing more". Each side sends it once its own
+     * pulls are settled, and the sync ends when both have said so and nothing is still being
+     * served. It used to wait until the peer had also taken everything we allowed — but a
+     * file the peer gave up on after three failures stayed allowed forever, so neither side
+     * ever finished and one bad file ended every full sync in a timeout error.
+     */
     checkFullSyncCompletion(peerId: string) {
+        if (!this.syncState.isSyncing) return;
         const pending = this.syncState.pendingPulls;
-        const allowed = this.syncState.allowedPulls;
         const activeBatches = this.syncState.activeBatches;
-        
-        // Only declare complete when no pulls are pending, no pulls are allowed, AND
-        // no batches are still in-flight (being sent by the peer).
-        if ((!pending || pending.size === 0) && (!allowed || allowed.size === 0) && (!activeBatches || activeBatches.size === 0)) {
-            if (this.syncState.currentPhase !== SyncPhase.COMPLETING) {
-                this.transitionToPhase(SyncPhase.COMPLETING);
-            }
-            if (!this.localSyncComplete.get(peerId)) {
-                this.localSyncComplete.set(peerId, true);
-                this.sendSyncMessage(peerId, { type: 'full-sync-complete' }).catch(e => this.abortSync(e));
-            }       
+
+        if ((!pending || pending.size === 0) && !this.localSyncComplete.get(peerId)) {
+            this.localSyncComplete.set(peerId, true);
+            this.sendSyncMessage(peerId, { type: 'full-sync-complete' }).catch(e => this.abortSync(e));
         }
-        
+
         if (this.localSyncComplete.get(peerId) && this.peerSyncComplete.get(peerId) && (!activeBatches || activeBatches.size === 0)) {
             this.transitionToPhase(SyncPhase.COMPLETING);
             this.handleFullSyncComplete();
@@ -4474,6 +5136,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.peerSyncComplete.clear();
         this.syncState.peerId = null;
         this.peerFileSizes = {};
+        this.sentManifestMtimes = new Map();
         this.processQueue();
         this.updateStatus(); 
         this.showNotice(`Sync complete. Transferred ${this.syncState.filesTransferred} files.`, 'important'); 
@@ -4501,7 +5164,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // Yield on a time budget rather than every 50 files. A 20k-file vault produced
         // ~400 macrotask yields, and browser timer clamping turned that into seconds of
         // pure scheduling latency inside a phase that has a 120 s timeout.
-        const twoDevice = this.currentSyncIsTwoDeviceMode ?? this.isTwoDeviceMode();
         let count = 0;
         let lastYield = Date.now();
         for (const file of allFiles) {
@@ -4509,8 +5171,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (file instanceof TFolder) {
                     if (file.path !== '/') manifest.push({ type: 'folder', path: file.path });
                 } else if (file instanceof TFile) {
-                    const hash = this.syncedHashes.get(file.path)?.hash;
-                    const vv = twoDevice ? this.twoDeviceState.fileVersions[file.path] : undefined;
+                    const hash = this.cachedHashFor(file);
+                    const vv = this.twoDeviceState.fileVersions[file.path];
                     manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash, versionVector: vv });
                     count++;
 
@@ -4529,7 +5191,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const livePaths = new Set(manifest.map(entry => entry.path));
         for (const [path, timestamp] of Object.entries(this.tombstones)) {
             if (livePaths.has(path)) continue;
-            manifest.push({ type: 'deleted', path, mtime: timestamp, size: 0 });
+            manifest.push({ type: 'deleted', path, mtime: timestamp, size: 0, versionVector: this.twoDeviceState.fileVersions[path] });
         }
         return manifest;
     }
@@ -4542,10 +5204,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public isPathSyncable(path: string): boolean {
-        // Evaluate the rules against the normalised path. Every check below is a prefix
-        // comparison, so './.obsidian/plugins/x' would otherwise slip past the '.obsidian/'
-        // guard while still resolving into the config folder — and '../' would escape the
-        // vault entirely. sanitizeVaultPath rejects the latter outright.
+        // Evaluate the rules against the normalised path: './.obsidian/plugins/x' must not slip
+        // past a prefix check while resolving into the config folder, and '../' must never
+        // escape the vault. sanitizeVaultPath rejects the latter outright.
         const safePath = sanitizeVaultPath(path);
         if (safePath === null) {
             this.log(`Rejected unsafe path: ${JSON.stringify(path)}`);
@@ -4553,25 +5214,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         path = safePath;
 
-        // Use cached arrays to avoid re-parsing on every vault event (invalidated on settings change)
-        if (this._cachedExcludedFolders === null) {
-            this._cachedExcludedFolders = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
-        }
-        if (this._cachedExcludedFolders.length > 0 && this._cachedExcludedFolders.some(p => path.startsWith(p))) { return false; }
+        // Hidden paths never sync as notes. Obsidian does not index them, so nothing
+        // legitimate is lost, and accepting them let a peer write into `.git/hooks` or the
+        // config folder. Obsidian settings sync through ConfigSync instead, which reads and
+        // writes them through the adapter under its own allow-list.
+        if (hasHiddenSegment(path)) return false;
+        // The config folder can be renamed to something without a leading dot.
+        const configDir = this.app.vault.configDir || '.obsidian';
+        if (path === configDir || path.startsWith(configDir + '/')) return false;
 
-        if (path.startsWith('.obsidian/')) {
-            if (this.settings.syncMode === 'auto') {
-                return AUTO_SAFE_CONFIG_PATHS.some(safe => path.startsWith(safe));
-            } else {
-                return this.settings.syncObsidianConfig;
-            }
+        // Cached, and invalidated on settings change, to avoid re-parsing on every vault event.
+        if (this._cachedExcludedFolders === null) {
+            this._cachedExcludedFolders = parseFolderList(this.settings.excludedFolders);
         }
+        if (isWithinFolders(path, this._cachedExcludedFolders)) return false;
 
         if (this.settings.syncMode === 'manual' || this.settings.syncMode === 'advanced') {
             if (this._cachedIncludedFolders === null) {
-                this._cachedIncludedFolders = this.settings.includedFolders.split('\n').map(p => p.trim()).filter(Boolean);
+                this._cachedIncludedFolders = parseFolderList(this.settings.includedFolders);
             }
-            if (this._cachedIncludedFolders.length > 0 && !this._cachedIncludedFolders.some(p => path.startsWith(p))) { return false; }
+            if (this._cachedIncludedFolders.length > 0 && !isWithinFolders(path, this._cachedIncludedFolders)) return false;
         }
         return true;
     }
@@ -4707,20 +5369,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     public async connectToDirectIpHost(config: DirectIpConfig) {
         this.reinitializeConnectionManager();
-        this.directIpClient = new DirectIpClient(this, config);
+        // The handshake goes out first on every authenticated link, reconnects included: the
+        // host forgets this device when a socket closes, and without a fresh handshake it
+        // never sent it anything again. The token itself is never sent — the transport
+        // proves it instead.
+        const client = new DirectIpClient(this, config,
+            () => ({ type: 'handshake', peerInfo: this.getMyPeerInfo(), protocolVersion: PROTOCOL_VERSION }));
+        this.directIpClient = client;
         this.clusterPeers.set('direct-ip-host', { deviceId: 'direct-ip-host', friendlyName: `Host (${config.host})`, ip: config.host });
-        
+
         const mockConn = {
-            send: (data: any) => this.directIpClient?.send(data),
+            send: (data: any) => client.send(data),
             peer: 'direct-ip-host',
-            open: true,
-            close: () => this.directIpClient?.triggerReconnect()
+            // Only once the host has proved it holds the token and the link is encrypted.
+            get open() { return client.isOpen; },
+            close: () => client.triggerReconnect()
         } as any;
         this.connections.set('direct-ip-host', mockConn);
         this.updateStatus();
-
-        // Initiate handshake
-        await this.directIpClient.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: config.pin, protocolVersion: PROTOCOL_VERSION });
     }
 
     /** True when Sync Progress has something to show (not merely "Connecting…"). */
@@ -4811,9 +5477,33 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * on every single call, and the 200 ms throttle did not apply when idle. Now the
      * elements are created once and only the changed parts are touched.
      */
+    private clearStatusTimer() {
+        if (this.statusTimer !== null) window.clearTimeout(this.statusTimer);
+        this.statusTimer = null;
+    }
+
     updateStatus(customStatus?: SyncStatusState) {
+        if (this.unloaded) return;
         const now = Date.now();
-        if (!customStatus && now - this.lastStatusUpdate < 200) return;
+        if (customStatus) {
+            // Shown as given; a refresh owed from before must not paint over it.
+            this.clearStatusTimer();
+        } else {
+            // At most one refresh per 200 ms — but the last one always happens. Dropping it
+            // left the bar on whatever it said mid-burst ("Syncing 1 file…") until something
+            // unrelated refreshed it.
+            const wait = this.lastStatusUpdate + 200 - now;
+            if (wait > 0) {
+                if (this.statusTimer === null) {
+                    this.statusTimer = window.setTimeout(() => {
+                        this.statusTimer = null;
+                        this.updateStatus();
+                    }, wait);
+                }
+                return;
+            }
+            this.clearStatusTimer();
+        }
         this.lastStatusUpdate = now;
 
         const status = customStatus || this.calculateStatus();

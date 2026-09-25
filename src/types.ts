@@ -197,6 +197,8 @@ export type FileDeletePayload = BasePayload & {
     type: 'file-delete';
     path: string;
     versionVector?: VersionVector; // Added versionVector for conflict resolution on deletion
+    /** When the file was deleted. Decides against an edit made independently of the deletion. */
+    deletedAt?: number;
 };
 
 export type FileRenamePayload = BasePayload & {
@@ -235,6 +237,8 @@ export type SyncPlanPayload = {
     filesReceiverMustDelete: string[];
     filesInitiatorMustDelete: string[];
     fileSizes: Record<string, number>;
+    /** For each of filesInitiatorMustDelete: when it was deleted, and the deletion's vector. */
+    deletions?: Record<string, { at: number; vv?: VersionVector }>;
 };
 
 export type RequestBatchPayload = {
@@ -385,6 +389,8 @@ export type MerkleNodeResponsePayload = {
     type: 'merkle-node-response';
     path: string;
     children: Record<string, string>;
+    /** Which children are folders. Absent from older peers. */
+    folders?: string[];
 };
 
 export interface MerkleNode {
@@ -423,7 +429,15 @@ export interface SyncStatusState {
 }
 
 export type SyncTask =
-    | { taskType: 'send-file'; path: string; mtime: number; forceFull: boolean; batchId?: string }
+    | {
+        taskType: 'send-file'; path: string; mtime: number; forceFull: boolean; batchId?: string;
+        /**
+         * Send this vector instead of the file's current one. A device answering a conflict
+         * it won sends its vector from before it folded in the loser's, so the loser sees the
+         * conflict and keeps its version as a copy.
+         */
+        versionVector?: VersionVector;
+    }
     | { taskType: 'send-file-batch'; paths: string[]; batchId: string }
     | { taskType: 'send-folder-create'; path: string; batchId?: string }
     | { taskType: 'send-delete'; path: string }
@@ -479,7 +493,42 @@ export type SyncData =
     | SyncAckPayload
     | MerkleRootPayload
     | MerkleNodeRequestPayload
-    | MerkleNodeResponsePayload;
+    | MerkleNodeResponsePayload
+    | ConfigManifestPayload
+    | ConfigRequestPayload
+    | ConfigFilePayload
+    | ConfigDeletePayload;
+
+// Obsidian settings (config folder) sync. Paths are relative to the config folder, which
+// can be named differently on each device.
+export interface ConfigFileState { hash: string; mtime: number; size: number }
+
+export type ConfigManifestPayload = {
+    type: 'config-manifest';
+    files: Array<{ configPath: string } & ConfigFileState>;
+    deleted: Array<{ configPath: string; at: number }>;
+};
+
+export type ConfigRequestPayload = {
+    type: 'config-request';
+    configPaths: string[];
+};
+
+export type ConfigFilePayload = {
+    type: 'config-file';
+    configPath: string;
+    mtime: number;
+    /** SHA-256 of the uncompressed content. */
+    hash: string;
+    /** Deflated content. */
+    data: ArrayBuffer | Uint8Array;
+};
+
+export type ConfigDeletePayload = {
+    type: 'config-delete';
+    configPath: string;
+    at: number;
+};
 
 // Interfaces
 export interface PeerServerConfig {
@@ -509,7 +558,8 @@ export interface ObsidianDecentralizedSettings {
     directIpHostPort: number;
     syncAllFileTypes: boolean;
     syncObsidianConfig: boolean;
-    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins' | 'role-based';
+    /** Applies with three or more devices; two paired devices use newest-wins with a copy. */
+    conflictResolutionStrategy: 'create-conflict-file' | 'last-write-wins';
     includedFolders: string;
     excludedFolders: string;
     hideNativeSyncStatus: boolean;
@@ -532,12 +582,29 @@ export interface ObsidianDecentralizedSettings {
 
     // Two-Device Mode Settings
     enableTwoDeviceOptimizations: boolean;
+    /**
+     * Retired; kept so existing data.json files still load. Links to a paired device are
+     * always encrypted: the toggle only affected sending, the receiver still refused
+     * plaintext from a paired device, so switching it off broke every paired link.
+     */
     enableEncryption: boolean;
+    /**
+     * Stream keystrokes to the other device. Off by default: it rewrites the open editor from
+     * the network and can clobber text when both sides type at once.
+     */
     enableRealtimeSync: boolean;
     peerKeys: Record<string, string>; // peerId -> base64 PSK
     /** Device IDs the user removed. Handshake/gossip must not put them back until they pair again. */
     blockedPeers: string[];
+    /** Which one-time settings migrations have run (see SETTINGS_VERSION). */
+    settingsVersion: number;
 }
+
+/**
+ * Bumped with each one-time migration of saved settings.
+ *   2: real-time keystroke sync switched off for everyone (it had defaulted to on).
+ */
+export const SETTINGS_VERSION = 2;
 
 export interface TwoDeviceState {
     fileVersions: Record<string, VersionVector>; // path -> { deviceId: version }
@@ -576,9 +643,10 @@ export const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
 
     enableTwoDeviceOptimizations: true,
     enableEncryption: true,
-    enableRealtimeSync: true,
+    enableRealtimeSync: false,
     peerKeys: {},
     blockedPeers: [],
+    settingsVersion: SETTINGS_VERSION,
 };
 
 export interface ILANDiscovery {

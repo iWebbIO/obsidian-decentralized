@@ -65,3 +65,35 @@ export function persistablePeerInfo(peer: PeerInfo): PeerInfo {
     const { pairingKey: _pairingKey, ...rest } = peer;
     return rest;
 }
+
+const MAX_DEVICE_ID_LENGTH = 128;
+const MAX_FRIENDLY_NAME_LENGTH = 64;
+
+/**
+ * Validate device info that arrived from another device (handshake, gossip, companion
+ * pairing) and reduce it to what is safe to keep and show. Returns null when it is unusable.
+ *
+ * These fields go straight into settings (knownPeers) and the UI, and they were trusted as
+ * sent: a missing peerInfo threw inside the handshake, and a name of any size or type was
+ * persisted and rendered. The pairing key is always dropped — it is only meaningful on a
+ * live LAN beacon and must never be stored or passed on.
+ */
+export function sanitizePeerInfo(raw: unknown): PeerInfo | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const info = raw as Record<string, unknown>;
+    const deviceId = typeof info.deviceId === 'string' ? info.deviceId.trim() : '';
+    if (!deviceId || deviceId.length > MAX_DEVICE_ID_LENGTH) return null;
+
+    const rawName = typeof info.friendlyName === 'string' ? info.friendlyName.trim() : '';
+    const friendlyName = (rawName || deviceId).slice(0, MAX_FRIENDLY_NAME_LENGTH);
+    const ip = typeof info.ip === 'string' && info.ip.length <= 64 ? info.ip : null;
+    const port = typeof info.port === 'number' && Number.isInteger(info.port) && info.port > 0 && info.port < 65536
+        ? info.port
+        : undefined;
+    const mode = info.mode === 'peerjs' || info.mode === 'direct-ip' ? info.mode : undefined;
+
+    const clean: PeerInfo = { deviceId, friendlyName, ip };
+    if (port !== undefined) clean.port = port;
+    if (mode !== undefined) clean.mode = mode;
+    return clean;
+}

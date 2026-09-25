@@ -1,46 +1,84 @@
 import { Platform } from 'obsidian';
-import { DirectIpConfig, SyncData } from './types';
+import { DirectIpConfig } from './types';
 import { splitBinaryPayload, joinBinaryPayload, packFrame, unpackFrame } from './utils';
+import {
+    AUTH_CHALLENGE,
+    AUTH_OK,
+    AUTH_PROOF,
+    DIRECT_IP_AUTH_VERSION,
+    base64ToBytes,
+    bytesToBase64,
+    clientProof,
+    deriveSessionKeys,
+    hostProof,
+    openFrame,
+    proofsMatch,
+    randomNonce,
+    sealFrame,
+} from './utils/direct-ip-auth';
+import { formatHostForUrl } from './utils/net';
 import type ObsidianDecentralizedPlugin from './main';
 import { loadWs } from './ws-loader';
 
 // Heartbeat constants (mirror main.ts startHeartbeat)
 const HEARTBEAT_INTERVAL_MS = 5000;   // ping every 5 s
 const LIVENESS_TIMEOUT_MS   = 20000;  // declare dead after 20 s of silence
+/** How long either side waits for the other half of the authentication exchange. */
+const AUTH_TIMEOUT_MS = 10000;
+/** WebSocket close code for "policy violation": a rejected token, or an incompatible version. */
+const CLOSE_REJECTED = 1008;
 
 /**
- * Frame a message for the wire. Messages with a bulk binary body (file chunks,
- * binary batches, binary file updates, encrypted frames) are sent as a single
- * binary frame; everything else goes as JSON text.
- *
- * The per-type branches this used to carry are now one call to splitBinaryPayload,
- * which is shared with the encryption layer in main.ts so both agree on which
- * field holds the body.
+ * One authenticated Offline Mode socket. Every frame is sealed with the direction's key, and
+ * both directions are chained so frames are encrypted, sent, decrypted and delivered in the
+ * order they were written — encryption is asynchronous, and a file chunk overtaking its
+ * file-chunk-start would be dropped.
  */
-function encodeMessage(msg: SyncData | any): string | Uint8Array {
-    const { header, body } = splitBinaryPayload(msg);
-    if (!body) return JSON.stringify(msg);
-    // packFrame allocates the frame buffer itself and nothing else references it, so the
-    // Uint8Array goes to the socket as-is. Copying it out to a standalone ArrayBuffer was
-    // a full extra pass over every chunk of every file.
-    return packFrame(header, body);
+class SecureChannel {
+    private outbound: Promise<void> = Promise.resolve();
+    private inbound: Promise<void> = Promise.resolve();
+
+    constructor(private sendKey: CryptoKey, private receiveKey: CryptoKey) { }
+
+    /** Encrypt `message` and pass the sealed frame to `write`, in call order. */
+    send(message: any, write: (frame: Uint8Array) => void): Promise<void> {
+        let plaintext: Uint8Array;
+        try {
+            const { header, body } = splitBinaryPayload(message);
+            // Framed now, synchronously: callers may drop their buffers once send() returns.
+            plaintext = packFrame(header, body);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        const done = this.outbound.then(async () => write(await sealFrame(this.sendKey, plaintext)));
+        this.outbound = done.catch(() => { /* reported to this send's caller */ });
+        return done;
+    }
+
+    /** Decrypt `frame` after every earlier one, then hand the message to `deliver`. */
+    receive(frame: Uint8Array, deliver: (message: any) => void, onError: (e: unknown) => void) {
+        this.inbound = this.inbound
+            .then(async () => {
+                const plaintext = await openFrame(this.receiveKey, frame);
+                const { header, body } = unpackFrame(plaintext);
+                deliver(joinBinaryPayload(header, body));
+            })
+            .catch(onError);
+    }
 }
 
-function decodeMessage(data: string | ArrayBuffer | Uint8Array): any {
-    if (typeof data === 'string') {
-        return JSON.parse(data);
+/** Bytes of a ws 'message' payload (Buffer, ArrayBuffer or fragments). */
+function frameBytes(data: any): Uint8Array {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (Array.isArray(data)) {
+        const parts = data.map(frameBytes);
+        const out = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+        let offset = 0;
+        for (const part of parts) { out.set(part, offset); offset += part.byteLength; }
+        return out;
     }
-    let buffer: ArrayBuffer;
-    if (data instanceof ArrayBuffer) {
-        buffer = data;
-    } else if (data instanceof Uint8Array || (typeof Buffer !== 'undefined' && Buffer.isBuffer(data))) {
-        buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-    } else {
-        throw new Error('Unsupported data type');
-    }
-
-    const { header, body } = unpackFrame(buffer);
-    return joinBinaryPayload(header, body);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    throw new Error('Unsupported frame type');
 }
 
 // ─── DirectIpServer ────────────────────────────────────────────────────────────
@@ -48,14 +86,16 @@ function decodeMessage(data: string | ArrayBuffer | Uint8Array): any {
 interface ServerClientEntry {
     socket: any;
     lastHeard: number;
+    channel: SecureChannel;
 }
 
 export class DirectIpServer {
     private wss: any | null = null;
-    /** deviceId → {socket, lastHeard} */
+    /** deviceId → authenticated socket */
     private clients: Map<string, ServerClientEntry> = new Map();
     private pin: string;
     private reapInterval: number | null = null;
+    private notifiedOutdatedClient = false;
     /**
      * Resolves once the socket is actually bound, rejects if it never binds. Callers must
      * await this before telling the user that hosting is active — `new WebSocketServer()`
@@ -113,90 +153,7 @@ export class DirectIpServer {
             });
         });
 
-        this.wss.on('connection', (socket: any, request: any) => {
-            const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
-            const pin = url.searchParams.get('pin');
-            const deviceId = url.searchParams.get('deviceId') || 'unknown';
-
-            if (pin !== this.pin) {
-                socket.close(1008, 'Invalid token');
-                return;
-            }
-
-            const entry: ServerClientEntry = { socket, lastHeard: Date.now() };
-            this.clients.set(deviceId, entry);
-
-            socket.on('message', (data: any, isBinary: boolean) => {
-                // Update liveness timestamp on every message from this client
-                const e = this.clients.get(deviceId);
-                if (e) e.lastHeard = Date.now();
-
-                try {
-                    let parsedData: any;
-                    let parsedSuccessfully = false;
-                    // IMPORTANT: 'ws' delivers TEXT frames as a Node Buffer too, and Buffer IS
-                    // an instanceof Uint8Array — so the frame kind must be decided by the
-                    // isBinary flag alone. Checking `data instanceof Uint8Array` here routed
-                    // every JSON text message into the binary decoder, which always threw,
-                    // silently dropping ALL client→server traffic (handshakes included).
-                    if (isBinary) {
-                        try {
-                            parsedData = decodeMessage(data);
-                            parsedSuccessfully = true;
-                        } catch (decodeErr) {
-                            this.plugin.log(`Server: decodeMessage failed for binary message from ${deviceId}:`, decodeErr);
-                        }
-                    } else {
-                        try {
-                            parsedData = JSON.parse(data.toString());
-                            parsedSuccessfully = true;
-                        } catch (jsonErr) {
-                            this.plugin.log(`Server: JSON parse failed for string message from ${deviceId}:`, jsonErr);
-                        }
-                    }
-
-                    if (parsedSuccessfully) {
-                        const mockConn = {
-                            send: (msg: any) => this.sendTo(deviceId, msg),
-                            peer: deviceId,
-                            open: true,
-                            // main.ts (heartbeat, PIN rejection) calls conn.close(); without
-                            // this method those call sites threw TypeError every tick.
-                            close: () => {
-                                try { socket.close(); } catch (_) { /* ignore */ }
-                                if (this.clients.get(deviceId)?.socket === socket) {
-                                    this.clients.delete(deviceId);
-                                }
-                                this.plugin.connections?.delete(deviceId);
-                                this.plugin.updateStatus();
-                            },
-                        } as any;
-
-                        this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => {
-                            this.plugin.log(`Server: Failed to handle raw incoming data from ${deviceId}:`, e);
-                            this.plugin.showNotice(`Error processing received sync message from ${deviceId}.`, 'error');
-                        });
-                    }
-                } catch (e) {
-                    this.plugin.log('Error parsing WS message', e);
-                }
-            });
-
-            socket.on('close', () => {
-                // Only remove the registration if it still belongs to THIS socket.
-                // A stale socket's late close event must not evict a client that
-                // has already reconnected with a fresh socket under the same deviceId.
-                if (this.clients.get(deviceId)?.socket === socket) {
-                    this.clients.delete(deviceId);
-                    this.plugin.connections?.delete(deviceId);
-                }
-                this.plugin.updateStatus();
-            });
-            
-            socket.on('error', (err: any) => {
-                this.plugin.log(`WS Client Error (${deviceId}):`, err);
-            });
-        });
+        this.wss.on('connection', (socket: any, request: any) => this.acceptSocket(socket, request));
 
         this.wss.on('error', (err: Error) => {
             this.plugin.showNotice(`Offline server error: ${err.message}`, 'error');
@@ -229,6 +186,157 @@ export class DirectIpServer {
         this.plugin.log(`Offline WebSocket server listening on port ${port}`);
     }
 
+    /** A new socket: challenge it, and admit it only once it proves it holds the token. */
+    private acceptSocket(socket: any, request: any) {
+        let url: URL;
+        try {
+            url = new URL(request?.url || '/', 'http://localhost');
+        } catch {
+            socket.close(CLOSE_REJECTED, 'Bad request');
+            return;
+        }
+        if (url.searchParams.has('pin')) {
+            // Older versions sent the token in the URL, in plaintext, and then spoke plaintext.
+            if (!this.notifiedOutdatedClient) {
+                this.notifiedOutdatedClient = true;
+                this.plugin.showNotice('A device running an older version of Obsidian Decentralized tried to join. Update it to the same version as this computer.', 'warning', 12000);
+            }
+            socket.close(CLOSE_REJECTED, 'Update Obsidian Decentralized on this device');
+            return;
+        }
+        const deviceId = (url.searchParams.get('deviceId') || '').slice(0, 128);
+        if (!deviceId) {
+            socket.close(CLOSE_REJECTED, 'Missing device ID');
+            return;
+        }
+
+        const serverNonce = randomNonce();
+        const conn = this.connectionFor(deviceId, socket);
+        let channel: SecureChannel | null = null;
+        let authenticating = false;
+        const authTimer = setTimeout(() => {
+            if (!channel) {
+                try { socket.close(4001, 'Authentication timed out'); } catch (_) { /* gone */ }
+            }
+        }, AUTH_TIMEOUT_MS);
+
+        socket.on('message', (data: any, isBinary: boolean) => {
+            if (!channel) {
+                if (isBinary || authenticating) {
+                    socket.close(CLOSE_REJECTED, 'Not authenticated');
+                    return;
+                }
+                authenticating = true;
+                const admit = (ready: SecureChannel) => {
+                    clearTimeout(authTimer);
+                    channel = ready;
+                    const previous = this.clients.get(deviceId);
+                    this.clients.set(deviceId, { socket, lastHeard: Date.now(), channel: ready });
+                    // The same device reconnected before its old socket died: retire the old one.
+                    if (previous && previous.socket !== socket) {
+                        try { previous.socket.close(1000, 'Replaced by a newer connection'); } catch (_) { /* gone */ }
+                    }
+                    this.plugin.updateStatus();
+                };
+                this.completeAuth(socket, deviceId, serverNonce, data, admit).catch(e => {
+                    this.plugin.log(`Server: authentication of ${deviceId} failed:`, e);
+                    try { socket.close(1011, 'Authentication failed'); } catch (_) { /* gone */ }
+                });
+                return;
+            }
+
+            if (!isBinary) {
+                this.plugin.log(`Server: ignoring an unencrypted frame from ${deviceId}.`);
+                return;
+            }
+            const entry = this.clients.get(deviceId);
+            if (entry && entry.socket === socket) entry.lastHeard = Date.now();
+            let bytes: Uint8Array;
+            try {
+                bytes = frameBytes(data);
+            } catch (e) {
+                this.plugin.log(`Server: unreadable frame from ${deviceId}:`, e);
+                return;
+            }
+            channel.receive(
+                bytes,
+                message => this.deliver(deviceId, conn, message),
+                e => this.plugin.log(`Server: dropped a frame from ${deviceId} that did not decrypt:`, e),
+            );
+        });
+
+        socket.on('close', () => {
+            clearTimeout(authTimer);
+            // Only remove the registration if it still belongs to THIS socket. A stale socket's
+            // late close event must not evict a client that has already reconnected.
+            if (this.clients.get(deviceId)?.socket === socket) {
+                this.clients.delete(deviceId);
+                this.plugin.connections?.delete(deviceId);
+            }
+            this.plugin.updateStatus();
+        });
+
+        socket.on('error', (err: any) => {
+            this.plugin.log(`WS Client Error (${deviceId}):`, err);
+        });
+
+        socket.send(JSON.stringify({ type: AUTH_CHALLENGE, v: DIRECT_IP_AUTH_VERSION, nonce: bytesToBase64(serverNonce) }));
+    }
+
+    /** Check the joining device's proof; on success answer with ours and return the channel. */
+    private async completeAuth(socket: any, deviceId: string, serverNonce: Uint8Array, data: any, admit: (channel: SecureChannel) => void): Promise<void> {
+        let message: any;
+        try {
+            message = JSON.parse(typeof data === 'string' ? data : new TextDecoder().decode(frameBytes(data)));
+        } catch {
+            socket.close(CLOSE_REJECTED, 'Bad handshake');
+            return;
+        }
+        const clientNonce = base64ToBytes(message?.nonce, 16);
+        if (message?.type !== AUTH_PROOF || !clientNonce) {
+            socket.close(CLOSE_REJECTED, 'Bad handshake');
+            return;
+        }
+        const expected = await clientProof(this.pin, serverNonce, clientNonce, deviceId);
+        if (!proofsMatch(message.proof, expected)) {
+            this.plugin.log(`Server: rejecting ${deviceId}: wrong token.`);
+            socket.close(CLOSE_REJECTED, 'Invalid token');
+            return;
+        }
+        const keys = await deriveSessionKeys(this.pin, serverNonce, clientNonce, deviceId);
+        const proof = await hostProof(this.pin, serverNonce, clientNonce, deviceId);
+        if (socket.readyState !== 1 /* OPEN */) return;
+        // Admitted before auth-ok goes out, so the device's first encrypted frame finds it ready.
+        admit(new SecureChannel(keys.hostToClient, keys.clientToHost));
+        socket.send(JSON.stringify({ type: AUTH_OK, proof }));
+    }
+
+    /** The connection object main.ts sees for one authenticated socket. */
+    private connectionFor(deviceId: string, socket: any): any {
+        return {
+            send: (msg: any) => this.sendTo(deviceId, msg),
+            peer: deviceId,
+            get open() { return socket.readyState === 1; },
+            // main.ts (heartbeat, rejections) calls conn.close(); without this method those
+            // call sites threw TypeError every tick.
+            close: () => {
+                try { socket.close(); } catch (_) { /* ignore */ }
+                if (this.clients.get(deviceId)?.socket === socket) {
+                    this.clients.delete(deviceId);
+                }
+                this.plugin.connections?.delete(deviceId);
+                this.plugin.updateStatus();
+            },
+        };
+    }
+
+    private deliver(deviceId: string, mockConn: any, message: any) {
+        this.plugin.handleRawIncomingData(message, mockConn).catch((e: any) => {
+            this.plugin.log(`Server: Failed to handle raw incoming data from ${deviceId}:`, e);
+            this.plugin.showNotice(`Error processing received sync message from ${deviceId}.`, 'error');
+        });
+    }
+
     getClients(): string[] {
         return Array.from(this.clients.keys());
     }
@@ -240,14 +348,12 @@ export class DirectIpServer {
 
     sendTo(peerId: string, data: any) {
         const entry = this.clients.get(peerId);
-        if (entry && entry.socket.readyState === 1 /* OPEN */) {
-            try {
-                const encoded = encodeMessage(data);
-                entry.socket.send(encoded);
-            } catch (err) {
-                this.plugin.log(`DirectIpServer: Failed to send message to peer ${peerId}:`, err);
-            }
-        }
+        if (!entry || entry.socket.readyState !== 1 /* OPEN */) return;
+        entry.channel
+            .send(data, frame => {
+                if (entry.socket.readyState === 1) entry.socket.send(frame);
+            })
+            .catch(err => this.plugin.log(`DirectIpServer: Failed to send message to peer ${peerId}:`, err));
     }
 
     hasClient(peerId: string): boolean {
@@ -260,26 +366,10 @@ export class DirectIpServer {
         return entry.socket._socket ? entry.socket._socket.bufferSize : entry.socket.bufferedAmount;
     }
 
+    /** Send to every connected device (each with its own keys). */
     send(data: any, excludePeerId?: string) {
-        let encoded: any;
-        try {
-            encoded = encodeMessage(data);
-        } catch (err) {
-            this.plugin.log('DirectIpServer: Failed to encode message for broadcast:', err);
-            return;
-        }
-        for (const [deviceId, entry] of this.clients.entries()) {
-            if (deviceId === excludePeerId) continue;
-            if (entry.socket.readyState === 1 /* OPEN */) {
-                try {
-                    // One encoded buffer, shared by every recipient. ws only reads from it,
-                    // and nothing mutates it after encodeMessage returns, so the per-client
-                    // defensive copy this used to make bought nothing.
-                    entry.socket.send(encoded);
-                } catch (err) {
-                    this.plugin.log('DirectIpServer: Broadcast send failed for client:', err);
-                }
-            }
+        for (const deviceId of this.clients.keys()) {
+            if (deviceId !== excludePeerId) this.sendTo(deviceId, data);
         }
     }
 
@@ -307,30 +397,54 @@ export class DirectIpServer {
 
 // ─── DirectIpClient ────────────────────────────────────────────────────────────
 
+type PendingSend = { data: any; resolve?: () => void; reject?: (e: any) => void };
+
 export class DirectIpClient {
-    /** True once the socket is open AND at least one message has been received. */
+    /** True once authenticated AND at least one message has been received. */
     public isLive: boolean = false;
-    /** True when the socket is OPEN (TCP layer), independent of liveness. */
+    /** True once the host has proved it holds the token and frames can flow. */
     public isOpen: boolean = false;
-    /** Set when a fatal, non-retriable error has occurred (e.g. PIN rejection). */
+    /** Set when a fatal, non-retriable error has occurred (e.g. a rejected token). */
     public isFatalError: boolean = false;
+    /** What went wrong, for the Connect screen, when isFatalError is set. */
+    public fatalReason: string | null = null;
 
     private ws: WebSocket | null = null;
-    private sendBuffer: { data: any, retries: number, resolve?: () => void, reject?: (e: any) => void }[] = [];
+    private channel: SecureChannel | null = null;
+    private pendingAuth: { serverNonce: Uint8Array; clientNonce: Uint8Array } | null = null;
+    private sendBuffer: PendingSend[] = [];
     private isStopped = false;
 
     // Reconnect backoff state
     private reconnectAttempts = 0;
     private reconnectTimeout: number | null = null;
+    private authTimeout: number | null = null;
 
     // Heartbeat / keep-alive state
     private heartbeatInterval: number | null = null;
     private lastHeardAt: number = 0;
 
-    constructor(private plugin: ObsidianDecentralizedPlugin, private config: DirectIpConfig) {
+    /** The connection object main.ts sees for the host. */
+    private readonly hostConnection = (() => {
+        const client = this;
+        return {
+            send: (data: any) => client.send(data),
+            peer: 'direct-ip-host',
+            get open() { return client.isOpen; },
+            // main.ts heartbeat calls conn.close() on silent peers; map it to a
+            // reconnect cycle instead of throwing TypeError.
+            close: () => client.triggerReconnect(),
+        } as any;
+    })();
+
+    /**
+     * @param greeting builds the first message of every authenticated link (the handshake),
+     *   sent before anything queued while the link was down.
+     */
+    constructor(private plugin: ObsidianDecentralizedPlugin, private config: DirectIpConfig, private greeting?: () => any) {
         this.connect();
     }
-    
+
     getBufferedAmount(): number {
         return this.ws ? this.ws.bufferedAmount : 0;
     }
@@ -341,6 +455,13 @@ export class DirectIpClient {
         if (this.heartbeatInterval !== null) {
             clearInterval(this.heartbeatInterval);
             this.heartbeatInterval = null;
+        }
+    }
+
+    private clearAuthTimeout() {
+        if (this.authTimeout !== null) {
+            clearTimeout(this.authTimeout);
+            this.authTimeout = null;
         }
     }
 
@@ -361,17 +482,12 @@ export class DirectIpClient {
         this.stopHeartbeat();
         this.lastHeardAt = Date.now(); // socket just opened — reset the clock
         this.heartbeatInterval = window.setInterval(() => {
-            if (!this.ws || this.ws.readyState !== 1 /* WebSocket.OPEN */) {
+            if (!this.ws || this.ws.readyState !== 1 /* WebSocket.OPEN */ || !this.channel) {
                 this.stopHeartbeat();
                 return;
             }
 
-            // Send a ping to the server
-            try {
-                this.ws.send(encodeMessage({ type: 'ping' }));
-            } catch (e) {
-                this.plugin.log('DirectIpClient: failed to send heartbeat ping', e);
-            }
+            void this.send({ type: 'ping' });
 
             // Check liveness window — if exceeded, force-close to trigger reconnect
             if (Date.now() - this.lastHeardAt > LIVENESS_TIMEOUT_MS) {
@@ -387,7 +503,7 @@ export class DirectIpClient {
      * schedule a call to connect().
      */
     private scheduleReconnect() {
-        if (this.isStopped) return;
+        if (this.isStopped || this.isFatalError) return;
 
         this.reconnectAttempts++;
         const backoff = Math.min(30000, this.reconnectAttempts * 2000);
@@ -409,128 +525,206 @@ export class DirectIpClient {
         }, backoff);
     }
 
+    /** Stop for good and say why: retrying cannot fix a wrong token or address. */
+    private fail(reason: string) {
+        this.isFatalError = true;
+        this.fatalReason = reason;
+        this.isOpen = false;
+        this.isLive = false;
+        this.channel = null;
+        this.stopHeartbeat();
+        this.clearAuthTimeout();
+        this.drainSendBuffer(reason);
+        this.plugin.log(`DirectIpClient: ${reason}`);
+        this.plugin.showNotice(reason, 'error');
+        this.plugin.updateStatus({ text: 'Could not join the offline host', icon: 'shield-off', state: 'error' });
+    }
+
     private connect() {
         if (this.isStopped) return;
         this.isFatalError = false;
-        
-        const wsUrl = `ws://${this.config.host}:${this.config.port}/?pin=${encodeURIComponent(this.config.pin)}&deviceId=${encodeURIComponent(this.plugin.settings.deviceId)}`;
-        this.ws = new WebSocket(wsUrl);
-        this.ws.binaryType = 'arraybuffer';
+        this.fatalReason = null;
+        this.channel = null;
+        this.pendingAuth = null;
 
-        this.ws.onopen = () => {
-            // Cancel any pending reconnect timer
+        // The token is deliberately NOT in the URL: it is proven, never sent.
+        const wsUrl = `ws://${formatHostForUrl(this.config.host)}:${this.config.port}/?deviceId=${encodeURIComponent(this.plugin.settings.deviceId)}&v=${DIRECT_IP_AUTH_VERSION}`;
+        let ws: WebSocket;
+        try {
+            ws = new WebSocket(wsUrl);
+        } catch (e) {
+            // A malformed address throws synchronously, and used to escape as an uncaught error
+            // that left the Connect screen spinning.
+            this.fail(`"${this.config.host}" is not a valid address. Enter the IP shown on the hosting computer, like 192.168.1.20.`);
+            return;
+        }
+        this.ws = ws;
+        ws.binaryType = 'arraybuffer';
+        // Events from a socket we have since replaced must not touch the current one's state.
+        const isCurrent = () => this.ws === ws;
+
+        ws.onopen = () => {
+            if (!isCurrent()) return;
             if (this.reconnectTimeout !== null) {
                 clearTimeout(this.reconnectTimeout);
                 this.reconnectTimeout = null;
             }
-            // Reset backoff counter
-            this.reconnectAttempts = 0;
-
-            this.isOpen = true;
-            // isLive remains false until the first incoming message proves the
-            // far-end is processing traffic (Phase 4 accuracy requirement).
-
-            this.plugin.showNotice(`Connected to Offline Host at ${this.config.host}`, 'important', 3000);
-
-            // Emit "connecting" until first message confirms liveness
-            this.plugin.updateStatus({
-                text: 'Connected — verifying link…',
-                icon: 'plug',
-                spin: true,
-                state: 'loading',
-            });
-
-            this.startHeartbeat();
-            this.flushSendBuffer();
+            // Wait for the host's challenge; something that never sends one is not our host.
+            this.clearAuthTimeout();
+            this.authTimeout = window.setTimeout(() => {
+                this.authTimeout = null;
+                if (isCurrent() && !this.channel) ws.close();
+            }, AUTH_TIMEOUT_MS);
+            this.plugin.updateStatus({ text: 'Verifying the host…', icon: 'plug', spin: true, state: 'loading' });
         };
 
-        this.ws.onmessage = (event) => {
-            // Every incoming message proves the far-end is alive
-            this.lastHeardAt = Date.now();
-            if (!this.isLive) {
-                this.isLive = true;
-                // First confirmed live message — emit proper connected status
-                this.plugin.updateStatus();
-            }
+        // Authentication steps are asynchronous, and the host may send its first encrypted
+        // frame right behind auth-ok. Until the channel exists, every frame waits its turn.
+        let authStep: Promise<void> = Promise.resolve();
 
+        const receiveEncrypted = (data: unknown) => {
+            if (typeof data === 'string') {
+                this.plugin.log('DirectIpClient: ignoring an unencrypted frame.');
+                return;
+            }
+            let bytes: Uint8Array;
             try {
-                let parsedData: any;
-                let parsedSuccessfully = false;
-
-                if (typeof event.data === 'string') {
-                    try {
-                        parsedData = JSON.parse(event.data);
-                        parsedSuccessfully = true;
-                    } catch (jsonErr) {
-                        this.plugin.log('DirectIpClient: JSON parse failed for string message:', jsonErr);
-                    }
-                } else if (event.data instanceof ArrayBuffer) {
-                    try {
-                        parsedData = decodeMessage(event.data);
-                        parsedSuccessfully = true;
-                    } catch (decodeErr) {
-                        this.plugin.log('DirectIpClient: decodeMessage failed for ArrayBuffer:', decodeErr);
-                    }
-                } else {
-                    this.plugin.log('DirectIpClient: Unsupported WebSocket message type dropped:', typeof event.data);
-                }
-                
-                if (parsedSuccessfully) {
-                    const mockConn = {
-                        send: (data: any) => this.send(data),
-                        peer: 'direct-ip-host',
-                        open: true,
-                        // main.ts heartbeat calls conn.close() on silent peers; map it to a
-                        // reconnect cycle instead of throwing TypeError.
-                        close: () => this.triggerReconnect()
-                    } as any;
-
-                    this.plugin.handleRawIncomingData(parsedData, mockConn).catch((e: any) => {
-                        this.plugin.log('Client: Failed to handle raw incoming data:', e);
-                        this.plugin.showNotice('Error processing received sync message.', 'error');
-                    });
-                }
+                bytes = frameBytes(data);
             } catch (e) {
-                this.plugin.log('Offline WS Parse Error:', e);
+                this.plugin.log('DirectIpClient: unreadable frame dropped:', e);
+                return;
             }
+            this.channel?.receive(
+                bytes,
+                message => this.deliver(message),
+                e => this.plugin.log('DirectIpClient: dropped a frame that did not decrypt:', e),
+            );
         };
 
-        this.ws.onclose = (event) => {
+        ws.onmessage = (event) => {
+            if (!isCurrent()) return;
+            this.lastHeardAt = Date.now();
+            if (this.channel) {
+                receiveEncrypted(event.data);
+                return;
+            }
+            authStep = authStep
+                .then(async () => {
+                    if (!isCurrent()) return;
+                    if (this.channel) receiveEncrypted(event.data);
+                    else await this.handleAuthMessage(ws, event.data);
+                })
+                .catch(e => {
+                    this.plugin.log('DirectIpClient: authentication failed:', e);
+                    ws.close();
+                });
+        };
+
+        ws.onclose = (event) => {
+            if (!isCurrent()) return;
             this.isOpen = false;
             this.isLive = false;
+            this.channel = null;
+            this.pendingAuth = null;
             this.stopHeartbeat();
+            this.clearAuthTimeout();
 
-            // Intentional shutdown — do nothing
-            if (this.isStopped) return;
+            // Intentional shutdown, or already failed for good — do nothing
+            if (this.isStopped || this.isFatalError) return;
 
-            // Fatal: token / auth rejection → no retry, surface error
-            if (event.code === 1008) {
-                this.isFatalError = true;
-                this.drainSendBuffer('Connection rejected by host (invalid token)');
-                this.plugin.log(`DirectIpClient: fatal close (1008 token/auth rejection)`);
-                this.plugin.showNotice('The host rejected this token. On the host, open Connect devices and copy a fresh token.', 'error');
-                this.plugin.updateStatus({
-                    text: 'Host rejected the token — copy a fresh one from the host Connect screen',
-                    icon: 'shield-off',
-                    state: 'error',
-                });
+            if (event.code === CLOSE_REJECTED) {
+                this.fail('The host rejected this device. Check the token on the hosting computer (Connect devices → Offline Mode), and make sure both devices run the same version of Obsidian Decentralized.');
                 return;
             }
 
             // All other closes — schedule exponential backoff reconnect
             this.scheduleReconnect();
         };
-        
-        this.ws.onerror = (err) => {
+
+        ws.onerror = (err) => {
             // onclose always fires after onerror, so reconnect logic lives there.
             this.plugin.log('Offline WS Error:', err);
         };
     }
 
+    private async handleAuthMessage(ws: WebSocket, data: unknown) {
+        if (typeof data !== 'string') {
+            ws.close();
+            return;
+        }
+        let message: any;
+        try {
+            message = JSON.parse(data);
+        } catch {
+            ws.close();
+            return;
+        }
+        const deviceId = this.plugin.settings.deviceId;
+
+        if (message?.type === AUTH_CHALLENGE && !this.pendingAuth) {
+            const serverNonce = base64ToBytes(message.nonce, 16);
+            if (!serverNonce) {
+                ws.close();
+                return;
+            }
+            const clientNonce = randomNonce();
+            this.pendingAuth = { serverNonce, clientNonce };
+            const proof = await clientProof(this.config.pin, serverNonce, clientNonce, deviceId);
+            if (this.ws !== ws || ws.readyState !== 1) return;
+            ws.send(JSON.stringify({ type: AUTH_PROOF, nonce: bytesToBase64(clientNonce), proof }));
+            return;
+        }
+
+        if (message?.type === AUTH_OK && this.pendingAuth) {
+            const { serverNonce, clientNonce } = this.pendingAuth;
+            this.pendingAuth = null;
+            const expected = await hostProof(this.config.pin, serverNonce, clientNonce, deviceId);
+            if (this.ws !== ws) return;
+            if (!proofsMatch(message.proof, expected)) {
+                // Whatever answered at this address does not know the token.
+                this.fail(`The device at ${this.config.host} could not prove it is the host that issued this token. Check the IP address.`);
+                ws.close();
+                return;
+            }
+            const keys = await deriveSessionKeys(this.config.pin, serverNonce, clientNonce, deviceId);
+            if (this.ws !== ws || ws.readyState !== 1) return;
+            this.channel = new SecureChannel(keys.clientToHost, keys.hostToClient);
+            this.clearAuthTimeout();
+            this.reconnectAttempts = 0;
+            this.isOpen = true;
+            this.plugin.showNotice(`Connected to Offline Host at ${this.config.host}`, 'important', 3000);
+            this.plugin.updateStatus({ text: 'Connected — verifying link…', icon: 'plug', spin: true, state: 'loading' });
+            this.startHeartbeat();
+            if (this.greeting) this.sendBuffer.unshift({ data: this.greeting() });
+            this.flushSendBuffer();
+            return;
+        }
+
+        this.plugin.log(`DirectIpClient: unexpected ${message?.type} during authentication.`);
+        ws.close();
+    }
+
+    private deliver(message: any) {
+        if (!this.isLive) {
+            this.isLive = true;
+            // First confirmed live message — emit proper connected status
+            this.plugin.updateStatus();
+        }
+        this.plugin.handleRawIncomingData(message, this.hostConnection).catch((e: any) => {
+            this.plugin.log('Client: Failed to handle raw incoming data:', e);
+            this.plugin.showNotice('Error processing received sync message.', 'error');
+        });
+    }
+
     // ── Public API ─────────────────────────────────────────────────────────────
 
+    /**
+     * Queue `data` for the host; it goes out, encrypted, once the link is authenticated.
+     * The returned promise is marked handled up front: most callers fire and forget, and a
+     * link that drops used to reject every one of them as an unhandled rejection.
+     */
     send(data: any): Promise<void> {
-        return new Promise((resolve, reject) => {
+        const sent = new Promise<void>((resolve, reject) => {
             if (this.sendBuffer.length >= 100) {
                 const dropped = this.sendBuffer.shift(); // Drop oldest message
                 if (dropped?.data?.transferId) {
@@ -538,71 +732,67 @@ export class DirectIpClient {
                 }
                 dropped?.reject?.(new Error('Buffer overflow'));
             }
-            this.sendBuffer.push({ data, retries: 0, resolve, reject });
+            this.sendBuffer.push({ data, resolve, reject });
             this.flushSendBuffer();
         });
+        sent.catch(() => { /* observed by callers that await it */ });
+        return sent;
     }
 
     private flushSendBuffer() {
-        if (!this.ws || this.ws.readyState !== 1 /* WebSocket.OPEN */) return;
-        
+        const ws = this.ws;
+        const channel = this.channel;
+        if (!ws || ws.readyState !== 1 /* WebSocket.OPEN */ || !channel) return;
+
         while (this.sendBuffer.length > 0) {
-            const item = this.sendBuffer[0];
-            const data = item.data;
-            let encoded;
-            try {
-                encoded = encodeMessage(data);
-            } catch (e: any) {
-                this.plugin.log('DirectIpClient: Failed to encode message, dropping it.', e);
-                this.plugin.showNotice(`Failed to encode sync message: ${e.message}`, 'important');
-                if (data.transferId) {
-                    this.plugin.rejectPendingAck(data.transferId, `Encode failed: ${e.message}`);
-                }
-                item.reject?.(e);
-                this.sendBuffer.shift();
-                continue;
-            }
-            try {
-                this.ws.send(encoded);
-                item.resolve?.();
-                this.sendBuffer.shift();
-            } catch (e) {
-                item.retries++;
-                if (item.retries < 3) {
-                    setTimeout(() => this.flushSendBuffer(), 1000);
-                } else {
-                    this.plugin.log('DirectIpClient: Dropping message after max retries on send failure');
+            const item = this.sendBuffer.shift()!;
+            channel
+                .send(item.data, frame => {
+                    if (ws.readyState !== 1) throw new Error('Connection closed');
+                    ws.send(frame);
+                })
+                .then(() => item.resolve?.(), (e: any) => {
+                    this.plugin.log('DirectIpClient: send failed:', e);
+                    if (item.data?.transferId) {
+                        this.plugin.rejectPendingAck(item.data.transferId, `Send failed: ${e?.message || e}`);
+                    }
                     item.reject?.(e);
-                    this.sendBuffer.shift();
-                }
-                break;
-            }
+                });
         }
     }
 
     /**
-     * Force-close the current socket and immediately begin the backoff-reconnect
-     * cycle.  Called by the network-change handler in main.ts (Phase 3.2).
+     * Drop the current socket and reconnect. The plugin heartbeat calls this every 5 s while
+     * the host is silent, so it must not disturb a reconnect already on its way: resetting
+     * the backoff timer on each call meant that once the delay passed 5 s the timer never
+     * fired, and a device that lost its host for 20 s never reconnected. A network change
+     * passes resetBackoff to retry promptly.
      */
-    public triggerReconnect() {
+    public triggerReconnect(opts?: { resetBackoff?: boolean }) {
         if (this.isStopped || this.isFatalError) return;
-        this.stopHeartbeat();
-        if (this.ws && this.ws.readyState !== 3) {
-            this.ws.close(); // let onclose trigger scheduleReconnect
-        } else {
-            this.scheduleReconnect();
+        if (opts?.resetBackoff) this.reconnectAttempts = 0;
+        const state = this.ws?.readyState;
+        if (state === 0 /* CONNECTING */ || state === 2 /* CLOSING */) return; // its outcome decides
+        if (state === 1 /* OPEN */) {
+            this.stopHeartbeat();
+            this.ws!.close(); // onclose schedules the reconnect
+            return;
         }
-    }
-
-    startPolling() {
-        // Legacy compat, no-op for WebSockets
+        if (this.reconnectTimeout !== null) {
+            if (!opts?.resetBackoff) return; // already scheduled
+            clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
+        }
+        this.scheduleReconnect();
     }
 
     stop() {
         this.isStopped = true;
         this.isOpen = false;
         this.isLive = false;
+        this.channel = null;
         this.stopHeartbeat();
+        this.clearAuthTimeout();
         this.drainSendBuffer('Client stopped');
 
         if (this.reconnectTimeout !== null) {

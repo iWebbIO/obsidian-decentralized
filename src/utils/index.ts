@@ -62,6 +62,33 @@ export function decompressText(data: ArrayBuffer | Uint8Array, maxBytes: number 
     }
 }
 
+/** Deflate raw bytes (settings files, plugin code) for the wire. */
+export function compressBytes(data: Uint8Array): Uint8Array {
+    return pako.deflate(data);
+}
+
+/**
+ * Inflate bytes from a peer, refusing to grow past `maxBytes` — the same guard as
+ * decompressText, for binary content.
+ */
+export function decompressBytes(data: ArrayBuffer | Uint8Array, maxBytes: number): Uint8Array {
+    const inflater = new pako.Inflate();
+    let total = 0;
+    let overflowed = false;
+    (inflater as any).onData = function (chunk: Uint8Array) {
+        total += chunk.length;
+        if (total > maxBytes) {
+            overflowed = true;
+            return;
+        }
+        (this as any).chunks.push(chunk);
+    };
+    inflater.push(data instanceof Uint8Array ? data : new Uint8Array(data), true);
+    if (overflowed) throw new Error(`decompressed payload exceeds ${maxBytes} bytes`);
+    if (inflater.err) throw new Error(inflater.msg || `inflate error ${inflater.err}`);
+    return (inflater.result as Uint8Array) ?? new Uint8Array(0);
+}
+
 /**
  * Normalises a vault-relative path that came from a peer and rejects anything that could
  * escape the vault or slip past the folder filters.
@@ -97,6 +124,42 @@ export function sanitizeVaultPath(rawPath: unknown): string | null {
 
     if (segments.length === 0) return null;
     return segments.join('/');
+}
+
+/**
+ * Parse a user's folder list (one folder per line) into normalised vault paths.
+ *
+ * Accepts the spellings people actually type — `Archive/`, `/Archive`, `./Archive`,
+ * `Archive\Old` — and drops blank or unusable lines.
+ */
+export function parseFolderList(text: string | null | undefined): string[] {
+    const out: string[] = [];
+    for (const line of (text ?? '').split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const folder = sanitizeVaultPath(trimmed.replace(/^[\\/]+/, ''));
+        if (folder && !out.includes(folder)) out.push(folder);
+    }
+    return out;
+}
+
+/**
+ * True when `path` is one of `folders` or lies inside one.
+ *
+ * Folder rules were plain startsWith() prefixes, so excluding `Work` also excluded
+ * `Workshop/` and `Work notes.md`, and including `Journal` pulled in `Journal archive/`.
+ */
+export function isWithinFolders(path: string, folders: string[]): boolean {
+    return folders.some(folder => path === folder || path.startsWith(folder + '/'));
+}
+
+/**
+ * True when any segment of `path` starts with a dot. Obsidian never indexes such paths, so no
+ * legitimate vault sync involves them, and a peer writing one could reach `.git/hooks` or
+ * other tooling outside the notes.
+ */
+export function hasHiddenSegment(path: string): boolean {
+    return path.split('/').some(segment => segment.startsWith('.'));
 }
 
 /** Inverse of getConflictPath: `Note (conflict on 2024-01-02).md` → `Note.md`. */
@@ -183,11 +246,17 @@ export async function mapWithConcurrency<T, R>(
 }
 
 /**
- * Wire protocol version. Bumped for V3, which replaced the base64-in-JSON
- * encryption envelope with a binary frame. A V3 peer cannot talk to a 2.x peer,
- * so the handshake refuses mismatched versions rather than corrupting a vault.
+ * Wire protocol version. The handshake refuses a mismatch rather than letting two
+ * incompatible devices corrupt a vault.
+ *
+ * 3: binary frames replaced the base64-in-JSON encryption envelope.
+ * 4: control replies (pings, acks, sync-acks) are encrypted on paired links, two-device
+ *    conflicts are resolved by edit time rather than device role, and Offline Mode
+ *    authenticates and encrypts its own transport. A v3 device refuses the replies of a
+ *    v4 one on a paired link and would resolve conflicts differently, so the two must not
+ *    mix silently.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Messages that carry a large binary body in a single named field. */
 const BINARY_BODY_FIELD: Record<string, 'data' | 'content'> = {
@@ -196,6 +265,7 @@ const BINARY_BODY_FIELD: Record<string, 'data' | 'content'> = {
     'encrypted-frame': 'data',
     'sync-control-binary': 'data',
     'file-update': 'content',
+    'config-file': 'data',
 };
 
 /**
@@ -233,6 +303,7 @@ export function splitBinaryPayload(msg: any): { header: any; body: Uint8Array | 
  * `instanceof ArrayBuffer` and is handed straight to the vault's binary writers.
  */
 const VIEW_SAFE_BODY_TYPES = new Set([
+    'config-file',
     'file-chunk-data',
     'file-batch-binary',
     'encrypted-frame',
@@ -319,9 +390,16 @@ export function taskQueueId(peerId: string | null, task: SyncTask): string {
     // A batch is flushed in several chunks that all share one batchId, so the paths have to
     // be part of the id. Keying on batchId alone made every flush after the first a
     // duplicate, and those files were silently never sent.
-    const target = task.taskType === 'send-rename'
-        ? `${task.oldPath}\0${task.newPath}`
-        : (task.taskType === 'send-file-batch' ? `${task.batchId}\0${task.paths.join('\0')}` : task.path);
+    let target: string;
+    if (task.taskType === 'send-rename') target = `${task.oldPath}\0${task.newPath}`;
+    else if (task.taskType === 'send-file-batch') target = `${task.batchId}\0${task.paths.join('\0')}`;
+    else target = task.path;
+    if (task.taskType === 'send-file') {
+        // A pull retried in a later batch must not be swallowed by the earlier batch's task,
+        // and a conflict reply carries its own vector, so neither may merge with a plain send.
+        if (task.batchId) target += `\0batch:${task.batchId}`;
+        if (task.versionVector) target += '\0reply';
+    }
     return `${peerId || '*'}\0${task.taskType}\0${target}`;
 }
 
