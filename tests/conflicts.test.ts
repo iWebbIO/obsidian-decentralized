@@ -222,6 +222,28 @@ describe('an edit right after a change arrives', () => {
         expect(conflictCopies(b)).toEqual([]);
     });
 
+    test('when Obsidian reports the write after it returns, it is still recognised as ours', async () => {
+        // The other order: the modify event arrives once the write has completed. It must be
+        // told apart by content — not counted, not sent back, and not taken as an edit that
+        // locks the note against the device that sent it.
+        // A takes no edit lock of its own here, so nothing on B holds the event back.
+        const a = await createDevice(A, { vault: vaultWith({ 'note.md': ['v1', T] }), settings: { enableTwoDeviceOptimizations: false } });
+        const vaultB = vaultWith({ 'note.md': ['v1', T] });
+        vaultB.deferEvents = true;
+        const b = await createDevice(B, { vault: vaultB });
+        await connect(a, b);
+        const sentByB = jest.spyOn(b.plugin, 'sendFileUpdate');
+        const lockedByB = jest.spyOn(b.plugin, 'requestLock');
+
+        await edit(a, 'note.md', 'from A', T + 10_000);
+        await waitFor(() => b.vault.text('note.md') === 'from A', { what: 'A\'s edit to arrive' });
+        await settle(a, b);
+
+        expect(b.plugin.twoDeviceState.fileVersions['note.md']?.[B]).toBeUndefined();
+        expect(sentByB).not.toHaveBeenCalled();
+        expect(lockedByB).not.toHaveBeenCalled();
+    });
+
     test('the incoming write itself is not counted as an edit here', async () => {
         const a = await createDevice(A, { vault: vaultWith({ 'note.md': ['v1', T] }) });
         const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['v1', T] }) });

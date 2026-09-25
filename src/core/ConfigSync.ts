@@ -159,8 +159,11 @@ export class ConfigSync {
         return false;
     }
 
-    private exclusive<T>(fn: () => Promise<T>): Promise<T> {
-        const run = this.chain.then(fn, fn);
+    private exclusive(fn: () => Promise<void>): Promise<void> {
+        // Work still queued when the plugin unloads is dropped, not run against a vault the
+        // plugin no longer manages.
+        const guarded = () => (this.disposed ? Promise.resolve() : fn());
+        const run = this.chain.then(guarded, guarded);
         this.chain = run.then(() => undefined, () => undefined);
         return run;
     }

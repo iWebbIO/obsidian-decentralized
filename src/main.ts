@@ -1171,22 +1171,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private async handleFileChange(file: TAbstractFile) { 
         await this.runLocked(file.path, async () => { 
             this.log(`Processing debounced change for: ${file.path}`); 
-            
-            if (this.isTwoDeviceMode() && !this.heldLocks.has(file.path) && file instanceof TFile && !this.isBinary(file.extension)) {
-                await this.requestLock(file.path);
-            }
 
+            // Our own write of a peer's version is not an edit here: no version bump, no send,
+            // and no edit lock — locking would hold back the sender's next edits to the note.
             if (file instanceof TFile) {
                 const echo = this.remoteEchoHashes.get(file.path);
                 if (echo) {
                     this.remoteEchoHashes.delete(file.path);
                     const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
                     if (await this.getHash(content) === echo.hash) {
-                        // Our own write of a peer's version: nothing was edited here.
                         this.ignoreEvents.delete(file.path);
                         return;
                     }
                 }
+            }
+
+            if (this.isTwoDeviceMode() && !this.heldLocks.has(file.path) && file instanceof TFile && !this.isBinary(file.extension)) {
+                await this.requestLock(file.path);
+            }
+
+            if (file instanceof TFile) {
                 this.recordLocalEdit(file.path);
                 this.syncedHashes.delete(file.path);
                 // Recreating a deleted file must retract our deletion record, or the next

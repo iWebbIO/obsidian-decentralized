@@ -67,6 +67,11 @@ export class FakeVault {
     now: () => number = () => Date.now();
     /** Paths removed through trash()/fileManager.trashFile()/adapter trash (tests only). */
     trashed: string[] = [];
+    /**
+     * Deliver vault events after the writing call has returned, instead of during it (tests
+     * only). Obsidian can do either, so the plugin must cope with both orders.
+     */
+    deferEvents = false;
 
     private index = new Map<string, TAbstractFile>();
     readonly store = new Map<string, Stored>();
@@ -92,7 +97,8 @@ export class FakeVault {
         ref.off();
     }
     trigger(name: string, ...args: any[]) {
-        this.events.trigger(name, ...args);
+        if (this.deferEvents) setTimeout(() => this.events.trigger(name, ...args), 0);
+        else this.events.trigger(name, ...args);
     }
     listenerCount(name: string): number {
         return this.events.count(name);
