@@ -1,7 +1,7 @@
 {
   "id": "obsidian-decentralized",
   "name": "Obsidian Decentralized",
-  "version": "2.9.15",
+  "version": "2.9.16",
   "minAppVersion": "1.8.3",
   "description": "Sync vaults without a cloud, pair with a code.",
   "author": "moreweb",

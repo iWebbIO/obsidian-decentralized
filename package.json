@@ -1,6 +1,6 @@
 {
   "name": "obsidian-decentralized-sync",
-  "version": "2.9.15",
+  "version": "2.9.16",
   "description": "Sync vaults without a cloud, pair with a code.",
   "main": "dist/main.js",
   "engines": {
