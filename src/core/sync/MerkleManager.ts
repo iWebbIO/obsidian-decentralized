@@ -10,7 +10,7 @@ export interface MerkleDiffResult {
 }
 
 export class MerkleManager {
-    private hashCache: Map<string, { hash: string; mtime: number }> = new Map();
+    private hashCache: Map<string, { hash: string; mtime: number; size: number }> = new Map();
     private cachedTree: MerkleNode | null = null;
     private treeBuiltAt: number = 0;
 
@@ -82,7 +82,7 @@ export class MerkleManager {
         const fileHashes = new Map<string, string>();
         for (const file of files) {
             const cached = this.hashCache.get(file.path);
-            if (cached && cached.mtime === file.mtime) {
+            if (cached && cached.mtime === file.mtime && cached.size === file.size) {
                 fileHashes.set(file.path, cached.hash);
             } else if (file.size > this.surrogateThresholdBytes) {
                 // Size+mtime surrogate for large files to avoid reading huge chunks into memory
@@ -94,7 +94,7 @@ export class MerkleManager {
                         ? await this.storage.readBinary(file.path)
                         : await this.storage.read(file.path);
                     const hash = await this.computeHash(content);
-                    this.hashCache.set(file.path, { hash, mtime: file.mtime });
+                    this.hashCache.set(file.path, { hash, mtime: file.mtime, size: file.size });
                     fileHashes.set(file.path, hash);
                 } catch {
                     // File vanished or deleted concurrently mid-build; skip it

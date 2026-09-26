@@ -36,6 +36,9 @@ jobs:
     - name: Run tests
       run: npm run test
 
+    - name: Run simulation tests
+      run: npm run test:simulation
+
     # The tests run against the TypeScript sources; only the bundle shows whether the
     # plugin still builds and still loads on mobile (no Node built-ins at load time).
     - name: Build plugin

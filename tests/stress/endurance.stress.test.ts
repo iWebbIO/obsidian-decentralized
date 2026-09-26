@@ -1,5 +1,5 @@
 import { SimulatedNetwork, SimulatedTransport, SeededPRNG } from '../simulation/SimulatedNetwork';
-import { VirtualDevice } from '../simulation/VirtualDevice';
+import { VirtualDevice, waitForConvergence } from '../simulation/VirtualDevice';
 
 describe('Stress Test: Randomized Endurance & Fuzzing', () => {
     const SEED = parseInt(process.env.STRESS_SEED || '0x5EED1234', 16);
@@ -92,24 +92,22 @@ describe('Stress Test: Randomized Endurance & Fuzzing', () => {
         }
 
         // Final Quiescence & Full Mesh Convergence Pass
-        for (let round = 0; round < 3; round++) {
-            for (const p of peers) {
-                await p.syncAll();
-            }
-            await new Promise(r => setTimeout(r, 100));
+        const converged = await waitForConvergence(peers, 4000);
+        if (!converged) {
+            console.error(`[STRESS FAILURE REPRODUCTION SEED] 0x${SEED.toString(16)}`);
+            const t1 = await dev1.merkleManager.getMerkleTree();
+            const t2 = await dev2.merkleManager.getMerkleTree();
+            const t3 = await dev3.merkleManager.getMerkleTree();
+            console.error('diff 1-2:', dev1.merkleManager.diffTrees(t1, t2));
+            console.error('diff 1-3:', dev1.merkleManager.diffTrees(t1, t3));
         }
+        expect(converged).toBe(true);
 
-        // Assert all 3 peers reach 100% identical Merkle roots
         const root1 = await dev1.getMerkleRoot();
         const root2 = await dev2.getMerkleRoot();
         const root3 = await dev3.getMerkleRoot();
 
-        try {
-            expect(root2).toBe(root1);
-            expect(root3).toBe(root1);
-        } catch (err) {
-            console.error(`[STRESS FAILURE REPRODUCTION SEED] 0x${SEED.toString(16)}`);
-            throw err;
-        }
+        expect(root2).toBe(root1);
+        expect(root3).toBe(root1);
     });
 });

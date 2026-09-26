@@ -50,8 +50,8 @@ export class VirtualDevice {
         this.role = config.role ?? 'primary';
 
         // Auto-invalidate Merkle cache on local storage changes
-        this.unsubscribeStorage = this.storage.onVaultChange(() => {
-            this.merkleManager.invalidate();
+        this.unsubscribeStorage = this.storage.onVaultChange((event) => {
+            this.merkleManager.invalidateFile(event.path);
         });
     }
 
