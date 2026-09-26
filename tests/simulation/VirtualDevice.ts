@@ -277,9 +277,26 @@ export class VirtualDevice {
             return;
         }
 
-        if (relation === 'GREATER' || relation === 'EQUAL') {
-            // Local is newer or equal, ignore
+        if (relation === 'GREATER') {
+            // Local is newer, ignore
             return;
+        }
+
+        if (relation === 'EQUAL') {
+            // Check if contents are already identical
+            const localContent = msg.isBinary
+                ? await this.storage.readBinary(msg.path)
+                : await this.storage.read(msg.path);
+            const remoteContent = msg.isBinary
+                ? Buffer.from(msg.content, 'base64')
+                : msg.content;
+            const remoteBuf = remoteContent instanceof Buffer
+                ? remoteContent.buffer.slice(remoteContent.byteOffset, remoteContent.byteOffset + remoteContent.byteLength)
+                : remoteContent;
+            if (this.conflictResolver.areContentsEqual(localContent, remoteBuf)) {
+                return;
+            }
+            // Relation is EQUAL but contents differ -> proceed to conflict resolution
         }
 
         // Concurrent edit: invoke ConflictResolver
@@ -291,6 +308,10 @@ export class VirtualDevice {
         const remoteContent = msg.isBinary
             ? Buffer.from(msg.content, 'base64')
             : msg.content;
+
+        const remoteBuf = remoteContent instanceof Buffer
+            ? remoteContent.buffer.slice(remoteContent.byteOffset, remoteContent.byteOffset + remoteContent.byteLength)
+            : remoteContent;
 
         // Try 3-way text merge if enabled
         if (this.conflictStrategy === 'three-way-merge' && typeof localContent === 'string' && typeof remoteContent === 'string') {
@@ -312,7 +333,8 @@ export class VirtualDevice {
             filePath: msg.path,
             localContent,
             localMtime,
-            remoteContent: typeof remoteContent === 'string' ? remoteContent : remoteContent.buffer,
+            localDeviceId: this.deviceId,
+            remoteContent: remoteBuf,
             remoteMtime: msg.mtime,
             remoteDeviceId: msg.deviceId,
             myRole: this.role
@@ -326,21 +348,48 @@ export class VirtualDevice {
                 await this.storage.write(msg.path, msg.content, msg.mtime);
                 this.baseContents.set(msg.path, msg.content);
             }
-        } else if (outcome.action === 'write-merged' && typeof outcome.contentToSave === 'string') {
-            await this.storage.write(msg.path, outcome.contentToSave, Math.max(localMtime, msg.mtime) + 1);
-            this.baseContents.set(msg.path, outcome.contentToSave);
-        } else if (outcome.action === 'create-conflict-file' && outcome.conflictFilePath) {
-            if (msg.isBinary) {
-                const buf = Buffer.from(msg.content, 'base64');
-                await this.storage.writeBinary(outcome.conflictFilePath, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength), msg.mtime);
-            } else {
-                await this.storage.write(outcome.conflictFilePath, msg.content, msg.mtime);
-            }
+            this.fileVersions.set(msg.path, VersionVectorManager.merge(localVV, remoteVV));
+            return;
         }
 
-        const mergedVV = VersionVectorManager.merge(localVV, remoteVV);
-        mergedVV[this.deviceId] = (mergedVV[this.deviceId] || 0) + 1;
-        this.fileVersions.set(msg.path, mergedVV);
+        if (outcome.action === 'keep-local') {
+            this.fileVersions.set(msg.path, VersionVectorManager.merge(localVV, remoteVV));
+            return;
+        }
+
+        if (outcome.action === 'write-merged' && typeof outcome.contentToSave === 'string') {
+            await this.storage.write(msg.path, outcome.contentToSave, Math.max(localMtime, msg.mtime) + 1);
+            this.baseContents.set(msg.path, outcome.contentToSave);
+            const mergedVV = VersionVectorManager.merge(localVV, remoteVV);
+            mergedVV[this.deviceId] = (mergedVV[this.deviceId] || 0) + 1;
+            this.fileVersions.set(msg.path, mergedVV);
+            return;
+        }
+
+        if (outcome.action === 'create-conflict-file' && outcome.conflictFilePath) {
+            const conflictData = outcome.conflictFileContent ?? localContent;
+            const conflictMtime = msg.mtime ?? localMtime;
+            if (typeof conflictData === 'string') {
+                await this.storage.write(outcome.conflictFilePath, conflictData, conflictMtime);
+            } else {
+                const ab = conflictData instanceof ArrayBuffer ? conflictData : (conflictData as any).buffer;
+                await this.storage.writeBinary(outcome.conflictFilePath, ab, conflictMtime);
+            }
+            this.fileVersions.set(outcome.conflictFilePath, { [this.deviceId]: 1 });
+
+            // If remote won, adopt remote on the primary path
+            if (outcome.contentToSave) {
+                if (msg.isBinary) {
+                    const buf = Buffer.from(msg.content, 'base64');
+                    await this.storage.writeBinary(msg.path, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength), msg.mtime);
+                } else {
+                    await this.storage.write(msg.path, msg.content, msg.mtime);
+                    this.baseContents.set(msg.path, msg.content);
+                }
+            }
+            this.fileVersions.set(msg.path, VersionVectorManager.merge(localVV, remoteVV));
+            return;
+        }
     }
 
     public async destroy() {

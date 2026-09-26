@@ -56,8 +56,9 @@ describe('Stress Test: Randomized Endurance & Fuzzing', () => {
             if (actionRoll < 0.50 || filePool.length === 0) {
                 // Action 1: Create or overwrite file
                 const path = `notes/note_${Math.floor(prng.next() * 15)}.md`;
-                const content = `Step ${step}: updated by ${peer.deviceId} at ${Date.now()}`;
-                await peer.writeFile(path, content);
+                const content = `Step ${step}: updated by ${peer.deviceId}`;
+                const mtime = 1700000000000 + step * 10;
+                await peer.writeFile(path, content, mtime);
                 if (!filePool.includes(path)) filePool.push(path);
             } else if (actionRoll < 0.75) {
                 // Action 2: Trigger partial sync

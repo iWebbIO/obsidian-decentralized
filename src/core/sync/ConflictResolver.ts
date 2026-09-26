@@ -13,7 +13,7 @@ export interface ConflictResolutionOutcome {
 export class ConflictResolver {
     private dmp = new DiffMatchPatch();
 
-    constructor(private mtimeToleranceMs: number = 2000) {}
+    constructor(public readonly mtimeToleranceMs: number = 2000) {}
 
     /**
      * Compute a conflict path for a file.
@@ -28,6 +28,25 @@ export class ConflictResolver {
         const base = originalPath.substring(0, lastDot);
         const ext = originalPath.substring(lastDot);
         return `${base}.conflict-${sanitizedPeer}-${timestamp}${ext}`;
+    }
+
+    /**
+     * Compare text or binary contents for exact equality.
+     */
+    public areContentsEqual(a: string | ArrayBuffer, b: string | ArrayBuffer): boolean {
+        if (typeof a === 'string' && typeof b === 'string') {
+            return a === b;
+        }
+        if (a instanceof ArrayBuffer && b instanceof ArrayBuffer) {
+            if (a.byteLength !== b.byteLength) return false;
+            const ua = new Uint8Array(a);
+            const ub = new Uint8Array(b);
+            for (let i = 0; i < ua.length; i++) {
+                if (ua[i] !== ub[i]) return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -63,7 +82,8 @@ export class ConflictResolver {
         remoteContent,
         remoteMtime,
         remoteDeviceId,
-        myRole
+        myRole,
+        localDeviceId
     }: {
         strategy: ConflictStrategy;
         filePath: string;
@@ -73,7 +93,16 @@ export class ConflictResolver {
         remoteMtime: number;
         remoteDeviceId: string;
         myRole: DeviceRole;
+        localDeviceId?: string;
     }): ConflictResolutionOutcome {
+        if (this.areContentsEqual(localContent, remoteContent)) {
+            return { action: 'keep-local' };
+        }
+
+        const remoteIsNewer = (remoteMtime !== localMtime)
+            ? remoteMtime > localMtime
+            : (remoteDeviceId > (localDeviceId ?? ''));
+
         switch (strategy) {
             case 'role-based':
                 if (myRole === 'primary') {
@@ -83,7 +112,7 @@ export class ConflictResolver {
                 }
 
             case 'last-write-wins':
-                if (remoteMtime > localMtime + this.mtimeToleranceMs) {
+                if (remoteIsNewer) {
                     return { action: 'adopt-remote', contentToSave: remoteContent };
                 } else {
                     return { action: 'keep-local' };
@@ -97,11 +126,12 @@ export class ConflictResolver {
                         return { action: 'write-merged', contentToSave: mergedText };
                     }
                 }
-                // Fallback to creating conflict file if merge fails or is binary
+                // Fallback to conflict file if merge fails or is binary
                 return {
                     action: 'create-conflict-file',
                     conflictFilePath: this.getConflictPath(filePath, remoteDeviceId, remoteMtime),
-                    conflictFileContent: remoteContent
+                    conflictFileContent: remoteContent,
+                    contentToSave: remoteIsNewer ? remoteContent : undefined
                 };
 
             case 'create-conflict-file':
@@ -109,7 +139,8 @@ export class ConflictResolver {
                 return {
                     action: 'create-conflict-file',
                     conflictFilePath: this.getConflictPath(filePath, remoteDeviceId, remoteMtime),
-                    conflictFileContent: remoteContent
+                    conflictFileContent: remoteContent,
+                    contentToSave: remoteIsNewer ? remoteContent : undefined
                 };
         }
     }
