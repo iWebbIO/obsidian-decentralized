@@ -1,0 +1,48 @@
+name: Stress & Endurance Testing
+
+on:
+  schedule:
+    # Run nightly at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of randomized endurance fuzzing iterations'
+        required: false
+        default: '200'
+        type: string
+      seed:
+        description: 'Hex seed for deterministic reproducibility (e.g. 0xCAFEBABE)'
+        required: false
+        default: '0xCAFEBABE'
+        type: string
+
+jobs:
+  stress-test:
+    name: Multi-Instance Virtual Device Stress
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20.x, 22.x]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Multi-Instance Simulation Tests
+        run: npm run test:simulation
+
+      - name: Run High-Intensity Stress Tests
+        env:
+          STRESS_ITERATIONS: ${{ github.event.inputs.iterations || '200' }}
+          STRESS_SEED: ${{ github.event.inputs.seed || '0xCAFEBABE' }}
+        run: npm run test:stress

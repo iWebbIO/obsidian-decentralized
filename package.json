@@ -11,6 +11,8 @@
     "build": "rollup --config rollup.config.mjs --environment BUILD:production",
     "typecheck": "tsc --noEmit",
     "test": "jest",
+    "test:stress": "jest tests/stress/",
+    "test:simulation": "jest tests/simulation.test.ts",
     "test:mobile-load": "node scripts/check-mobile-load.mjs"
   },
   "keywords": [
