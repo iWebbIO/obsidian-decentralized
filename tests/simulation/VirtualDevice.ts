@@ -68,6 +68,13 @@ export class VirtualDevice {
         this.peers.add(peerId);
     }
 
+    public async disconnectFrom(peerId: string) {
+        this.peers.delete(peerId);
+        if (this.transport) {
+            await this.transport.disconnect(peerId);
+        }
+    }
+
     public async syncWith(peerId: string): Promise<void> {
         const root = await this.merkleManager.getMerkleTree();
         await this.sendMessage(peerId, {
@@ -340,4 +347,23 @@ export class VirtualDevice {
         if (this.unsubscribeTransport) this.unsubscribeTransport();
         if (this.unsubscribeStorage) this.unsubscribeStorage();
     }
+}
+
+/**
+ * Polls anti-entropy reconciliation rounds until all devices reach identical Merkle roots.
+ */
+export async function waitForConvergence(devices: VirtualDevice[], maxWaitMs: number = 3000): Promise<boolean> {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+        for (const dev of devices) {
+            await dev.syncAll();
+        }
+        await new Promise(r => setTimeout(r, 60));
+        const roots = await Promise.all(devices.map(d => d.getMerkleRoot()));
+        const first = roots[0];
+        if (first && roots.every(r => r === first)) {
+            return true;
+        }
+    }
+    return false;
 }

@@ -1,5 +1,5 @@
 import { SimulatedNetwork, SimulatedTransport } from '../simulation/SimulatedNetwork';
-import { VirtualDevice } from '../simulation/VirtualDevice';
+import { VirtualDevice, waitForConvergence } from '../simulation/VirtualDevice';
 
 describe('Stress Test: Network Chaos & Partition Recovery', () => {
     let network: SimulatedNetwork;
@@ -44,8 +44,7 @@ describe('Stress Test: Network Chaos & Partition Recovery', () => {
     test('recovers from split-brain network partition after healing', async () => {
         // Initial sync state
         await devA.writeFile('common.md', 'Base content');
-        await devA.syncAll();
-        await new Promise(r => setTimeout(r, 80));
+        await waitForConvergence([devA, devB, devC], 1500);
 
         expect(await devB.storage.read('common.md')).toBe('Base content');
         expect(await devC.storage.read('common.md')).toBe('Base content');
@@ -56,12 +55,12 @@ describe('Stress Test: Network Chaos & Partition Recovery', () => {
         // Mutations on side 1 (A & B)
         await devA.writeFile('side1.md', 'Written in partition 1');
         await devA.syncWith('node-B');
-        await new Promise(r => setTimeout(r, 80));
+        await new Promise(r => setTimeout(r, 60));
 
         // Mutation on side 2 (C)
         await devC.writeFile('side2.md', 'Written in partition 2');
         await devC.syncWith('node-A'); // Should be dropped
-        await new Promise(r => setTimeout(r, 80));
+        await new Promise(r => setTimeout(r, 60));
 
         // Node C must not have side1.md yet, and Node A must not have side2.md
         expect(await devC.storage.exists('side1.md')).toBe(false);
@@ -71,16 +70,8 @@ describe('Stress Test: Network Chaos & Partition Recovery', () => {
         network.heal();
 
         // Trigger reconciliation sync across all peers
-        await devA.syncAll();
-        await devB.syncAll();
-        await devC.syncAll();
-        await new Promise(r => setTimeout(r, 150));
-
-        // Repeat to ensure transitive closure
-        await devA.syncAll();
-        await devB.syncAll();
-        await devC.syncAll();
-        await new Promise(r => setTimeout(r, 150));
+        const converged = await waitForConvergence([devA, devB, devC], 2500);
+        expect(converged).toBe(true);
 
         // All nodes must now have all files
         for (const dev of [devA, devB, devC]) {
@@ -98,6 +89,10 @@ describe('Stress Test: Network Chaos & Partition Recovery', () => {
     });
 
     test('converges under packet loss and jitter', async () => {
+        // Disconnect devC so this test isolates two peers under network fault injection
+        await devA.disconnectFrom('node-C');
+        await devB.disconnectFrom('node-C');
+
         // Configure 10% packet drop and 5-15ms latency jitter
         network.setFaults({
             packetLossRate: 0.10,
@@ -108,18 +103,22 @@ describe('Stress Test: Network Chaos & Partition Recovery', () => {
         await devA.writeFile('resilience.md', 'Packet loss resilient content');
         await devB.writeFile('other.md', 'Another resilient file');
 
-        // Repeated sync passes (simulating retry loops)
-        for (let pass = 0; pass < 5; pass++) {
+        // Repeated sync passes (simulating retry loops under active chaos)
+        for (let pass = 0; pass < 6; pass++) {
             await devA.syncAll();
             await devB.syncAll();
-            await new Promise(r => setTimeout(r, 80));
+            await new Promise(r => setTimeout(r, 60));
         }
 
         // Disable faults to settle
         network.setFaults({ packetLossRate: 0, minLatencyMs: 0, maxLatencyMs: 0 });
-        await devA.syncAll();
-        await devB.syncAll();
-        await new Promise(r => setTimeout(r, 80));
+
+        // Allow any in-flight delayed timer packets to completely drain
+        await new Promise(r => setTimeout(r, 100));
+
+        // Reconcile and wait for convergence
+        const converged = await waitForConvergence([devA, devB], 3000);
+        expect(converged).toBe(true);
 
         expect(await devA.storage.exists('other.md')).toBe(true);
         expect(await devB.storage.exists('resilience.md')).toBe(true);
