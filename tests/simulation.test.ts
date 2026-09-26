@@ -90,11 +90,8 @@ describe('Virtual Device Simulation Harness', () => {
             transport1 = new LoopbackTransport('node-1');
             transport2 = new LoopbackTransport('node-2');
 
-            const port1 = await transport1.listen();
             const port2 = await transport2.listen();
-
             await transport1.connect('node-2', port2);
-            await transport2.connect('node-1', port1);
 
             device1.attachTransport(transport1);
             device2.attachTransport(transport2);

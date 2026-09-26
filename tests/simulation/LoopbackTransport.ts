@@ -15,6 +15,7 @@ export class LoopbackTransport implements INetworkTransport {
     private wss: any = null;
     private port: number = 0;
     private connections: Map<string, any> = new Map();
+    private allSockets: Set<any> = new Set();
     private messageListeners: Set<MessageHandler> = new Set();
     private connectListeners: Set<PeerEventHandler> = new Set();
     private disconnectListeners: Set<PeerEventHandler> = new Set();
@@ -58,6 +59,7 @@ export class LoopbackTransport implements INetworkTransport {
     }
 
     private setupSocket(peerId: string, ws: any) {
+        this.allSockets.add(ws);
         this.connections.set(peerId, ws);
 
         for (const handler of this.connectListeners) {
@@ -71,6 +73,7 @@ export class LoopbackTransport implements INetworkTransport {
         });
 
         ws.on('close', () => {
+            this.allSockets.delete(ws);
             this.connections.delete(peerId);
             for (const handler of this.disconnectListeners) {
                 try { handler(peerId); } catch (_) {}
@@ -78,6 +81,7 @@ export class LoopbackTransport implements INetworkTransport {
         });
 
         ws.on('error', () => {
+            this.allSockets.delete(ws);
             this.connections.delete(peerId);
         });
     }
@@ -115,6 +119,7 @@ export class LoopbackTransport implements INetworkTransport {
         const ws = this.connections.get(peerId);
         if (ws) {
             ws.close();
+            this.allSockets.delete(ws);
             this.connections.delete(peerId);
         }
     }
@@ -124,12 +129,13 @@ export class LoopbackTransport implements INetworkTransport {
     }
 
     public async close(): Promise<void> {
-        for (const ws of this.connections.values()) {
+        for (const ws of this.allSockets) {
             try {
                 if (typeof ws.terminate === 'function') ws.terminate();
                 else ws.close();
             } catch (_) {}
         }
+        this.allSockets.clear();
         this.connections.clear();
 
         if (this.wss) {
