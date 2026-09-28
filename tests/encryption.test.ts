@@ -126,3 +126,69 @@ describe('paired links', () => {
         expect(refusals()).toEqual([]);
     });
 });
+
+describe('pairing-key hygiene', () => {
+    test('the plaintext handshake never carries the active pairing key', async () => {
+        // getMyPeerInfo embeds the ACTIVE PSK for the LAN beacon, and the handshake to
+        // an unknown peer goes out in plaintext — sending that key in the clear handed
+        // it to whoever dialed during a pairing window, with no user action on this side.
+        const a = await createDevice(A);
+        const plugin: any = a.plugin;
+        await plugin.beginPairingWindow();
+        expect(plugin.getActivePsk()).toBeTruthy();
+
+        const sent: any[] = [];
+        const conn = { peer: 'device-ffff0009', open: true, send: (m: any) => sent.push(m) };
+
+        await (plugin as any).sendHandshake(conn);
+
+        expect(sent).toHaveLength(1);
+        expect(sent[0].peerInfo.pairingKey).toBeUndefined();
+    });
+
+    test('forgetting a device rotates the pairing key it still holds', async () => {
+        // beginPairingWindow reused the same PSK forever, so a forgotten device still
+        // holding it re-adopted the key on the next window and unblocked itself — the
+        // device re-paired itself with no user action.
+        const a = await createDevice(A);
+        const plugin: any = a.plugin;
+        const first = await plugin.beginPairingWindow();
+
+        await plugin.forgetDevice('device-ffff0009');
+
+        expect(plugin.getActivePsk()).toBeNull();
+        const second = await plugin.beginPairingWindow();
+        expect(second).toBeTruthy();
+        expect(second).not.toBe(first);
+    });
+
+    test('a removed device cannot re-enrol through the active pairing key', async () => {
+        const a = await createDevice(A, { settings: { blockedPeers: ['device-ffff0009'] } });
+        const plugin: any = a.plugin;
+        await plugin.beginPairingWindow();
+
+        // Whatever it sends — a frame encrypted under the key it still holds, or
+        // garbage — must not adopt, unblock or persist anything.
+        await plugin.handleRawIncomingData(
+            { type: 'encrypted-frame', data: new Uint8Array(13).buffer },
+            { peer: 'device-ffff0009', open: true, send: jest.fn() });
+        await sleep(20);
+
+        expect(plugin.settings.peerKeys['device-ffff0009']).toBeUndefined();
+        expect(plugin.settings.blockedPeers).toContain('device-ffff0009');
+    });
+
+    test('a failed settings save still drops the stale cached key', async () => {
+        const a = await createDevice(A);
+        const plugin: any = a.plugin;
+        // Simulate a cached key for a peer whose stored PSK just changed.
+        plugin.cryptoKeys.set('device-ffff0009', {} as any);
+        plugin.settings.peerKeys['device-ffff0009'] = 'new-value';
+        const failing = jest.spyOn(plugin, 'saveData').mockRejectedValueOnce(new Error('disk full'));
+
+        await expect(plugin.saveSettings()).rejects.toThrow('disk full');
+
+        expect(plugin.cryptoKeys.size).toBe(0);
+        failing.mockRestore();
+    });
+});

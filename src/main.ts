@@ -1000,13 +1000,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async saveSettings() {
+        // Drop cached CryptoKeys BEFORE the write: a failed saveData used to skip the
+        // invalidation entirely, leaving the cache holding the key for the peerKeys
+        // that had already changed in memory — every later encrypt/decrypt used it.
+        this.invalidateCryptoKey();
         await this.saveData(this.settings);
         // Invalidate folder filter caches so isPathSyncable picks up the new values immediately
         this._cachedExcludedFolders = null;
         this._cachedIncludedFolders = null;
-        // A PSK may have been added, rotated or removed — drop cached CryptoKeys so a
-        // stale key is never reused for a peer.
-        this.invalidateCryptoKey();
         void this.configSync?.onSettingsChanged();
     }
     async saveKnownPeers() {
@@ -2598,7 +2599,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * gate refuses — and what an impersonator would send.
      */
     private async sendHandshake(conn: DataConnection) {
-        const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), protocolVersion: PROTOCOL_VERSION };
+        // persistablePeerInfo strips the ephemeral pairing key: the handshake goes out
+        // in PLAINTEXT to peers we hold no key for, and getMyPeerInfo embeds the ACTIVE
+        // PAIRING KEY for the LAN beacon. Sending that in the clear handed the key to
+        // whoever dialed during a pairing window, with no user action on this side —
+        // only the beacon is supposed to carry it.
+        const payload = { type: 'handshake', peerInfo: persistablePeerInfo(this.getMyPeerInfo()), protocolVersion: PROTOCOL_VERSION };
         if (!this.peerKeyFor(conn.peer)) {
             conn.send(payload);
             return;
@@ -2642,7 +2648,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 // A peer pairing via the active QR code has no stored key yet. Adopt the
                 // active PSK provisionally, and roll it back if it does not decrypt.
                 // getActivePsk() returns null once the pairing window has closed.
-                this.settings.peerKeys[conn.peer] = this.getActivePsk()!;
+                // Captured once: the window can expire between the check and the write,
+                // which used to store a null "key".
+                const activePsk = this.getActivePsk()!;
+                // A removed device must not re-enrol itself with the key it still holds:
+                // adopting first and unblocking left it re-paired with no user action.
+                if (this.isBlocked(conn.peer)) {
+                    this.log(`Refusing to re-enrol removed device ${conn.peer} through the active pairing key.`);
+                    return;
+                }
+                this.settings.peerKeys[conn.peer] = activePsk;
                 this.invalidateCryptoKey(conn.peer);
                 try {
                     data = await this.decryptPayload(raw, conn.peer);
@@ -3314,6 +3329,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         this.scheduleStateSave();
         delete this.settings.peerKeys[deviceId];
+        // A forgotten device typically still holds the pairing key it was given, and
+        // beginPairingWindow reused the same key forever — so on the next window its
+        // encrypted frame re-adopted it and unblocked it: the device re-paired itself
+        // with no user action. Clearing the key here forces the next window to mint a
+        // fresh one the forgotten device does not hold.
+        this.activePsk = null;
+        this.activePskExpiresAt = 0;
         this.invalidateCryptoKey(deviceId);
         if (this.settings.companionPeerId === deviceId) this.settings.companionPeerId = undefined;
         if (!this.settings.blockedPeers) this.settings.blockedPeers = [];
@@ -3572,11 +3594,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let lastYieldTime = Date.now();
         const transferStartTime = Date.now();
         
-        const encryptFor = !!this.peerKeyFor(peerId);
+        // Re-evaluated per chunk, not snapshotted: the key regime can change mid-transfer
+        // (a re-pair, an adopt, a forget), and a transfer that started plaintext kept
+        // sending plaintext to a peer that now refuses it — every remaining chunk
+        // silently dropped until the 300 s ack timeout burned through the whole retry
+        // ladder before a fresh send picked the right regime.
+        const keyApplies = () => !!this.peerKeyFor(peerId);
 
         if (startIndex === 0) {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector, totalBytes: fileContent.byteLength, chunkSize };
-            const encPayload = encryptFor ? await this.encryptPayload(startPayload, peerId) : startPayload;
+            const encPayload = keyApplies() ? await this.encryptPayload(startPayload, peerId) : startPayload;
             await this.sendPayloadTo(peerId, encPayload);
             this.resetIdleTimeout();
         }
@@ -3611,6 +3638,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 // ciphertext anyway, so slicing here was a wasted copy of every chunk.
                 // The plaintext path still needs a detached buffer, because the transport
                 // serialises it asynchronously and must not observe a moving window.
+                const encryptFor = keyApplies();
                 const chunk: ArrayBuffer | Uint8Array = encryptFor
                     ? new Uint8Array(fileContent, start, end - start)
                     : fileContent.slice(start, end);
