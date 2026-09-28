@@ -57,6 +57,8 @@ export interface ConfigAdapter {
 
 export interface ConfigSyncHost {
     adapter: ConfigAdapter;
+    /** How long to remember config deletions; mirrors the vault tombstone setting. */
+    tombstoneRetentionMs(): number;
     configDir(): string;
     /** This plugin's own folder, relative to the config folder (e.g. plugins/obsidian-decentralized). */
     ownPluginFolder(): string;
@@ -212,6 +214,7 @@ export class ConfigSync {
 
     private async doScan() {
         if (this.disposed || this.host.scope() === 'off') return;
+        this.pruneTombstones();
         const announce = this.scannedOnce;
         const seen = new Set<string>();
         let changed = false;
@@ -234,6 +237,22 @@ export class ConfigSync {
 
         this.scannedOnce = true;
         if (changed) this.host.stateChanged();
+    }
+
+    /** Config tombstones had no expiry: every config path ever deleted stayed in
+     *  state.json for the vault's life and was advertised to every peer on every
+     *  connect, with no retention cutoff. */
+    private pruneTombstones() {
+        const retentionMs = this.host.tombstoneRetentionMs() || 30 * 24 * 60 * 60 * 1000;
+        const now = Date.now();
+        let pruned = false;
+        for (const [rel, at] of Object.entries(this.state.tombstones)) {
+            if (now - at > retentionMs) {
+                delete this.state.tombstones[rel];
+                pruned = true;
+            }
+        }
+        if (pruned) this.host.stateChanged();
     }
 
     /**
@@ -265,7 +284,18 @@ export class ConfigSync {
             }
             return true;
         }
-        if (stat.size > MAX_CONFIG_FILE_BYTES) return false;
+        if (stat.size > MAX_CONFIG_FILE_BYTES) {
+            // Silently returning kept a stale baseline entry, so the manifest went on
+            // advertising a version this device refuses to deliver — every reconnect
+            // re-requested it and every send no-opped, forever. Drop the entry (the
+            // file is simply not synced) and say so once.
+            this.host.log(`Config sync: ${rel} is over the ${(MAX_CONFIG_FILE_BYTES / 1024 / 1024)} MB cap and will not be synced.`);
+            if (this.state.baseline[rel]) {
+                delete this.state.baseline[rel];
+                return true;
+            }
+            return false;
+        }
         if (known && known.mtime === stat.mtime && known.size === stat.size) return false;
 
         let hash: string;
@@ -408,14 +438,28 @@ export class ConfigSync {
         }
         const content = bytes.slice().buffer;
         if (await this.host.hash(content) !== msg.hash) {
-            this.host.log(`Config sync: ${rel} from ${peer} did not match its hash; ignored.`);
+            // A mismatch means transport trouble (the sender hashes the bytes it
+            // read), and config messages carry no ack — without this, the file
+            // silently diverged until the next reconnect. Ask again.
+            this.host.log(`Config sync: ${rel} from ${peer} did not match its hash; requesting it again.`);
+            this.host.send(peer, { type: 'config-request', configPaths: [rel] } as any);
             return;
         }
 
         await this.refreshOne(rel);
         const local = this.state.baseline[rel];
         if (local) {
-            if (local.hash === msg.hash) return;
+            if (local.hash === msg.hash) {
+                // Identical content: fold the fresher mtime into the baseline. The
+                // stale value (a write landing between the sender's stat and read)
+                // used to survive and could lose a later three-way comparison to a
+                // third device holding older content with an in-between mtime.
+                if (msg.mtime > (local.mtime ?? 0)) {
+                    this.state.baseline[rel] = { ...local, mtime: msg.mtime };
+                    this.host.stateChanged();
+                }
+                return;
+            }
             if (!this.remoteWins(peer, rel, msg, local)) {
                 // Ours is newer: make sure they get it.
                 await this.sendFile(peer, rel);
@@ -430,6 +474,14 @@ export class ConfigSync {
         }
 
         try {
+            // Decide against fresh bytes: a local save landing between the refresh
+            // above and this write would be silently clobbered — and the baseline
+            // then recorded the sender's hash for it, so no later scan noticed.
+            const fresh = await this.host.adapter.stat(this.abs(rel));
+            if (fresh && local && (fresh.mtime !== local.mtime || fresh.size !== local.size)) {
+                this.host.log(`Config sync: ${rel} changed locally during transfer; keeping the local version.`);
+                return;
+            }
             await this.ensureParents(rel);
             await this.host.adapter.writeBinary(this.abs(rel), content, { mtime: msg.mtime });
         } catch (e) {
@@ -469,6 +521,13 @@ export class ConfigSync {
         }
         const path = this.abs(rel);
         try {
+            // A file recreated between the refresh and this trash would be destroyed
+            // with no record; leave it and let the next manifest re-offer it.
+            const fresh = await this.host.adapter.stat(path);
+            if (fresh && local && (fresh.mtime !== local.mtime || fresh.size !== local.size)) {
+                this.host.log(`Config sync: ${rel} changed locally during transfer; keeping the local version.`);
+                return;
+            }
             const trashed = await this.host.adapter.trashSystem(path).catch(() => false);
             if (!trashed) await this.host.adapter.trashLocal(path);
         } catch (e) {

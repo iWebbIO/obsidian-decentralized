@@ -487,6 +487,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         this.configSync = new ConfigSync({
             adapter: this.app.vault.adapter as any,
+            tombstoneRetentionMs: () => (this.settings.tombstoneRetentionDays || 30) * 24 * 60 * 60 * 1000,
             configDir: () => this.app.vault.configDir || '.obsidian',
             ownPluginFolder: () => {
                 const configDir = this.app.vault.configDir || '.obsidian';
@@ -1143,6 +1144,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (this.twoDeviceState.fileVersions) delete this.twoDeviceState.fileVersions[path];
                 pruned = true;
             }
+        }
+        // A count cap for churn within the retention window: a flood of short-lived
+        // synced files (temp exports, generated names) grew the map — and every
+        // state.json write — without bound until retention pruned them.
+        const MAX_TOMBSTONES = 10000;
+        if (Object.keys(this.tombstones).length > MAX_TOMBSTONES) {
+            const byAge = Object.entries(this.tombstones).sort(([, a], [, b]) => a - b);
+            for (const [path] of byAge.slice(0, byAge.length - MAX_TOMBSTONES)) delete this.tombstones[path];
+            pruned = true;
         }
         if (pruned) this.scheduleStateSave();
     }
@@ -2643,6 +2653,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async retryFailedSyncs() {
         if (this.failedSyncs.length === 0) return;
+        // Bounded like every other durable collection: a long offline stretch with
+        // many changed paths grew the array (and every state.json write) without cap.
+        const MAX_FAILED_SYNCS = 1000;
+        if (this.failedSyncs.length > MAX_FAILED_SYNCS) {
+            this.failedSyncs.splice(0, this.failedSyncs.length - MAX_FAILED_SYNCS);
+            this.scheduleStateSave();
+        }
+        // Removed devices are gone regardless of the connection state: their parked
+        // entries are not deliverable, ever.
+        const before = this.failedSyncs.length;
+        this.failedSyncs = this.failedSyncs.filter(f => !f.peerId || !this.isBlocked(f.peerId));
+        if (this.failedSyncs.length !== before) this.scheduleStateSave();
         if (!this.hasPeers()) return;
 
         const now = Date.now();
@@ -2650,6 +2672,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         for (let i = this.failedSyncs.length - 1; i >= 0; i--) {
             const fail = this.failedSyncs[i];
+            // A parked entry whose own target is unreachable burns its whole attempt
+            // budget against a dead link (a 60 s cycle at a time) and then blames a
+            // device that is simply offline. Leave it parked for a live link instead.
+            if (fail.peerId) {
+                const conn = this.connections.get(fail.peerId);
+                const directIpTarget = this.getConnectionMode() === 'direct-ip'
+                    && ((this.directIpServer?.hasClient(fail.peerId)) || (fail.peerId === 'direct-ip-host' && this.directIpClient?.isOpen));
+                if ((conn?.open ?? false) !== true && !directIpTarget) continue;
+            }
             const backoffMs = 30000 * Math.pow(2, fail.retryCount || 0);
 
             if (now - fail.timestamp > backoffMs) {
@@ -3757,6 +3788,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.connections.get(deviceId)?.close();
         this.connections.delete(deviceId);
         this.clusterPeers.delete(deviceId);
+        // Nothing more is deliverable to a removed device: its parked failures and
+        // queued work would otherwise retry toward a blocked target forever.
+        this.failedSyncs = this.failedSyncs.filter(f => f.peerId !== deviceId);
+        this.queueManager.clearForPeer(deviceId);
         // Paused uploads to it will never resume; left behind they held the status bar on
         // "Sync paused" for good.
         for (const [id, transfer] of this.activeTransfers) {

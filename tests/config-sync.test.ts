@@ -259,3 +259,56 @@ describe('what a device refuses', () => {
         expect(sent.mock.calls.filter(([, m]) => (m as any).type === 'config-delete')).toEqual([]);
     });
 });
+
+describe('config tombstone retention (24/35)', () => {
+    test('config tombstones are pruned past the retention window', async () => {
+        // Every config path ever deleted stayed in state.json for the vault's life
+        // and was advertised to every peer on every connect, with no expiry.
+        const b = await createDevice(B, { vault: vaultWith({ 'appearance.json': ['{}', 1000] }) });
+        const sync: any = b.plugin.configSync;
+        sync.state.tombstones['snippets/old.css'] = Date.now() - 40 * 24 * 3600 * 1000;
+        sync.state.tombstones['snippets/new.css'] = Date.now();
+
+        await sync.scan();
+
+        expect(sync.state.tombstones['snippets/old.css']).toBeUndefined();
+        expect(sync.state.tombstones['snippets/new.css']).toBeDefined();
+    });
+
+    test('an over-cap config file leaves the baseline instead of being advertised forever', async () => {
+        // The manifest advertised a version this device refuses to deliver: every
+        // reconnect re-requested it and every send no-opped, silently, forever.
+        const b = await createDevice(B, { vault: vaultWith({ 'themes/huge.css': ['x'.repeat(17 * 1024 * 1024), 1000] }) });
+        const sync: any = b.plugin.configSync;
+
+        await sync.scan();
+
+        expect(sync.state.baseline['themes/huge.css']).toBeUndefined();
+    });
+});
+
+describe('retry machinery (36)', () => {
+    test('parked entries for a removed peer are dropped, not retried', async () => {
+        // They burned their attempt budget against a blocked target and then blamed
+        // a device the user had deliberately removed.
+        const b = await createDevice(B, { settings: { blockedPeers: ['device-cccc0003'] } });
+        const plugin: any = b.plugin;
+        plugin.failedSyncs.push({ path: 'x.md', peerId: 'device-cccc0003', timestamp: Date.now() - 60_000, type: 'file-update', reason: 'test', retryCount: 0 });
+
+        await plugin.retryFailedSyncs();
+
+        expect(plugin.failedSyncs.some((f: any) => f.peerId === 'device-cccc0003')).toBe(false);
+    });
+
+    test('parked entries for an offline peer stay parked, attempts unburned', async () => {
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        plugin.failedSyncs.push({ path: 'x.md', peerId: 'device-cccc0003', timestamp: Date.now() - 60_000, type: 'file-update', reason: 'test', retryCount: 0 });
+        await b.vault.create('x.md', 'content');
+
+        await plugin.retryFailedSyncs();
+
+        const entry = plugin.failedSyncs.find((f: any) => f.path === 'x.md');
+        expect(entry.retryCount).toBe(0);   // no attempt burned against a dead link
+    });
+});
