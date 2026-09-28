@@ -178,7 +178,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // Receiver-side dedup of retried sync control messages (insertion-ordered, capped)
     private processedMessageIds: Set<string> = new Set();
 
-    private ignoreEvents: Map<string, number> = new Map();
+    /**
+     * Path → active ignore markers. Each marker names the vault event kind its
+     * producer will cause: plugin WRITES suppress modify/create, plugin DELETES
+     * suppress delete, plugin RENAMES suppress rename. Kindless suppression used to
+     * swallow a user's delete/rename/create that landed inside the 2 s window — a
+     * deleted-on-arrival note was then resurrected by the next reconciliation.
+     */
+    private ignoreEvents: Map<string, Array<{ until: number; cause: 'write' | 'delete' | 'rename' }>> = new Map();
     private statusBar: HTMLElement;
     // Persistent status-bar elements plus the last rendered state, so updateStatus can
     // diff instead of rebuilding the DOM on every call.
@@ -428,7 +435,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         // Any vault mutation — local or applied from a peer — makes the cached Merkle
         // tree stale.
-        const onVaultEvent = (file: TAbstractFile, kind?: 'modify') => {
+        const onVaultEvent = (file: TAbstractFile, kind?: 'modify' | 'delete' | 'rename' | 'create') => {
             this.invalidateMerkleTree();
             this.handleEvent(file, kind);
         };
@@ -437,12 +444,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // never happened wins conflicts it should lose. Listen once loading is done.
         this.app.workspace.onLayoutReady(() => {
             if (this.unloaded) return;
-            this.registerEvent(this.app.vault.on('create', onVaultEvent));
+            this.registerEvent(this.app.vault.on('create', (file) => onVaultEvent(file, 'create')));
             this.registerEvent(this.app.vault.on('modify', (file) => onVaultEvent(file, 'modify')));
             this.registerEvent(this.app.vault.on('delete', (file) => {
                 // A removed path can no longer be assumed to exist.
                 this.forgetKnownFolders(file.path);
-                onVaultEvent(file);
+                onVaultEvent(file, 'delete');
             }));
             this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
                 this.invalidateMerkleTree();
@@ -1175,7 +1182,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public getConnectionMode() { return this.settings.connectionMode || 'peerjs'; }
     private hasPeers(): boolean {
         if (this.getConnectionMode() === 'direct-ip') {
-            return !!this.directIpClient || !!this.directIpServer;
+            // A listening host with nobody joined, or a client whose socket dropped,
+            // is offline for recording purposes: the old check treated the mere
+            // existence of the objects as "connected", so changes took the online
+            // path, parked in failedSyncs and were discarded after five retries.
+            const joined = this.directIpServer ? this.directIpServer.getClients().length : 0;
+            const clientLive = this.directIpClient ? this.directIpClient.isOpen : false;
+            return joined > 0 || clientLive;
         }
         return this.connections.size > 0;
     }
@@ -1183,13 +1196,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private generateTransferId(path: string): string { return `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
     
     // --- File System Events ---
-    private handleEvent(file: TAbstractFile, kind?: 'modify') {
+    private handleEvent(file: TAbstractFile, kind?: 'modify' | 'delete' | 'rename' | 'create') {
         // A change right after we wrote a peer's version is either that write coming back or
         // a real edit on top of it: handleFileChange compares contents to tell. Silencing the
         // path for two seconds instead dropped any edit made in that window — it was never
         // counted or sent.
         const checkContent = kind === 'modify' && this.remoteEchoHashes.has(file.path);
-        if (!checkContent && this.shouldIgnoreEvent(file.path)) return;
+        // Deletes and renames have no content to compare: they are suppressed only by
+        // a marker armed for exactly that kind, so a user's delete inside a write
+        // window still lands (and a plugin delete inside its own window still
+        // doesn't bounce back).
+        const ignoreKind = kind === 'delete' ? 'delete' : kind === 'rename' ? 'rename' : 'write';
+        if (!checkContent && this.shouldIgnoreEvent(file.path, ignoreKind)) return;
         if (!this.isPathSyncable(file.path)) return;
 
         // Record local state even with no peer connected. This used to return here first, so
@@ -1221,8 +1239,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const lock = this.remoteLocks.get(file.path)!;
             if (Date.now() < lock.expiresAt) {
                 this.showNotice(`${file.name} is being edited on another device. Sync will wait.`, 'warning');
-                // Actually delay: re-run this event once the peer's lock expires
-                this.timeoutManager.setTimeout(() => this.handleEvent(file), (lock.expiresAt - Date.now()) + 250);
+                // Actually delay: re-run this event once the peer's lock expires. The
+                // kind travels with it — an echo re-run without it lost the content
+                // compare and could be counted as a local edit.
+                if (checkContent) return;   // an echo is not a competing edit; the hash compare already cleared it
+                this.timeoutManager.setTimeout(() => this.handleEvent(file, kind), (lock.expiresAt - Date.now()) + 250);
                 return;
             } else {
                 this.remoteLocks.delete(file.path);
@@ -1230,7 +1251,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         if (!this.app.vault.getAbstractFileByPath(file.path)) {
-            this.handleFileDelete(file);
+            void this.handleFileDelete(file).catch(e => this.log(`Delete handling for ${file.path} failed:`, e));
             return;
         }
         this.debounceFileChange(file);
@@ -1252,7 +1273,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.pendingFileChanges.delete(path);
             // Re-resolve the file: it may have been renamed or deleted while waiting.
             const current = this.app.vault.getAbstractFileByPath(path);
-            if (current) void this.handleFileChange(current);
+            if (current) void this.handleFileChange(current).catch(e => this.log(`Change flush for ${path} failed:`, e));
         }, this.settings.debounceDelay);
 
         this.pendingFileChanges.set(path, handle);
@@ -1273,6 +1294,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         this.ignoreEvents.delete(file.path);
                         return;
                     }
+                    // Genuine edit inside the window: the marker has done its job —
+                    // leaving it armed swallowed the user's NEXT save in the same 2 s.
+                    this.ignoreEvents.delete(file.path);
                 }
             }
 
@@ -1299,7 +1323,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
     private async handleFileDelete(file: TAbstractFile) { 
         await this.runLocked(file.path, async () => { 
-            if (this.shouldIgnoreEvent(file.path)) return; 
+            if (this.shouldIgnoreEvent(file.path, 'delete')) return; 
             if (!this.isPathSyncable(file.path)) return; 
             this.log(`Processing delete: ${file.path}`); 
             this.syncedHashes.delete(file.path);
@@ -1320,7 +1344,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const [firstLock, secondLock] = [oldPath, file.path].sort();
         await this.runLocked(firstLock, async () => {
             await this.runLocked(secondLock, async () => {
-                if (this.shouldIgnoreEvent(oldPath) || this.shouldIgnoreEvent(file.path)) return;
+                if (this.shouldIgnoreEvent(oldPath, 'rename') || this.shouldIgnoreEvent(file.path, 'rename')) return;
                 const wasSynced = this.isPathSyncable(oldPath);
                 const isSynced = this.isPathSyncable(file.path);
                 if (!wasSynced && !isSynced) return;
@@ -1333,18 +1357,40 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.moveFileRecords(oldPath, file.path);
                     this.recordLocalEdit(file.path);
                     if (!this.hasPeers()) return;
-                    this.ignoreNextEventForPath(file.path);
-                    this.ignoreNextEventForPath(oldPath);
+                    // No ignore markers here: this handler only moves records and queues
+                    // tasks — it never touches the vault, so there is no echo to
+                    // suppress. The 2 s markers used to swallow the user's next edit,
+                    // second rename, or delete of the just-renamed file.
                     if (!wasSynced) {
                         // Moved in from a folder this device does not sync: peers have never
                         // seen it, so a rename would give them nothing to move.
                         void this.sendFileUpdate(file, undefined, true);
                     } else {
                         this.addToQueueTask(null, { taskType: 'send-rename', oldPath, newPath: file.path });
+                        // A change still pending under the old name must not die with
+                        // the rename: its debounce timer re-resolves the OLD path (now
+                        // gone) and silently dropped the edit. Flush it here — the
+                        // content travels with the rename instead.
+                        const pending = this.pendingFileChanges.get(oldPath);
+                        if (pending !== undefined) {
+                            this.timeoutManager.clearTimeout(pending);
+                            this.pendingFileChanges.delete(oldPath);
+                            void this.sendFileUpdate(file, undefined, true);
+                        }
                     }
                 } else if (file instanceof TFolder) {
-                    // Its files each get their own rename event and follow individually.
-                    if (!this.hasPeers() || !wasSynced) return;
+                    // Offline: record each child's move directly. Relying only on the
+                    // per-file rename events left every child's records stranded under
+                    // their dead paths on a platform that does not fire them.
+                    if (!this.hasPeers()) {
+                        if (wasSynced) {
+                            const { files } = this.collectFolderContents(file);
+                            const oldPrefixOf = (p: string) => oldPath + p.slice(file.path.length);
+                            for (const child of files) this.moveFileRecords(oldPrefixOf(child.path), child.path);
+                        }
+                        return;
+                    }
+                    if (!wasSynced) return;
                     this.ignoreNextEventForPath(file.path);
                     this.ignoreNextEventForPath(oldPath);
                     this.broadcastData({ type: 'folder-rename', oldPath, newPath: file.path, transferId: this.generateTransferId(file.path) });
@@ -3925,11 +3971,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         // Sweep expired ignore markers. shouldIgnoreEvent only deletes an entry when the
-        // path is read again, so paths that never receive another event — and every
-        // 'conflict:<path>' cooldown key, which is never read through that helper — leaked
-        // for the lifetime of the session.
-        for (const [p, ignoreUntil] of this.ignoreEvents.entries()) {
-            if (now >= ignoreUntil) this.ignoreEvents.delete(p);
+        // path is read again, so paths that never receive another event leaked for the
+        // lifetime of the session.
+        for (const [p, markers] of this.ignoreEvents.entries()) {
+            if (!markers.some(m => m.until > now)) this.ignoreEvents.delete(p);
         }
 
         if (statusChanged) this.updateStatus();
@@ -4143,11 +4188,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
-    private async handleFileModification(data: FileUpdatePayload, existingFile: TFile, fromPeer?: string) {
+    private async handleFileModification(data: FileUpdatePayload, existingFile: TFile, fromPeer?: string, attempt = 0) {
         try {
+            // The user's writes do not pass through the path lock, so a save can land
+            // between our read and our write: a decision made against the old bytes
+            // erased it, and the echo hash then hid that it happened. If the file
+            // moved under us during the read, decide again against the fresh bytes —
+            // once; a second mid-decision move is the pending debounce's to carry.
+            const statAtRead = { mtime: existingFile.stat.mtime, size: existingFile.stat.size };
             const localContent = (data.encoding === 'binary' || data.encoding === 'base64')
                 ? await this.app.vault.readBinary(existingFile)
                 : await this.app.vault.cachedRead(existingFile);
+            if (attempt === 0 && (existingFile.stat.mtime !== statAtRead.mtime || existingFile.stat.size !== statAtRead.size)) {
+                return this.handleFileModification(data, existingFile, fromPeer, 1);
+            }
 
             const contentIsSame = (data.encoding === 'binary' || data.encoding === 'base64')
                 ? await this.areArrayBuffersEqual(localContent as ArrayBuffer, data.content as ArrayBuffer)
@@ -4155,8 +4209,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
             const localVV = this.twoDeviceState.fileVersions[data.path] || {};
             const remoteVV = data.versionVector || {};
+            // A change still sitting in this path's debounce is an edit the version
+            // vector cannot see yet, and its words are already in localContent. The
+            // causal fast path would overwrite it with no copy, and the flush would
+            // then match the echo hash — the edit vanished. Treat it as what it is:
+            // this device's own unseen edit, so the conflict rules preserve it.
+            const editPendingInDebounce = this.pendingFileChanges.has(data.path);
 
-            if (contentIsSame) {
+            if (contentIsSame && !editPendingInDebounce) {
                 this.log(`Ignoring update (content is identical): ${data.path}`);
                 if (data.fileHash) this.updateHashCache(data.path, data.fileHash, existingFile.stat);
                 this.adoptVector(data.path, mergeVectors(localVV, remoteVV));
@@ -4165,7 +4225,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
             // Version vectors order edits causally, which beats comparing two devices'
             // clocks: the version made with the other already in hand wins.
-            const order = compareVectors(remoteVV, localVV);
+            const order = editPendingInDebounce ? 'concurrent' : compareVectors(remoteVV, localVV);
             if (order === 'after') {
                 this.log(`Applying update (it includes this device's version): ${data.path}`);
                 await this.writeRemoteVersion(existingFile, data);
@@ -4227,7 +4287,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // no edit here ever touched (vaults that differed before the plugin was installed)
         // simply takes the newer version, so a first sync does not litter copies.
         const keepCopy = this.getConflictStrategy() === 'newest-with-copy'
-            && hasOwnUnseenEdit(localVV, remoteVV, this.settings.deviceId);
+            && (hasOwnUnseenEdit(localVV, remoteVV, this.settings.deviceId)
+                // An edit still in the debounce has no vector entry yet; its words are
+                // in the local content that is about to be replaced.
+                || this.pendingFileChanges.has(data.path));
         this.log(`Conflicting versions of ${data.path}: the other device's is newer.${keepCopy ? ' Keeping ours as a conflict copy.' : ''}`);
         const copy = keepCopy ? await this.createConflictCopy(data.path, localContent) : null;
         await this.writeRemoteVersion(existingFile, data);
@@ -4382,7 +4445,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * recoverable. These used to be permanent vault.delete() calls.
      */
     private async trashForPeer(file: TAbstractFile) {
-        this.ignoreNextEventForPath(file.path);
+        this.ignoreNextEventForPath(file.path, 2000, 'delete');
         await this.app.fileManager.trashFile(file);
     }
 
@@ -4446,7 +4509,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.adoptVector(data.path, merged);
                 return;
             }
-            if (hasOwnUnseenEdit(localVV, remoteVV, this.settings.deviceId)) {
+            if (hasOwnUnseenEdit(localVV, remoteVV, this.settings.deviceId) || this.pendingFileChanges.has(data.path)) {
                 const from = this.clusterPeers.get(fromPeer ?? '')?.friendlyName || 'another device';
                 this.showNotice(`${existingFile.name} was deleted on ${from} after it was changed here. This device's version is in the trash.`, 'important', 12000);
             }
@@ -4483,12 +4546,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (fileToRename instanceof TFile && !target) {
                     try {
                         this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`);
-                        this.ignoreNextEventForPath(data.oldPath);
-                        this.ignoreNextEventForPath(data.newPath);
+                        this.ignoreNextEventForPath(data.oldPath, 2000, 'rename');
+                        this.ignoreNextEventForPath(data.newPath, 2000, 'rename');
                         this.moveFileRecords(data.oldPath, data.newPath, data.versionVector);
                         const parent = data.newPath.substring(0, data.newPath.lastIndexOf('/'));
                         if (parent) await this.ensureFolderExists(parent);
                         await this.app.vault.rename(fileToRename, data.newPath);
+                        // The rename preserved the bytes, so the moved hash cache entry
+                        // (or a fresh digest) is the echo hash: an edit saved right after
+                        // the rename now escapes the rename marker via the content
+                        // compare, exactly like other remote writes.
+                        const renamed = this.app.vault.getAbstractFileByPath(data.newPath);
+                        if (renamed instanceof TFile) {
+                            const echoHash = this.syncedHashes.get(data.newPath)?.hash
+                                ?? await this.getHash(this.isBinary(renamed.extension)
+                                    ? await this.app.vault.readBinary(renamed)
+                                    : await this.app.vault.cachedRead(renamed)).catch(() => undefined);
+                            this.noteRemoteWrite(data.newPath, echoHash);
+                        }
                     } catch (e) {
                         console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e);
                         this.showNotice(`Could not rename ${data.oldPath} on this device.`, 'error');
@@ -4569,9 +4644,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (hasOutOfScope) {
                     for (const file of files) await this.trashForPeer(file);
                 } else {
-                    for (const sub of folders) this.ignoreNextEventForPath(sub.path, 5000);
-                    for (const file of files) this.ignoreNextEventForPath(file.path, 5000);
-                    this.ignoreNextEventForPath(folder.path, 5000);
+                    for (const sub of folders) this.ignoreNextEventForPath(sub.path, 2000, 'delete');
+                    for (const file of files) this.ignoreNextEventForPath(file.path, 2000, 'delete');
+                    this.ignoreNextEventForPath(folder.path, 2000, 'delete');
                     await this.app.fileManager.trashFile(folder);
                 }
             } catch (e) {
@@ -4607,17 +4682,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             const target = moved(file.path);
                             const parent = target.substring(0, target.lastIndexOf('/'));
                             if (parent) await this.ensureFolderExists(parent);
-                            this.ignoreNextEventForPath(file.path);
-                            this.ignoreNextEventForPath(target);
+                            this.ignoreNextEventForPath(file.path, 2000, 'rename');
+                            this.ignoreNextEventForPath(target, 2000, 'rename');
                             this.moveFileRecords(file.path, target);
                             await this.app.vault.rename(file, target);
                         }
                     } else {
-                        this.ignoreNextEventForPath(data.oldPath);
-                        this.ignoreNextEventForPath(data.newPath);
+                        this.ignoreNextEventForPath(data.oldPath, 2000, 'rename');
+                        this.ignoreNextEventForPath(data.newPath, 2000, 'rename');
                         for (const item of [...files, ...folders]) {
-                            this.ignoreNextEventForPath(item.path);
-                            this.ignoreNextEventForPath(moved(item.path));
+                            this.ignoreNextEventForPath(item.path, 2000, 'rename');
+                            this.ignoreNextEventForPath(moved(item.path), 2000, 'rename');
                         }
                         for (const file of files) this.moveFileRecords(file.path, moved(file.path));
                         const parent = data.newPath.substring(0, data.newPath.lastIndexOf('/'));
@@ -5480,8 +5555,30 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const hash2 = await this.getHash(buf2);
         return hash1 === hash2;
     }
-    private shouldIgnoreEvent(path: string): boolean { const ignoreUntil = this.ignoreEvents.get(path); if (ignoreUntil && Date.now() < ignoreUntil) { return true; } this.ignoreEvents.delete(path); return false; }
-    public ignoreNextEventForPath(path: string, durationMs = 2000) { this.ignoreEvents.set(path, Date.now() + durationMs); }
+    private shouldIgnoreEvent(path: string, kind?: 'write' | 'delete' | 'rename'): boolean {
+        const markers = this.ignoreEvents.get(path);
+        if (!markers || markers.length === 0) {
+            this.ignoreEvents.delete(path);
+            return false;
+        }
+        const now = Date.now();
+        const alive = markers.filter(m => m.until > now);
+        if (alive.length === 0) {
+            this.ignoreEvents.delete(path);
+            return false;
+        }
+        this.ignoreEvents.set(path, alive);
+        // A marker matches the event it was armed for; a marker for a plugin write
+        // does not suppress the user's delete, and vice versa.
+        return alive.some(m => m.cause === kind);
+    }
+
+    /** Expect a vault event of `cause` from the plugin's own write/delete/rename of `path`. */
+    public ignoreNextEventForPath(path: string, durationMs = 2000, cause: 'write' | 'delete' | 'rename' = 'write') {
+        const markers = this.ignoreEvents.get(path) ?? [];
+        markers.push({ until: Date.now() + durationMs, cause });
+        this.ignoreEvents.set(path, markers);
+    }
     /**
      * Path for a conflict copy. Suffixed with a counter when needed: the date alone meant
      * a second conflict on the same file the same day overwrote the first copy, losing
