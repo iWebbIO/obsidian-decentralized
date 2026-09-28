@@ -61,3 +61,32 @@ describe('cluster gossip', () => {
         expect(plugin.clusterPeers.has('device-eeee0005')).toBe(false);
     });
 });
+
+describe('cluster control messages', () => {
+    test('forget and kick only act on devices this vault knows', async () => {
+        // The target ID is peer-supplied and grows blockedPeers; acting on arbitrary
+        // strings let one malformed message bloat the list without doing anything useful.
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        const before = plugin.settings.blockedPeers.length;
+
+        await plugin.processIncomingData({ type: 'cluster-forget', targetDeviceId: 'device-unknown01' }, fromA());
+        await plugin.processIncomingData({ type: 'cluster-kick', targetDeviceId: 'device-unknown02' }, fromA());
+        await new Promise(r => setTimeout(r, 20));
+
+        expect(plugin.settings.blockedPeers.length).toBe(before);
+        expect(plugin.clusterPeers.has('device-unknown01')).toBe(false);
+        expect(plugin.clusterPeers.has('device-unknown02')).toBe(false);
+    });
+
+    test('a known device can still be forgotten by instruction', async () => {
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        plugin.clusterPeers.set('device-known0003', { deviceId: 'device-known0003', friendlyName: 'Known', ip: null });
+
+        await plugin.processIncomingData({ type: 'cluster-forget', targetDeviceId: 'device-known0003' }, fromA());
+        await waitFor(() => !plugin.clusterPeers.has('device-known0003'), { what: 'the device to be forgotten' });
+
+        expect(plugin.settings.blockedPeers).toContain('device-known0003');
+    });
+});

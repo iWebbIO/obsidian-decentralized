@@ -3230,10 +3230,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             void this.leaveCluster();
             return;
         }
+        // Same reasoning as handleClusterForget: the ID is peer-supplied and feeds
+        // blockedPeers, so only a device this vault knows may be removed by name.
+        if (typeof data.targetDeviceId !== 'string' || !this.clusterPeers.has(data.targetDeviceId)) {
+            this.log(`Ignoring cluster-kick for unknown device: ${data.targetDeviceId}`);
+            return;
+        }
         void this.forgetDevice(data.targetDeviceId, { broadcast: false });
     }
 
     handleClusterRename(data: ClusterRenamePayload) {
+        if (typeof data.targetDeviceId !== 'string' || typeof data.newName !== 'string' || !data.newName.trim()) return;
         if (data.targetDeviceId === this.settings.deviceId) {
             this.settings.friendlyName = data.newName;
             // This handler is synchronous, so a disk failure in saveData had no

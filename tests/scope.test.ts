@@ -232,3 +232,54 @@ describe('Merkle traversal', () => {
         expect(Object.keys(sent[0].children).sort()).toEqual(['Notes', 'top.md']);
     });
 });
+
+describe('malformed peer payloads', () => {
+    test('a text-encoded update with binary content is refused, not written as garbage', async () => {
+        // The encoding decides how content is written; a mismatched pair used to reach
+        // vault.modify and land "[object ArrayBuffer]" in the note — silent
+        // corruption from one malformed message.
+        const vault = new FakeVault();
+        vault.seed('note.md', 'the real note', 1000);
+        const b = await createDevice(B, { vault });
+        const plugin: any = b.plugin;
+
+        // applyFileUpdate is what processIncomingData calls; it must refuse the
+        // message (the caller then nacks it) rather than write anything.
+        await expect(plugin.applyFileUpdate({
+            type: 'file-update', path: 'note.md',
+            content: new Uint8Array([1, 2, 3]).buffer as any,
+            mtime: 2000, encoding: 'utf8', transferId: 't1',
+        }, A)).rejects.toThrow('IntegrityError');
+
+        expect(vault.text('note.md')).toBe('the real note');
+    });
+
+    test('a binary-encoded update with string content is refused', async () => {
+        const vault = new FakeVault();
+        vault.seed('note.md', 'the real note', 1000);
+        const b = await createDevice(B, { vault });
+        const plugin: any = b.plugin;
+
+        await expect(plugin.applyFileUpdate({
+            type: 'file-update', path: 'note.md',
+            content: 'a string where bytes belong' as any,
+            mtime: 2000, encoding: 'binary', transferId: 't2',
+        }, A)).rejects.toThrow('IntegrityError');
+
+        expect(vault.text('note.md')).toBe('the real note');
+    });
+
+    test('a non-finite mtime is refused rather than persisted into the vault stat', async () => {
+        const vault = new FakeVault();
+        vault.seed('note.md', 'the real note', 1000);
+        const b = await createDevice(B, { vault });
+        const plugin: any = b.plugin;
+
+        await expect(plugin.applyFileUpdate({
+            type: 'file-update', path: 'note.md', content: 'peer text',
+            mtime: NaN, encoding: 'utf8', transferId: 't3',
+        }, A)).rejects.toThrow('IntegrityError');
+
+        expect(vault.text('note.md')).toBe('the real note');
+    });
+});
