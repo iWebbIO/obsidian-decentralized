@@ -4515,44 +4515,47 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         });
     }
 
-    async requestFullSyncFromPeer(peerId: string) { 
-        if (this.syncState.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; } 
-        const conn = this.connections.get(peerId); 
-        if (!conn) { this.showNotice("Peer not found.", 'error'); return; } 
-        this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info'); 
-        this.syncState.isSyncing = true; 
-        this.syncState.peerId = peerId;
-        this.syncState.filesTotal = 0;
-        this.syncState.filesTransferred = 0;
-        this.syncState.bytesTotal = 0;
-        this.syncState.bytesTransferred = 0;
-        this.syncState.syncStartTime = Date.now();
-        this.syncState.currentFile = null;
-        this.syncState.currentFileSize = null;
-        this.syncState.inFlightPulls = new Set();
-        this.syncState.activePullBatches = new Set();
-        this.syncState.adaptiveConfig = {
-            maxActiveBatches: 1,
-            filesPerBatch: 50,
-            maxBytesPerBatch: 50 * 1024 * 1024
-        };
-        this.syncState.batchStartTimes = new Map();
-        this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
-        this.localSyncComplete.set(peerId, false);
-        this.peerSyncComplete.set(peerId, false);
-        this.transitionToPhase(SyncPhase.REQUESTING);
-        this.startSyncKeepAlive();
-        this.resetIdleTimeout();
-        
+    async requestFullSyncFromPeer(peerId: string) {
+        if (this.syncState.isSyncing) { this.showNotice("A sync is already in progress.", 'info'); return; }
+        const conn = this.connections.get(peerId);
+        if (!conn) { this.showNotice("Peer not found.", 'error'); return; }
+        // The whole body, including the state-machine mutations before the manifest
+        // build: a synchronous throw there used to leave isSyncing = true with a
+        // floating rejection, healing only when the phase timeout eventually aborted.
         try {
+            this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info');
+            this.syncState.isSyncing = true;
+            this.syncState.peerId = peerId;
+            this.syncState.filesTotal = 0;
+            this.syncState.filesTransferred = 0;
+            this.syncState.bytesTotal = 0;
+            this.syncState.bytesTransferred = 0;
+            this.syncState.syncStartTime = Date.now();
+            this.syncState.currentFile = null;
+            this.syncState.currentFileSize = null;
+            this.syncState.inFlightPulls = new Set();
+            this.syncState.activePullBatches = new Set();
+            this.syncState.adaptiveConfig = {
+                maxActiveBatches: 1,
+                filesPerBatch: 50,
+                maxBytesPerBatch: 50 * 1024 * 1024
+            };
+            this.syncState.batchStartTimes = new Map();
+            this.currentSyncIsTwoDeviceMode = this.isTwoDeviceMode();
+            this.localSyncComplete.set(peerId, false);
+            this.peerSyncComplete.set(peerId, false);
+            this.transitionToPhase(SyncPhase.REQUESTING);
+            this.startSyncKeepAlive();
+            this.resetIdleTimeout();
+
             const localManifest = await this.buildVaultManifest();
             // Remember what we advertised: the plan may only delete files named here, and only
             // while they are unchanged since.
             this.sentManifestMtimes = new Map(
                 localManifest.filter(e => e.type === 'file').map(e => [e.path, (e as FileManifestEntry).mtime])
             );
-            this.log(`Sending sync request with ${localManifest.length} items.`); 
-            await this.sendSyncMessage(peerId, { type: 'request-full-sync', manifest: localManifest }); 
+            this.log(`Sending sync request with ${localManifest.length} items.`);
+            await this.sendSyncMessage(peerId, { type: 'request-full-sync', manifest: localManifest });
         } catch (e) {
             this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check network connection."));
         }

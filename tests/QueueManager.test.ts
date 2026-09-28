@@ -91,13 +91,30 @@ describe('QueueManager', () => {
         expect(manager.getQueueSize()).toBe(0); // It's in pending retries
 
         jest.advanceTimersByTime(5000); // Trigger the retry timeout
-        
+
         expect(manager.getQueueSize()).toBe(0); // Immediately picked up
         expect(manager.getActiveTransfers()).toBe(1);
 
         for (let i = 0; i < 10; i++) await Promise.resolve(); // item succeeds
 
         expect(manager.getActiveTransfers()).toBe(0);
+    });
+
+    test('counts items parked in retry backoff, which are in no queue', async () => {
+        // A UI reading only queue size + active count looked idle while a retry was
+        // pending — and told the user "Nothing is syncing right now."
+        processCallback.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+        manager.addToQueue({ id: 'retry-test', peerId: 'A', retries: 0, priority: 1 });
+
+        for (let i = 0; i < 10; i++) await Promise.resolve(); // item fails
+
+        expect(manager.getRetrying()).toBe(1);
+
+        jest.advanceTimersByTime(5000);
+        for (let i = 0; i < 10; i++) await Promise.resolve(); // item succeeds
+
+        expect(manager.getRetrying()).toBe(0);
     });
 
     test('heap drains strictly in priority order for a large shuffled batch', async () => {

@@ -28,6 +28,11 @@ export class QueueManager {
     private syncQueue: QueueItem[] = [];
     private activeQueueTransfers: number = 0;
     private inQueueOrProcessing: Set<string> = new Set();
+    /**
+     * Items parked in retry backoff: they are in neither the heap nor active count, so
+     * without this number a UI reading only the queue looks idle while work is pending.
+     */
+    private retryingCount: number = 0;
     private maxConcurrency: number = 3;
     private timeoutManager: TimeoutManager;
     private processCallback: (item: QueueItem) => Promise<boolean>;
@@ -142,6 +147,8 @@ export class QueueManager {
 
     public getQueueSize(): number { return this.syncQueue.length; }
     public getActiveTransfers(): number { return this.activeQueueTransfers; }
+    /** Items currently parked in retry backoff (in no queue, but pending work). */
+    public getRetrying(): number { return this.retryingCount; }
 
     private processQueue() {
         if (this.queueIsPaused || this.disposed) return;
@@ -163,9 +170,11 @@ export class QueueManager {
             const scheduleRetry = () => {
                 if (this.disposed) return;
                 item.retries++;
+                this.retryingCount++;
                 // Keep item.id in inQueueOrProcessing during the retry delay
                 // to prevent duplicates from entering the queue in the window.
                 this.timeoutManager.setTimeout(() => {
+                    this.retryingCount--;
                     release();
                     // If clear() ran while we were waiting, the item belongs to an
                     // aborted sync — don't resurrect it into the fresh queue.

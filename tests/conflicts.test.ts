@@ -7,7 +7,7 @@
  */
 import { TFile, Modal } from 'obsidian';
 import { ConflictListModal } from '../src/ui';
-import { createDevice, connect, teardown, waitFor, partition, heal, sleep, Device } from './helpers/harness';
+import { createDevice, connect, teardown, waitFor, partition, heal, sleep, notices, Device } from './helpers/harness';
 import { FakeVault } from './helpers/fake-vault';
 import { SyncPhase } from '../src/types';
 
@@ -309,6 +309,101 @@ describe('resolving a conflict', () => {
         expect(a.vault.text('note.md')).toBe('newer edit on B');
         expect(b.vault.text('note.md')).toBe('newer edit on B');
         expect(sent.mock.calls.filter(([file]) => (file as TFile).path === 'note.md')).toEqual([]);
+    });
+});
+
+
+describe('conflict copies whose original is gone', () => {
+    const COPY = 'note (conflict on 2026-09-28).md';
+
+    function chooseInModal(label: string) {
+        const open = (Modal as any).openModals as any[];
+        const modal = open[open.length - 1];
+        const button = modal.contentEl.findByText(label);
+        if (!button) throw new Error(`No "${label}" button`);
+        button.click();
+    }
+
+    async function orphanedDevice() {
+        // A vault where the original was deleted but the conflict copy survived: the
+        // copy is the only remaining version of that edit.
+        const vault = vaultWith({ 'note.md': ['v1', T], [COPY]: ['the surviving edit', T] });
+        const a = await createDevice(A, { vault });
+        await vault.delete(vault.getAbstractFileByPath('note.md')!);
+        return a;
+    }
+
+    test('the Conflict Center still lists the copy instead of losing it', async () => {
+        const a = await orphanedDevice();
+        const center = (a.plugin as any).conflictCenter as { count(): number; entries(): Iterable<[string, string]>; scanVault(): void };
+
+        center.scanVault();
+
+        expect(center.count()).toBe(1);
+        expect(Array.from(center.entries())).toEqual([['note.md', COPY]]);
+    });
+
+    test('Restore as original brings the surviving edit back under its name', async () => {
+        const a = await orphanedDevice();
+        const list = new ConflictListModal(a.app as any, (a.plugin as any).conflictCenter, a.plugin);
+
+        await (list as any).restoreOrphanCopy(COPY, 'note.md');
+
+        expect(a.vault.has('note.md')).toBe(true);
+        expect(a.vault.text('note.md')).toBe('the surviving edit');
+        expect(a.vault.has(COPY)).toBe(false);
+        expect((a.plugin as any).conflictCenter.count()).toBe(0);
+    });
+
+    test('Delete copy removes it and clears the entry', async () => {
+        const a = await orphanedDevice();
+        const list = new ConflictListModal(a.app as any, (a.plugin as any).conflictCenter, a.plugin);
+
+        await (list as any).deleteOrphanCopy('note.md', COPY);
+
+        expect(a.vault.has(COPY)).toBe(false);
+        expect(a.vault.trashed).toContain(COPY);
+        expect((a.plugin as any).conflictCenter.count()).toBe(0);
+    });
+
+    test('choosing the conflict copy does not clobber a newer version that arrived meanwhile', async () => {
+        // The resolution modal can stay open while background sync writes; applying a
+        // stale snapshot silently overwrote whatever arrived in the meantime.
+        const [a, b] = await (async () => {
+            const vault = vaultWith({ 'note.md': ['v1', T] });
+            const pairB = vaultWith({ 'note.md': ['v1', T] });
+            const a = await createDevice(A, { vault });
+            const b = await createDevice(B, { vault: pairB });
+            await connect(a, b);
+            await partition(a, b);
+            await edit(a, 'note.md', 'older edit on A', T + 10_000);
+            await edit(b, 'note.md', 'newer edit on B', T + 20_000);
+            heal(a, b);
+            await connect(a, b);
+            await waitFor(() => conflictCopies(a).length === 1 && a.vault.text('note.md') === 'newer edit on B', { what: 'the conflict copy' });
+            await settle(a, b);
+            return [a, b] as const;
+        })();
+        const copyPath = conflictCopies(a)[0];
+
+        // The user opens the diff (snapshot taken), then B pushes ANOTHER edit that
+        // lands on A while the modal is still open.
+        const list = new ConflictListModal(a.app as any, (a.plugin as any).conflictCenter, a.plugin);
+        const opened = list.showResolutionModal('note.md', copyPath);
+        await opened;
+        await edit(b, 'note.md', 'even newer edit on B', T + 30_000);
+        await waitFor(() => a.vault.text('note.md') === 'even newer edit on B', { what: 'the newest edit to arrive while deciding' });
+
+        chooseInModal('Use the conflict copy');
+
+        // The stale choice must not overwrite the newest version: the note keeps what
+        // arrived while deciding, and the conflict stays listed so the user can
+        // re-decide against the fresh content (the copy survives by design).
+        await sleep(200);
+        expect(a.vault.text('note.md')).toBe('even newer edit on B');
+        expect(conflictCopies(a).length).toBe(1);
+        expect((a.plugin as any).conflictCenter.count()).toBe(1);
+        expect(notices().join(' ')).toContain('changed while you were deciding');
     });
 });
 

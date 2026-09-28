@@ -1086,7 +1086,6 @@ export class SelectPeerModal extends Modal {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Force full sync' });
         contentEl.createEl('p', { text: 'Compares both vaults and exchanges whichever copy of each file is newer. Use this if the two devices look out of step.' });
-        let selectedPeer = '';
         const peerList = Array.from(this.plugin.connections.keys());
         if (peerList.length === 0) {
             contentEl.createEl('p', { text: 'No device is connected right now. Pair one first, then run a full sync.' });
@@ -1096,21 +1095,20 @@ export class SelectPeerModal extends Modal {
             }));
             return;
         }
-        if (peerList.length > 0) {
-            selectedPeer = peerList[0];
-        }
+        const selectedPeer = peerList[0];
+        let chosen = selectedPeer;
         new Setting(contentEl).setName('Sync with Device').addDropdown(dropdown => {
             peerList.forEach(peerId => {
                 const peerInfo = this.plugin.clusterPeers.get(peerId);
                 dropdown.addOption(peerId, peerInfo?.friendlyName || peerId);
             });
             dropdown.setValue(selectedPeer);
-            dropdown.onChange(value => selectedPeer = value);
+            dropdown.onChange(value => chosen = value);
         });
         new Setting(contentEl)
             .addButton(btn => btn.setButtonText('Cancel').onClick(() => this.close()))
             .addButton(btn => btn.setButtonText('Start full sync').setWarning().onClick(() => {
-                if (selectedPeer) this.onSubmit(selectedPeer);
+                if (chosen) this.onSubmit(chosen);
                 this.close();
             }));
     }
@@ -1137,7 +1135,9 @@ export class ConflictCenter {
         for (const file of this.app.vault.getFiles()) {
             const original = originalPathFromConflictCopy(file.path);
             if (!original) continue;
-            if (!this.app.vault.getAbstractFileByPath(original)) continue;
+            // Keep entries whose original is gone too: the copy holds the only surviving
+            // edit, and skipping it made that content undiscoverable through this UI —
+            // the list offers restore-or-delete for those instead.
             if (!found.has(original)) found.set(original, file.path);
         }
         this.conflicts = found;
@@ -1201,6 +1201,27 @@ export class ConflictListModal extends Modal {
             return;
         }
         for (const [originalPath, conflictPath] of this.conflictCenter.entries()) {
+            const original = this.app.vault.getAbstractFileByPath(originalPath);
+            const copy = this.app.vault.getAbstractFileByPath(conflictPath);
+            // The original note was deleted (here or on another device) while its
+            // conflict copy still exists. The copy is the only surviving version of
+            // that edit: offer to restore it under the original name, or drop it.
+            if (!original || !(original instanceof TFile)) {
+                new Setting(contentEl).setName(conflictPath)
+                    .setDesc(`The original ${originalPath} no longer exists. Restore the copy as the original, or delete it.`)
+                    .addButton(btn => btn.setButtonText('Restore as original').setCta().onClick(() => {
+                        void this.restoreOrphanCopy(conflictPath, originalPath);
+                    }))
+                    .addButton(btn => btn.setButtonText('Delete copy').setWarning().onClick(() => {
+                        void this.deleteOrphanCopy(originalPath, conflictPath);
+                    }));
+                continue;
+            }
+            if (!(copy instanceof TFile)) {
+                // The copy vanished (resolved elsewhere, or deleted): nothing to compare.
+                this.conflictCenter.resolveConflict(originalPath);
+                continue;
+            }
             new Setting(contentEl).setName(originalPath).setDesc(`Other version: ${conflictPath}`)
                 .addButton(btn => btn.setButtonText('Resolve').setCta().onClick(async () => {
                     this.close();
@@ -1208,12 +1229,51 @@ export class ConflictListModal extends Modal {
                 }));
         }
     }
+
+    /** Bring a conflict copy back under its original name after the original was deleted. */
+    private async restoreOrphanCopy(conflictPath: string, originalPath: string) {
+        const copy = this.app.vault.getAbstractFileByPath(conflictPath);
+        if (!(copy instanceof TFile)) return;
+        try {
+            if (this.app.vault.getAbstractFileByPath(originalPath)) {
+                new Notice(`${originalPath} exists again — resolving it from the list instead.`);
+            } else {
+                await this.app.vault.rename(copy, originalPath);
+                new Notice(`Restored ${conflictPath} as ${originalPath}.`);
+            }
+        } catch (e) {
+            new Notice('Could not restore the copy: ' + (e instanceof Error ? e.message : String(e)));
+        }
+        this.conflictCenter.resolveConflict(originalPath);
+        this.reopenIfMoreRemain();
+    }
+
+    private async deleteOrphanCopy(originalPath: string, conflictPath: string) {
+        const copy = this.app.vault.getAbstractFileByPath(conflictPath);
+        try {
+            if (copy) await this.app.fileManager.trashFile(copy);
+        } catch (e) {
+            new Notice('Could not delete the copy: ' + (e instanceof Error ? e.message : String(e)));
+            return;
+        }
+        this.conflictCenter.resolveConflict(originalPath);
+        this.reopenIfMoreRemain();
+    }
     
     async showResolutionModal(originalPath: string, conflictPath: string) {
-        const originalFile = this.app.vault.getAbstractFileByPath(originalPath) as TFile;
-        const conflictFile = this.app.vault.getAbstractFileByPath(conflictPath) as TFile;
-        if (!originalFile || !conflictFile) {
-            this.plugin.showNotice("One of the conflict files is missing.", 'error');
+        const originalFile = this.app.vault.getAbstractFileByPath(originalPath);
+        const conflictFile = this.app.vault.getAbstractFileByPath(conflictPath);
+        // instanceof, not casts: a folder sitting at the original's path made the cast
+        // hand a TFolder to the binary modal, whose write then threw uncaught.
+        if (!(originalFile instanceof TFile)) {
+            // The original was deleted while deciding: the copy is the surviving edit —
+            // the list's restore/delete actions own it now.
+            this.plugin.showNotice(`The original ${originalPath} no longer exists.`, 'warning');
+            this.reopenIfMoreRemain();
+            return;
+        }
+        if (!(conflictFile instanceof TFile)) {
+            // Resolved elsewhere or deleted: nothing left to compare.
             this.conflictCenter.resolveConflict(originalPath);
             this.reopenIfMoreRemain();
             return;
@@ -1231,9 +1291,17 @@ export class ConflictListModal extends Modal {
                 this.reopenIfMoreRemain();
             };
             if (this.plugin.isBinary(originalFile.extension)) {
+                // mtime as the freshness marker: binary content cannot be compared cheaply.
+                const snapshotMtime = originalFile.stat.mtime;
                 new BinaryConflictResolutionModal(this.app, originalFile.name, async (choice) => {
                     if (choice === 'copy') {
-                        await this.app.vault.modifyBinary(originalFile, await this.app.vault.readBinary(conflictFile));
+                        const current = this.app.vault.getAbstractFileByPath(originalPath);
+                        if (!(current instanceof TFile) || current.stat.mtime !== snapshotMtime) {
+                            this.plugin.showNotice(`${originalPath} changed while you were deciding. Nothing was overwritten — open the conflict again to compare against the latest.`, 'warning');
+                            this.reopenIfMoreRemain();
+                            return;
+                        }
+                        await this.app.vault.modifyBinary(current, await this.app.vault.readBinary(conflictFile));
                     }
                     await finish();
                 }, backToList).open();
@@ -1241,14 +1309,23 @@ export class ConflictListModal extends Modal {
                 const currentContent = await this.app.vault.read(originalFile);
                 const copyContent = await this.app.vault.read(conflictFile);
                 new ConflictResolutionModal(this.app, currentContent, copyContent, async (chosenContent) => {
-                    // Keeping the current version changes nothing, so there is nothing to send.
-                    if (chosenContent !== currentContent) await this.app.vault.modify(originalFile, chosenContent);
+                    // The modal can stay open for a long time, and background sync keeps
+                    // writing: applying the choice against a snapshot silently clobbered
+                    // a newer version that arrived in the meantime.
+                    if (chosenContent !== currentContent) {
+                        const onDisk = await this.app.vault.read(originalFile);
+                        if (onDisk !== currentContent) {
+                            this.plugin.showNotice(`${originalPath} changed while you were deciding. Nothing was overwritten — open the conflict again to compare against the latest.`, 'warning');
+                            this.reopenIfMoreRemain();
+                            return;
+                        }
+                        await this.app.vault.modify(originalFile, chosenContent);
+                    }
                     await finish();
                 }, backToList).open();
             }
         } catch (e) {
             new Notice('Failed to read conflict files: ' + (e instanceof Error ? e.message : String(e)));
-            this.conflictCenter.resolveConflict(originalPath);
             this.reopenIfMoreRemain();
         }
     }
@@ -1269,10 +1346,19 @@ export class ConflictResolutionModal extends Modal {
         app: App,
         private localContent: string,
         private remoteContent: string,
-        private onResolve: (chosenContent: string) => void,
+        private onResolve: (chosenContent: string) => void | Promise<void>,
         private onDismiss?: () => void,
     ) { super(app); }
-    
+
+    /** The resolve callbacks touch the vault (write, trash); a failure must say so, not die as an unhandled rejection. */
+    private apply(choice: string) {
+        this.decided = true;
+        this.close();
+        Promise.resolve(this.onResolve(choice)).catch(e => {
+            new Notice('Could not apply that choice: ' + (e instanceof Error ? e.message : String(e)));
+        });
+    }
+
     onOpen() {
         const { contentEl } = this;
         contentEl.addClass('obsidian-decentralized-diff-modal');
@@ -1294,17 +1380,13 @@ export class ConflictResolutionModal extends Modal {
         new Setting(contentEl)
             .addButton(btn => btn.setButtonText('Decide later').onClick(() => this.close()))
             .addButton(btn => btn.setButtonText('Keep the current version').onClick(() => {
-                this.decided = true;
-                this.onResolve(this.localContent);
-                this.close();
+                this.apply(this.localContent);
             }))
             .addButton(btn => btn.setButtonText('Use the conflict copy').setWarning().onClick(() => {
-                this.decided = true;
-                this.onResolve(this.remoteContent);
-                this.close();
+                this.apply(this.remoteContent);
             }));
     }
-    
+
     onClose() {
         this.contentEl.empty();
         if (!this.decided) this.onDismiss?.();
@@ -1316,10 +1398,18 @@ export class BinaryConflictResolutionModal extends Modal {
     constructor(
         app: App,
         private fileName: string,
-        private onResolve: (choice: 'current' | 'copy') => void,
+        private onResolve: (choice: 'current' | 'copy') => void | Promise<void>,
         private onDismiss?: () => void,
     ) { super(app); }
-    
+
+    private apply(choice: 'current' | 'copy') {
+        this.decided = true;
+        this.close();
+        Promise.resolve(this.onResolve(choice)).catch(e => {
+            new Notice('Could not apply that choice: ' + (e instanceof Error ? e.message : String(e)));
+        });
+    }
+
     onOpen() {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Resolve Binary Conflict' });
@@ -1327,17 +1417,13 @@ export class BinaryConflictResolutionModal extends Modal {
         new Setting(contentEl)
             .addButton(btn => btn.setButtonText('Decide later').onClick(() => this.close()))
             .addButton(btn => btn.setButtonText('Keep the current version').onClick(() => {
-                this.decided = true;
-                this.onResolve('current');
-                this.close();
+                this.apply('current');
             }))
             .addButton(btn => btn.setButtonText('Use the conflict copy').setWarning().onClick(() => {
-                this.decided = true;
-                this.onResolve('copy');
-                this.close();
+                this.apply('copy');
             }));
     }
-    
+
     onClose() {
         this.contentEl.empty();
         if (!this.decided) this.onDismiss?.();
@@ -1352,7 +1438,7 @@ export class BinaryConflictResolutionModal extends Modal {
 export class ConfirmModal extends Modal {
     constructor(
         app: App,
-        private opts: { title: string; body: string; confirmText: string; onConfirm: () => void }
+        private opts: { title: string; body: string; confirmText: string; onConfirm: () => void | Promise<void> }
     ) { super(app); }
 
     onOpen() {
@@ -1363,7 +1449,12 @@ export class ConfirmModal extends Modal {
             .addButton(btn => btn.setButtonText('Cancel').onClick(() => this.close()))
             .addButton(btn => btn.setButtonText(this.opts.confirmText).setWarning().onClick(() => {
                 this.close();
-                this.opts.onConfirm();
+                // Confirmers are async all over the app (device resets, forgets, mode
+                // switches); a rejected one died as an unhandled rejection with the UI
+                // showing a confirmed action that never ran.
+                Promise.resolve(this.opts.onConfirm()).catch(e => {
+                    new Notice('Could not complete that action: ' + (e instanceof Error ? e.message : String(e)));
+                });
             }));
     }
 
@@ -1404,9 +1495,11 @@ export class SyncProgressModal extends Modal {
     private stateSignature(): string {
         const s = this.plugin.syncState;
         const queued = this.plugin.queueManager.getQueueSize() + this.plugin.queueManager.getActiveTransfers();
+        const retrying = this.plugin.queueManager.getRetrying();
         const parts: string[] = [
             s.isSyncing ? `S${s.currentPhase}|${s.filesTransferred}/${s.filesTotal}|${s.bytesTransferred}/${s.bytesTotal}|${s.currentFile ?? ''}|${s.currentFileSize ?? ''}` : 'S-',
             `Q${queued}`,
+            `R${retrying}`,
         ];
         for (const t of this.plugin.activeTransfers.values()) {
             parts.push(`T${t.id}:${t.processedChunks}/${t.totalChunks}:${t.status}:${t.direction}`);
@@ -1414,7 +1507,10 @@ export class SyncProgressModal extends Modal {
         for (const f of this.plugin.failedSyncs) {
             parts.push(`F${f.path}:${f.type}:${f.retryCount}:${f.timestamp}`);
         }
-        const busy = s.isSyncing || this.plugin.activeTransfers.size > 0 || queued > 0;
+        // Pending retries tick too: without them in `busy`, the "Failed Ns ago" readout
+        // froze at whatever it last rendered, even though retries fire behind the scenes.
+        const busy = s.isSyncing || this.plugin.activeTransfers.size > 0 || queued > 0
+            || retrying > 0 || this.plugin.failedSyncs.length > 0;
         if (busy) parts.push(`t${Math.floor(Date.now() / 1000)}`);
         return parts.join('\n');
     }
@@ -1430,12 +1526,16 @@ export class SyncProgressModal extends Modal {
         const isSyncing = this.plugin.syncState.isSyncing;
 
         if (!hasActive && !hasFailed && !isSyncing) {
-            const queued = this.plugin.queueManager.getQueueSize() + this.plugin.queueManager.getActiveTransfers();
+            const queued = this.plugin.queueManager.getQueueSize()
+                + this.plugin.queueManager.getActiveTransfers()
+                + this.plugin.queueManager.getRetrying();
             if (queued > 0) {
+                // "Waiting" was wrong twice: items already in flight are being sent, and
+                // items in retry backoff are very much pending work, not silence.
                 this.container.createEl('p', {
                     text: queued === 1
-                        ? 'Waiting to send 1 recent change…'
-                        : `Waiting to send ${queued} recent changes…`,
+                        ? 'Sending 1 recent change…'
+                        : `Sending ${queued} recent changes…`,
                 });
                 this.container.createEl('p', {
                     text: 'File-by-file progress appears here once a transfer starts.',
@@ -1501,24 +1601,30 @@ export class SyncProgressModal extends Modal {
                 
                 title.createSpan({ text: transfer.path, attr: { style: 'font-weight: 600;' } });
                 if (transfer.status === 'paused') title.createSpan({ text: ' (Paused)', attr: { style: 'color: var(--text-muted); font-size: 0.8em; margin-left: 6px;' } });
-                
+
                 item.createEl('progress', { attr: { value: transfer.processedChunks, max: transfer.totalChunks } });
 
-                const now = Date.now();
-                const elapsedSeconds = (now - transfer.startTime) / 1000;
-                const chunkSize = transfer.chunkSize || this.plugin.getChunkSize();
-                const processedBytes = transfer.processedChunks * chunkSize;
-                const totalBytes = transfer.totalChunks * chunkSize;
-                const speedBytesPerSec = elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0;
-                const remainingBytes = totalBytes - processedBytes;
-                const remainingSeconds = speedBytesPerSec > 0 && Number.isFinite(speedBytesPerSec) ? remainingBytes / speedBytesPerSec : 0;
-
                 const meta = item.createDiv({ cls: 'od-transfer-meta' });
-                meta.createSpan({ text: `${formatBytes(speedBytesPerSec)}/s` });
-                
-                const remText = remainingSeconds > 0 && Number.isFinite(remainingSeconds) ? `${Math.round(remainingSeconds)}s remaining` : 'Unknown time remaining';
-                meta.createSpan({ text: remText });
-                
+                if (transfer.status === 'paused') {
+                    // A paused transfer's elapsed clock kept running, so the computed
+                    // speed shrank and "Ns remaining" grew forever while nothing moved.
+                    meta.createSpan({ text: 'Paused — no estimate' });
+                } else {
+                    const now = Date.now();
+                    const elapsedSeconds = (now - transfer.startTime) / 1000;
+                    const chunkSize = transfer.chunkSize || this.plugin.getChunkSize();
+                    const processedBytes = transfer.processedChunks * chunkSize;
+                    const totalBytes = transfer.totalChunks * chunkSize;
+                    const speedBytesPerSec = elapsedSeconds > 0 ? processedBytes / elapsedSeconds : 0;
+                    const remainingBytes = totalBytes - processedBytes;
+                    const remainingSeconds = speedBytesPerSec > 0 && Number.isFinite(speedBytesPerSec) ? remainingBytes / speedBytesPerSec : 0;
+
+                    meta.createSpan({ text: `${formatBytes(speedBytesPerSec)}/s` });
+
+                    const remText = remainingSeconds > 0 && Number.isFinite(remainingSeconds) ? `${Math.round(remainingSeconds)}s remaining` : 'Unknown time remaining';
+                    meta.createSpan({ text: remText });
+                }
+
                 const pct = transfer.totalChunks > 0 ? (transfer.processedChunks / transfer.totalChunks) * 100 : 0;
                 meta.createSpan({ text: `${Math.round(pct)}%` });
             });
@@ -1541,7 +1647,9 @@ export class SyncProgressModal extends Modal {
                 meta.createSpan({ text: `To: ${peerName}` });
                 
                 const secondsAgo = Math.round((Date.now() - fail.timestamp) / 1000);
-                meta.createSpan({ text: `Failed ${secondsAgo}s ago (Attempt ${fail.retryCount || 0})` });
+                // retryCount 0 means the first attempt is still coming, not that a
+                // zeroth attempt happened.
+                meta.createSpan({ text: `Failed ${secondsAgo}s ago (Attempt ${Math.max(1, (fail.retryCount || 0) + 1)})` });
 
                 if (fail.reason) {
                     const reasonMeta = item.createDiv({ cls: 'od-transfer-meta' });
