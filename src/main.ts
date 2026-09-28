@@ -205,7 +205,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     /** Opens (or re-opens) the pairing window, generating a key if there isn't one yet. */
-    public async beginPairingWindow(): Promise<string> {
+    public async beginPairingWindow(): Promise<string | null> {
+        // A modal or timer left behind by an unload used to re-arm the enrolment
+        // window on a plugin that is off — refreshLanBeacon guards this; so does this.
+        if (this.unloaded) return null;
         if (!this.activePsk) this.activePsk = await this.generatePSK();
         this.activePskExpiresAt = Date.now() + ObsidianDecentralizedPlugin.PAIRING_WINDOW_MS;
         if (this.pairingWindowTimer) window.clearTimeout(this.pairingWindowTimer);
@@ -5358,7 +5361,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (mode === 'direct-ip' && this.directIpServer) {
             port = this.settings.directIpHostPort;
         }
-        const pairingKey = this.getActivePsk() || undefined;
+        // Offline Mode never pairs by code — a key in its beacon advertised a Quick Pair
+        // that mode cannot honour (its PeerJS is never initialized), so the nearby tap
+        // on the other device always failed.
+        const pairingKey = this.getConnectionMode() === 'direct-ip' ? undefined : (this.getActivePsk() || undefined);
         return { 
             deviceId: this.peer?.id || this.settings.deviceId, 
             friendlyName: this.settings.friendlyName, 

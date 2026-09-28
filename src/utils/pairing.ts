@@ -1,7 +1,7 @@
 import type { PeerInfo } from '../types';
 
-/** AES-256-GCM raw key as standard base64 (32 bytes → 44 chars with padding). */
-export const PSK_PATTERN = /^[A-Za-z0-9+/]{40,}={0,2}$/;
+/** AES-256-GCM raw key as standard base64: 32 bytes → 44 chars with padding; 64-byte keys allowed, nothing longer. */
+export const PSK_PATTERN = /^[A-Za-z0-9+/]{40,88}={0,2}$/;
 
 export type ParsedPairing =
     | { kind: 'full'; deviceId: string; psk: string }
@@ -43,6 +43,12 @@ export function parsePairingInput(input: string): ParsedPairing {
         const psk = trimmed.slice(pipe + 1).trim();
         if (!deviceId) {
             return { kind: 'invalid', reason: 'That pairing code is missing a device ID. Copy it again from the other device.' };
+        }
+        // Inbound peer info is capped at 128/64 chars; the paste path was not, so a stray
+        // paste could permanently file a megabyte-scale "key" into data.json and burn a
+        // 20-second connection attempt on it.
+        if (deviceId.length > 128) {
+            return { kind: 'invalid', reason: 'That pairing code looks damaged. Copy it again from the other device.' };
         }
         if (!PSK_PATTERN.test(psk)) {
             return { kind: 'invalid', reason: 'That pairing code looks damaged. Copy it again from the other device.' };

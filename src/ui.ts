@@ -73,6 +73,10 @@ export class ConnectionModal extends Modal {
     private pairingValidityTimer: number | null = null;
     private handshakeTimer: number | null = null;
     private connectTimeout: number | null = null;
+    /** Set by onClose; async work still settling must not touch the dead modal. */
+    private closed = false;
+    /** Auto-submit timer for a paste into the code box; cleared on close. */
+    private pasteAutoSubmit: number | null = null;
 
     constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
 
@@ -84,6 +88,9 @@ export class ConnectionModal extends Modal {
         // Offline" while the bar reads "Offline Mode").
         if (this.plugin.getConnectionMode() === 'direct-ip') {
             this.activeTab = 'advanced';
+            if (!this.plugin.directIpServer) {
+                this.statusMessage = 'Offline Mode — host a network or join one with an IP and token.';
+            }
         }
         
         if (this.plugin.getConnectionMode() === 'direct-ip' && this.plugin.directIpServer) {
@@ -117,22 +124,40 @@ export class ConnectionModal extends Modal {
         
         // Opening this modal is what puts the device into pairing mode, so (re)start the
         // window here rather than leaving auto-enrolment armed for the whole session.
-        this.activePsk = await this.plugin.beginPairingWindow();
-        this.pairingRefreshTimer = window.setInterval(async () => {
-            if (!this.plugin.getActivePsk()) {
-                this.activePsk = await this.plugin.beginPairingWindow();
-                if (this.statusState === 'idle') this.render();
-            }
-        }, 30000);
-        
+        // Offline Mode never pairs by code: a window here advertised a key that mode
+        // cannot honour — the other device's nearby list showed "Ready to pair" for a
+        // device whose PeerJS is never initialized, so the tap always failed.
+        if (this.plugin.getConnectionMode() !== 'direct-ip') {
+            // The interval is armed BEFORE the await that mints the key: closing the
+            // modal while that await was pending ran onClose against a null timer, and
+            // the interval then existed with nothing left to clear it — re-arming the
+            // enrolment window forever on a closed modal. The closed flag is the
+            // backstop; it also stops the plugin's own unload.
+            this.pairingRefreshTimer = window.setInterval(async () => {
+                if (this.closed) {
+                    window.clearInterval(this.pairingRefreshTimer!);
+                    this.pairingRefreshTimer = null;
+                    return;
+                }
+                // Renew just before expiry so the on-screen label never flips to
+                // "expired" for the up-to-30 s before the next tick would renew it.
+                if (this.plugin.activePskExpiresAt - Date.now() < 60_000) {
+                    this.activePsk = await this.plugin.beginPairingWindow();
+                }
+            }, 30000);
+            this.activePsk = await this.plugin.beginPairingWindow();
+        }
+
         this.render();
     }
 
     onClose() {
+        this.closed = true;
         if (this.pairingRefreshTimer) window.clearInterval(this.pairingRefreshTimer);
         if (this.pairingValidityTimer) window.clearInterval(this.pairingValidityTimer);
         if (this.handshakeTimer) window.clearTimeout(this.handshakeTimer);
         if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
+        if (this.pasteAutoSubmit) window.clearTimeout(this.pasteAutoSubmit);
         if (this.plugin.lanDiscovery) {
             if (this.discoverListener) this.plugin.lanDiscovery.off('discover', this.discoverListener);
             if (this.loseListener) this.plugin.lanDiscovery.off('lose', this.loseListener);
@@ -318,6 +343,10 @@ export class ConnectionModal extends Modal {
 
         conn.on('error', () => {
             if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
+            // A pairing that already succeeded stays succeeded: the key is stored and
+            // auto-reconnect will re-establish the link, but overwriting the success
+            // card with a failure told the user to redo something that worked.
+            if (this.lastPairedId === peerId) return;
             this.fail('Connection failed. Check the code and that the other device is online.');
         });
     }
@@ -441,7 +470,11 @@ export class ConnectionModal extends Modal {
             }
         });
         input.addEventListener('paste', () => {
-            window.setTimeout(() => {
+            // Tracked so a paste followed immediately by closing the modal cannot
+            // still submit the connection attempt into the closed DOM.
+            this.pasteAutoSubmit = window.setTimeout(() => {
+                this.pasteAutoSubmit = null;
+                if (this.closed) return;
                 if (parsePairingInput(input.value).kind === 'full') submitPaste();
             }, 0);
         });
@@ -518,13 +551,9 @@ export class ConnectionModal extends Modal {
         const go = contentEl.createEl('button', { text: 'Open Offline Mode', cls: 'mod-cta od-full-width' });
         go.onclick = () => { this.activeTab = 'advanced'; this.render(); };
         const back = contentEl.createEl('button', { text: 'Switch to Standard Mode', cls: 'od-full-width' });
-        back.onclick = async () => {
-            this.plugin.settings.connectionMode = 'peerjs';
-            await this.plugin.saveSettings();
-            this.plugin.reinitializeConnectionManager();
-            this.statusState = 'idle';
-            this.statusMessage = 'Ready to pair';
-            this.render();
+        back.onclick = () => {
+            this.confirmModeSwitch('peerjs', 'Switch to Standard Mode?',
+                'Every connected device is dropped — Standard Mode reconnects through the sync network instead. You can switch back anytime from this screen.');
         };
     }
 
@@ -673,11 +702,9 @@ export class ConnectionModal extends Modal {
         
         const footer = contentEl.createDiv({ cls: 'od-mode-switch', attr: { style: 'margin-top: 10px;' } });
         footer.setText("Switch to Offline Mode");
-        footer.onclick = async () => {
-            this.plugin.settings.connectionMode = 'direct-ip';
-            await this.plugin.saveSettings();
-            this.plugin.reinitializeConnectionManager();
-            this.render();
+        footer.onclick = () => {
+            this.confirmModeSwitch('direct-ip', 'Switch to Offline Mode?',
+                'Every connected device is dropped — Offline Mode connects directly over your local network instead. You can switch back anytime from this screen.');
         };
     }
 
@@ -730,23 +757,28 @@ export class ConnectionModal extends Modal {
             const lanList = container.createDiv({ cls: 'od-peer-list' });
             const renderLanList = () => {
                 lanList.empty();
-                if (this.discoveredPeers.size === 0) {
+                // Only actual hosts: a standard-mode desktop broadcasts a beacon too,
+                // but it carries no port and nothing listens for a join — selecting it
+                // filled the IP box and the connection then dead-ended after 20 s.
+                const hosts = Array.from(this.discoveredPeers.values())
+                    .filter(p => p.mode === 'direct-ip' && p.port);
+                if (hosts.length === 0) {
                     const emptyState = lanList.createDiv({ cls: 'od-scanning' });
                     emptyState.createSpan({ cls: 'od-pulsing-indicator' });
                     emptyState.createSpan({ text: 'Scanning for hosts...' });
                 } else {
-                    this.discoveredPeers.forEach((peer) => {
+                    for (const peer of hosts) {
                         const item = lanList.createDiv({ cls: 'od-peer-item' });
                         const info = item.createDiv({ cls: 'info' });
                         info.createDiv({ text: peer.friendlyName, cls: 'od-peer-name' });
-                        info.createDiv({ text: `${peer.ip || 'Unknown IP'}:${peer.port || '???'}`, cls: 'sub-text' });
+                        info.createDiv({ text: `${peer.ip || 'Unknown IP'}:${peer.port}`, cls: 'sub-text' });
                         const btn = item.createEl('button', { text: 'Select' });
                         btn.onclick = async () => {
                             ipInput.value = peer.ip || '';
                             if (peer.port) { this.plugin.settings.directIpHostPort = peer.port; await this.plugin.saveSettings(); }
                             new Notice(`Selected ${peer.friendlyName}`);
                         };
-                    });
+                    }
                 }
             };
             
@@ -798,14 +830,20 @@ export class ConnectionModal extends Modal {
 
         const connectBtn = container.createEl('button', { text: 'Connect', cls: 'mod-cta od-full-width' });
         connectBtn.onclick = async () => {
+            // Disabled across the whole sequence: a double-click ran it twice, and the
+            // second call tore down the first client mid-handshake — plus a spurious
+            // "Disconnected from Offline Host" toast while connecting.
+            connectBtn.disabled = true;
             // Accepts "IP", "IP:port", "[IPv6]:port", or the host's "Copy IP and token" text.
             const parsed = parseHostInput(ipInput.value);
             const token = pinInput.value.trim() || parsed?.token || '';
             if (!ipInput.value.trim() || !token) {
+                connectBtn.disabled = false;
                 new Notice('Enter both the host IP and the token.');
                 return;
             }
             if (!parsed) {
+                connectBtn.disabled = false;
                 new Notice('That does not look like an IP address. Enter the address shown on the hosting computer, like 192.168.1.20.');
                 return;
             }
@@ -899,6 +937,7 @@ export class ConnectionModal extends Modal {
         if (this.handshakeTimer) window.clearTimeout(this.handshakeTimer);
         const started = Date.now();
         const tick = () => {
+            if (this.closed) return;
             const client = this.plugin.directIpClient;
             if (!client) return;
             if (client.isFatalError) {
@@ -912,9 +951,16 @@ export class ConnectionModal extends Modal {
                 return;
             }
             if (Date.now() - started > 20000) {
-                this.statusState = 'reconnecting';
-                this.statusMessage = 'Still trying to reach the host. Check the IP and that the other device is hosting.';
-                this.render();
+                // Do not stop watching: nothing else re-renders this modal, so a host
+                // that comes up later — or a fatal token rejection arriving after this
+                // point — must still surface here. Slower cadence, and re-render only
+                // on a state change so it cannot churn the DOM every tick.
+                if (this.statusState !== 'reconnecting') {
+                    this.statusState = 'reconnecting';
+                    this.statusMessage = 'Still trying to reach the host. Check the IP and that the other device is hosting.';
+                    this.render();
+                }
+                this.handshakeTimer = window.setTimeout(tick, 2000);
                 return;
             }
             this.handshakeTimer = window.setTimeout(tick, 200);
@@ -922,14 +968,42 @@ export class ConnectionModal extends Modal {
         tick();
     }
 
+    /**
+     * Switch connection mode behind a confirmation: the switch drops every live
+     * connection (it re-initializes the whole transport stack), which a stray click
+     * must not do silently — the same reasoning ConfirmModal exists for elsewhere.
+     * A failed save rolls the in-memory setting back, so the engine and data.json
+     * cannot end up claiming different modes.
+     */
+    private confirmModeSwitch(to: 'peerjs' | 'direct-ip', title: string, body: string) {
+        new ConfirmModal(this.app, {
+            title,
+            body,
+            confirmText: 'Switch',
+            onConfirm: async () => {
+                const from = to === 'peerjs' ? 'direct-ip' : 'peerjs';
+                try {
+                    this.plugin.settings.connectionMode = to;
+                    await this.plugin.saveSettings();
+                } catch (e) {
+                    this.plugin.settings.connectionMode = from;
+                    new Notice('Could not save the change — the connection mode was not switched.');
+                    return;
+                }
+                this.plugin.reinitializeConnectionManager();
+                this.statusState = 'idle';
+                this.statusMessage = to === 'direct-ip' ? 'Offline Mode' : 'Ready to pair';
+                this.render();
+            },
+        }).open();
+    }
+
     private renderStandardModeSwitch(parent: HTMLElement) {
         const footer = parent.createDiv({ cls: 'od-mode-switch' });
         footer.setText("Switch to Standard Mode");
-        footer.onclick = async () => {
-            this.plugin.settings.connectionMode = 'peerjs';
-            await this.plugin.saveSettings();
-            this.plugin.reinitializeConnectionManager();
-            this.render();
+        footer.onclick = () => {
+            this.confirmModeSwitch('peerjs', 'Switch to Standard Mode?',
+                'Every connected device is dropped — Standard Mode reconnects through the sync network instead. You can switch back anytime from this screen.');
         };
     }
 }
@@ -955,7 +1029,13 @@ export class QRScannerModal extends Modal {
         // so startPromise gates cleanup on the whole load-and-start sequence.
         this.startPromise = loadHtml5Qrcode().then(Html5Qrcode => {
             this.html5QrCode = new Html5Qrcode(readerId);
+            // The library invokes the callback on every decodable frame and only
+            // dedupes when no callback is given; stop() is async, so a still-visible
+            // code fires again before the camera halts. One shot, then ignore.
+            let handled = false;
             return this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
+                if (handled) return;
+                handled = true;
                 this.onScan(decodedText);
                 this.close();
             }, () => {});

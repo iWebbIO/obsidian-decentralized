@@ -14,9 +14,11 @@ describe('Quick Pair', () => {
         const shower = await createDevice(B, { name: 'Phone' });
         const scanner = await createDevice(A, { name: 'Laptop' });
 
-        // What the Connect screen does on each side.
+        // What the Connect screen does on each side. beginPairingWindow only returns
+        // null on an unloaded plugin, which the assertions below would catch anyway.
         const psk = await shower.plugin.beginPairingWindow();
-        scanner.plugin.settings.peerKeys[shower.id] = psk;
+        expect(psk).toBeTruthy();
+        scanner.plugin.settings.peerKeys[shower.id] = psk!;
         const first = scanner.plugin.dialPeer(shower.id);
 
         // The showing device has no key when the link opens, so its first handshake is

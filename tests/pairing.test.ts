@@ -108,3 +108,30 @@ describe('sanitizePeerInfo', () => {
         expect(info.mode).toBeUndefined();
     });
 });
+
+describe('parsePairingInput bounds', () => {
+    // Inbound peer info is capped at 128/64 chars; the paste path was not, so a stray
+    // paste could permanently file a megabyte-scale "key" into data.json.
+    it('rejects an absurdly long device id', () => {
+        const longId = 'device-' + 'a'.repeat(500);
+        expect(parsePairingInput(`${longId}|${SAMPLE_PSK}`)).toEqual({
+            kind: 'invalid',
+            reason: 'That pairing code looks damaged. Copy it again from the other device.',
+        });
+    });
+
+    it('rejects an absurdly long key', () => {
+        const longPsk = 'A'.repeat(10_000);
+        expect(parsePairingInput(`device-abcd1234|${longPsk}`)).toMatchObject({ kind: 'invalid' });
+    });
+
+    it('accepts a normal 32-byte key and a 64-byte key', () => {
+        expect(parsePairingInput(`device-abcd1234|${SAMPLE_PSK}`)).toEqual({
+            kind: 'full', deviceId: 'device-abcd1234', psk: SAMPLE_PSK,
+        });
+        const longButLegal = 'A'.repeat(86) + '==';
+        expect(parsePairingInput(`device-abcd1234|${longButLegal}`)).toEqual({
+            kind: 'full', deviceId: 'device-abcd1234', psk: longButLegal,
+        });
+    });
+});
