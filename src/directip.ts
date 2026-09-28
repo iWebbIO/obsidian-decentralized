@@ -296,6 +296,8 @@ export class DirectIpServer {
                 this.clients.delete(deviceId);
                 this.plugin.connections?.delete(deviceId);
             }
+            // Edit locks the joining device held do not survive its link.
+            this.plugin.purgePeerLocks?.(deviceId);
             this.plugin.updateStatus();
         });
 
@@ -354,7 +356,7 @@ export class DirectIpServer {
     }
 
     private deliver(deviceId: string, mockConn: any, message: any) {
-        if (this.stopped || this.plugin.isUnloaded) return;
+        if (this.stopped || this.plugin.isUnloaded === true) return;
         this.plugin.handleRawIncomingData(message, mockConn).catch((e: any) => {
             this.plugin.log(`Server: Failed to handle raw incoming data from ${deviceId}:`, e);
             this.plugin.showNotice(`Error processing received sync message from ${deviceId}.`, 'error');
@@ -661,6 +663,8 @@ export class DirectIpClient {
             this.pendingAuth = null;
             this.stopHeartbeat();
             this.clearAuthTimeout();
+            // The host's edit locks do not survive the link.
+            this.plugin.purgePeerLocks?.('direct-ip-host');
 
             // Intentional shutdown, or already failed for good — do nothing
             if (this.isStopped || this.isFatalError) return;

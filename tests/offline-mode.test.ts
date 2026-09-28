@@ -39,6 +39,10 @@ function stubPlugin(deviceId: string) {
         showNotice: jest.fn(),
         updateStatus: jest.fn(),
         rejectPendingAck: jest.fn(),
+        // The transports call these on socket close; the stub records them so a
+        // transport that grows a new plugin dependency fails here loudly.
+        purgePeerLocks: jest.fn(),
+        isUnloaded: false,
         handleRawIncomingData: jest.fn(async (message: any, conn: any) => { received.push({ message, conn }); }),
     };
     return plugin;

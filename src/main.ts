@@ -348,9 +348,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public remoteLocks: Map<string, { peerId: string, expiresAt: number }> = new Map();
     private pendingLockRequests: Map<string, { resolve: (granted: boolean) => void, timeout: number }> = new Map();
     
-    // Real-time Editor Sync State
-    private isApplyingRemoteEdit: boolean = false;
-    private debouncedEditorChange: Debouncer<[any, TFile], Promise<void>>;
+    // Real-time Editor Sync State. Per path: a shared Obsidian debouncer keeps only
+    // the last call's arguments, so typing note A then note B within 200 ms dropped
+    // A's burst entirely — and a stale (editor, file) pair fired later and read
+    // whatever the editor showed NOW, misbasing the patch. Per-path timers re-resolve
+    // at fire time.
+    private applyingRemoteEdits: Set<string> = new Set();
+    private editorDebounces: Map<string, { handle: number; editor: any; file: TFile }> = new Map();
+    /** Paths with a lock request still unanswered — dedupes keystroke-rate requests. */
+    private lockRequestsInFlight: Set<string> = new Set();
 
     async onload() {
         // Initialize Core Managers
@@ -383,7 +389,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // flushed on unload.
         this.debouncedSaveHashCache = debounce(() => { void this.saveHashCache(); }, 30000);
         this.debouncedSaveQueue = debounce(() => { void this.saveQueueState(); }, 2000);
-        this.debouncedEditorChange = debounce(this.handleEditorChangeDebounced.bind(this), 200);
+
 
         await this.loadSettings();
         this.applyHideNativeSync();
@@ -550,7 +556,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.debouncedSaveState.cancel();
         this.debouncedSaveHashCache.cancel();
         this.debouncedSaveQueue.cancel();
-        this.debouncedEditorChange.cancel();
         this.configSync?.dispose();
         this.clearStatusTimer();
         void this.saveState(true);
@@ -575,11 +580,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // --- Core Two-Device Infrastructure ---
     isTwoDeviceMode(): boolean {
         if (this.currentSyncIsTwoDeviceMode !== null) return this.currentSyncIsTwoDeviceMode;
-        return this.settings.enableTwoDeviceOptimizations && this.connections.size === 1;
+        if (!this.settings.enableTwoDeviceOptimizations || this.connections.size !== 1) return false;
+        // The direct-ip client's mock connection stays in the map with open=false while
+        // its socket is down — counting it kept every keystroke queueing lock requests
+        // and deltas toward a dead link, each burning its full 5 s timeout.
+        const conn = this.connections.values().next().value;
+        return conn?.open !== false;
     }
 
     get twoDevicePeerId(): string | null {
-        return this.isTwoDeviceMode() ? Array.from(this.connections.keys())[0] : null;
+        if (!this.isTwoDeviceMode()) return null;
+        // The paired partner, not whichever connection happens to sort first — with a
+        // gossiped third device connected, insertion order could aim editor traffic at
+        // the wrong device.
+        const companion = this.settings.companionPeerId;
+        if (companion && this.connections.has(companion)) return companion;
+        return Array.from(this.connections.keys())[0];
     }
 
     /**
@@ -1300,8 +1316,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             }
 
-            if (this.isTwoDeviceMode() && !this.heldLocks.has(file.path) && file instanceof TFile && !this.isBinary(file.extension)) {
-                await this.requestLock(file.path);
+            if (this.isTwoDeviceMode() && file instanceof TFile && !this.isBinary(file.extension)) {
+                const held = this.heldLocks.get(file.path);
+                if (!held) {
+                    await this.requestLock(file.path);
+                } else if (held.expiresAt - Date.now() < 10_000 && !this.lockRequestsInFlight.has(file.path)) {
+                    // The lock evaporates mid-edit-session (nothing renewed it), and
+                    // after expiry both sides could grab it in the gap before the next
+                    // save. Extend while the user is still editing this path.
+                    this.lockRequestsInFlight.add(file.path);
+                    this.requestLock(file.path).then(() => this.lockRequestsInFlight.delete(file.path));
+                }
             }
 
             if (file instanceof TFile) {
@@ -1412,23 +1437,47 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // --- Real-time Editor Sync ---
     private handleEditorChange(editor: any, info: any) {
         if (!this.isTwoDeviceMode() || !this.settings.enableRealtimeSync) return;
-        
+
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!view || !view.file) return;
         const path = view.file.path;
 
-        if (this.isApplyingRemoteEdit || this.shouldIgnoreEvent(path)) return;
+        if (this.applyingRemoteEdits.has(path) || this.shouldIgnoreEvent(path, 'write')) return;
 
+        // The lock is not advisory: a device that was DENIED (the peer is editing)
+        // used to stream patches anyway, and both sides then collided in the patch
+        // path. Stream only while this side holds the note; the ordinary file path
+        // carries the edits otherwise.
         if (!this.heldLocks.has(path)) {
-            // Await lock before sending edits to avoid racing with peer's active editing
-            this.requestLock(path).then(granted => {
-                if (granted) {
-                    this.sendData(this.twoDevicePeerId!, { type: 'editor-active', path });
-                }
-            });
+            const peerId = this.twoDevicePeerId;
+            if (!peerId) return;
+            // One request per burst, not per keystroke: every keystroke on a denied
+            // or timing-out path enqueued a priority-1M message and starved transfers.
+            if (!this.lockRequestsInFlight.has(path)) {
+                this.lockRequestsInFlight.add(path);
+                this.requestLock(path).then(granted => {
+                    this.lockRequestsInFlight.delete(path);
+                    if (granted && this.twoDevicePeerId) {
+                        this.sendData(this.twoDevicePeerId, { type: 'editor-active', path });
+                    }
+                });
+            }
+            return;
         }
 
-        this.debouncedEditorChange(editor, view.file);
+        const existing = this.editorDebounces.get(path);
+        if (existing) this.timeoutManager.clearTimeout(existing.handle);
+        const handle = this.timeoutManager.setTimeout(() => {
+            const entry = this.editorDebounces.get(path);
+            this.editorDebounces.delete(path);
+            if (!entry || this.unloaded) return;
+            // The user may have switched notes while the timer ran: apply only if this
+            // editor still belongs to the path it was captured for.
+            const current = this.app.workspace.getActiveViewOfType(MarkdownView);
+            if (!current || current.file?.path !== path) return;
+            void this.handleEditorChangeDebounced(entry.editor, entry.file).catch(e => this.log(`Editor sync for ${path} failed:`, e));
+        }, 200);
+        this.editorDebounces.set(path, { handle, editor, file: view.file });
     }
 
     private async handleEditorChangeDebounced(editor: any, file: TFile) {
@@ -2647,10 +2696,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.manualPingStart.delete(peerId);
             this.lastSuccessfulMessageTime.delete(peerId);
 
-            // Clear remote locks from this peer
-            for (const [path, lock] of this.remoteLocks.entries()) {
-                if (lock.peerId === peerId) this.remoteLocks.delete(path);
-            }
+            // Locks die with the link that carried them.
+            this.purgePeerLocks(peerId);
 
             this.settleTransfersAfterDisconnect(peerId);
             this.updateStatus();
@@ -3029,7 +3076,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 
                 // Editor Sync
                 case 'editor-active': this.handleEditorActive(data, conn!); break;
-                case 'editor-delta': this.handleEditorDelta(data); break;
+                case 'editor-delta': this.handleEditorDelta(data, conn ?? undefined); break;
                 
                 // Merkle
                 case 'merkle-root': await this.handleMerkleRoot(data, conn!); break;
@@ -3466,15 +3513,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.isTwoDeviceMode() || !this.twoDevicePeerId) return true;
         const requestId = this.generateTransferId(path);
         
+        const peerId = this.twoDevicePeerId;
         return new Promise((resolve) => {
             const timeout = window.setTimeout(() => {
                 this.pendingLockRequests.delete(requestId);
+                // Tell the grantor too: its remoteLocks entry otherwise defers its own
+                // sync of this file for up to 30 s behind a lock nobody ended up holding.
+                this.sendData(peerId, { type: 'lock-release', path, requestId } as any);
                 resolve(false);
             }, 5000);
-            
+
             this.pendingLockRequests.set(requestId, { resolve, timeout });
-            this.sendData(this.twoDevicePeerId!, { type: 'lock-request', path, requestId });
+            this.sendData(peerId, { type: 'lock-request', path, requestId });
         });
+    }
+
+    /** Forget every lock (held or granted) that involved `peerId` — its link is gone. */
+    public purgePeerLocks(peerId: string) {
+        for (const [path, lock] of this.heldLocks) {
+            if (lock.peerId === peerId) this.heldLocks.delete(path);
+        }
+        for (const [path, lock] of this.remoteLocks) {
+            if (lock.peerId === peerId) this.remoteLocks.delete(path);
+        }
     }
 
     handleLockRequest(data: LockRequestPayload, conn: DataConnection) {
@@ -3482,7 +3543,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         const isEditing = view && view.file && view.file.path === path;
         
-        if (isEditing || this.heldLocks.has(path)) {
+        const grantedElsewhere = this.remoteLocks.get(path);
+        if (isEditing || this.heldLocks.has(path)
+            // A third device's live grant must not be silently overwritten: both would
+            // then believe they hold the note, and both would stream edits into it.
+            || (grantedElsewhere && grantedElsewhere.peerId !== conn.peer && grantedElsewhere.expiresAt > Date.now())) {
             this.sendData(conn.peer, { type: 'lock-deny', path, requestId: data.requestId, reason: 'File is actively being edited' });
         } else {
             const expiresAt = Date.now() + LOCK_EXPIRATION_MS;
@@ -3539,55 +3604,71 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.showNotice(`Another device is editing ${data.path.split('/').pop() || data.path}`, 'info', 3000);
     }
 
-    handleEditorDelta(data: EditorDeltaPayload) {
+    handleEditorDelta(data: EditorDeltaPayload, conn?: DataConnection) {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (view && view.file && view.file.path === data.path) {
-            const cm = (view as any).editor?.cm;
-            if (cm) {
-                this.isApplyingRemoteEdit = true;
-                this.ignoreNextEventForPath(data.path);
-                
-                const currentText = view.editor.getValue();
-                // uses the shared module-level dmp instance
-                const patches = dmp.patch_fromText(data.patches);
-                const [newText, results] = dmp.patch_apply(patches, currentText);
-                
-                if (results.every((r: boolean) => r === true)) {
-                    const diff = dmp.diff_main(currentText, newText);
-                    dmp.diff_cleanupSemantic(diff);
-                    let offset = 0;
-                    const changes: Array<{ from: number, to?: number, insert?: string }> = [];
-                    for (let i = 0; i < diff.length; i++) {
-                        const [op, text] = diff[i];
-                        if (op === 0) {
-                            offset += text.length;
-                        } else if (op === -1) {
-                            const nextDiff = diff[i + 1];
-                            if (nextDiff && nextDiff[0] === 1) {
-                                changes.push({ from: offset, to: offset + text.length, insert: nextDiff[1] });
-                                offset += text.length;
-                                i++; // skip insert
-                            } else {
-                                changes.push({ from: offset, to: offset + text.length });
-                                offset += text.length;
-                            }
-                        } else if (op === 1) {
-                            changes.push({ from: offset, insert: text });
-                        }
+        if (!view || !view.file || view.file.path !== data.path) return;
+        const cm = (view as any).editor?.cm;
+        if (!cm) return;
+
+        // The peer streams deltas only while IT holds the note's lock; if our own lock
+        // bookkeeping says this path is being edited from another device, this delta
+        // (or our own just-granted lock) is racing — the 2 s file path settles it.
+        const liveLock = this.remoteLocks.get(data.path);
+        if (liveLock && conn && liveLock.peerId !== conn.peer) return;
+
+        // Per path: one global flag suppressed editor-change for a DIFFERENT note
+        // opened within the 50 ms reset window.
+        this.applyingRemoteEdits.add(data.path);
+        this.ignoreNextEventForPath(data.path);
+
+        const currentText = view.editor.getValue();
+        // uses the shared module-level dmp instance
+        const patches = dmp.patch_fromText(data.patches);
+        const [newText, results] = dmp.patch_apply(patches, currentText);
+
+        if (results.every((r: boolean) => r === true)) {
+            const diff = dmp.diff_main(currentText, newText);
+            dmp.diff_cleanupSemantic(diff);
+            let offset = 0;
+            const changes: Array<{ from: number, to?: number, insert?: string }> = [];
+            for (let i = 0; i < diff.length; i++) {
+                const [op, text] = diff[i];
+                if (op === 0) {
+                    offset += text.length;
+                } else if (op === -1) {
+                    const nextDiff = diff[i + 1];
+                    if (nextDiff && nextDiff[0] === 1) {
+                        changes.push({ from: offset, to: offset + text.length, insert: nextDiff[1] });
+                        offset += text.length;
+                        i++; // skip insert
+                    } else {
+                        changes.push({ from: offset, to: offset + text.length });
+                        offset += text.length;
                     }
-                    
-                    const tx: any = { changes };
-                    const syncAnnotation = (window as any).CM_Annotation ? (window as any).CM_Annotation.define() : null;
-                    if (syncAnnotation) tx.annotations = syncAnnotation.of('remote-sync');
-                    
-                    cm.dispatch(tx);
-                    
-                    this.lastSentContent.set(data.path, { content: newText, timestamp: Date.now() });
+                } else if (op === 1) {
+                    changes.push({ from: offset, insert: text });
                 }
-                
-                setTimeout(() => this.isApplyingRemoteEdit = false, 50);
             }
+
+            cm.dispatch({ changes });
+
+            this.lastSentContent.set(data.path, { content: newText, timestamp: Date.now() });
+            // An echo record, like every other remote write: Obsidian's autosave fires
+            // ~2 s after typing stops — right at the ignore marker's edge — and a save
+            // landing after it was counted as a LOCAL edit and bounced back.
+            void this.getHash(newText).then(hash => this.noteRemoteWrite(data.path, hash));
+        } else {
+            // The patch applied against text we no longer have: our base diverged. A
+            // failed delta used to vanish silently while the sender had already
+            // advanced its base — every later delta was then misbased forever. Ask
+            // for the file outright (disk converges; the sender's full send rebuilds
+            // both bases) and drop our stale cached base.
+            this.log(`Editor delta for ${data.path} no longer applies — requesting the file.`);
+            this.lastSentContent.delete(data.path);
+            if (conn) this.sendDirect(conn, { type: 'request-file', path: data.path });
         }
+
+        setTimeout(() => this.applyingRemoteEdits.delete(data.path), 50);
     }
 
     async loadQueueState() {
