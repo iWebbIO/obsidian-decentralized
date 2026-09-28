@@ -3,6 +3,7 @@ import type ObsidianDecentralizedPlugin from './main';
 import { PeerInfo, DEFAULT_SETTINGS, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE } from './types';
 import { ConnectionModal, ConfirmModal, renderHostAddresses } from './ui';
 import { persistablePeerInfo } from './utils/pairing';
+import { normalizePeerServerHost, normalizePeerServerPath } from './utils/net';
 
 export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     plugin: ObsidianDecentralizedPlugin;
@@ -188,13 +189,26 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         if (this.plugin.settings.useCustomPeerServer) {
             const config = this.plugin.settings.customPeerServerConfig;
-            new Setting(containerEl).setName("Host").addText(text => text.setValue(config.host).onChange(async (value) => { config.host = value; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Host").addText(text => text.setValue(config.host).onChange(async (value) => {
+                // PeerJS concatenates the host into its URL, so "wss://server.example"
+                // (the spelling its own docs use) must never reach it as-is. Mid-typing
+                // values that normalise to nothing keep the last valid host silently —
+                // onChange fires per keystroke and would spam notices.
+                const normalized = normalizePeerServerHost(value);
+                if (!normalized) return;
+                config.host = normalized.host;
+                if (normalized.secure !== null) config.secure = normalized.secure;
+                await this.plugin.saveSettings();
+            }));
             new Setting(containerEl).setName("Port").addText(text => text.setValue(config.port.toString()).onChange(async (value) => {
                 const parsed = parseInt(value, 10);
                 config.port = isNaN(parsed) ? DEFAULT_SETTINGS.customPeerServerConfig.port : Math.max(1, Math.min(parsed, 65535));
                 await this.plugin.saveSettings();
             }));
-            new Setting(containerEl).setName("Path").addText(text => text.setValue(config.path).onChange(async (value) => { config.path = value; await this.plugin.saveSettings(); }));
+            new Setting(containerEl).setName("Path").addText(text => text.setValue(config.path).onChange(async (value) => {
+                config.path = normalizePeerServerPath(value);
+                await this.plugin.saveSettings();
+            }));
             new Setting(containerEl).setName("Secure (SSL)").addToggle(toggle => toggle.setValue(config.secure).onChange(async (value) => { config.secure = value; await this.plugin.saveSettings(); }));
 
             new Setting(containerEl)

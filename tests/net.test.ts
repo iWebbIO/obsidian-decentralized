@@ -1,4 +1,4 @@
-import { collectLocalIpv4, preferLocalIpv4, parseHostInput, formatHostForUrl } from '../src/utils/net';
+import { collectLocalIpv4, preferLocalIpv4, parseHostInput, formatHostForUrl, normalizePeerServerHost, normalizePeerServerPath } from '../src/utils/net';
 
 describe('collectLocalIpv4', () => {
     it('skips loopback and link-local addresses', () => {
@@ -68,5 +68,45 @@ describe('formatHostForUrl', () => {
         expect(formatHostForUrl('192.168.1.20')).toBe('192.168.1.20');
         expect(formatHostForUrl('fe80::1')).toBe('[fe80::1]');
         expect(formatHostForUrl('[fe80::1]')).toBe('[fe80::1]');
+    });
+});
+
+describe('normalizePeerServerHost', () => {
+    it('keeps a plain hostname or address, with no opinion on security', () => {
+        expect(normalizePeerServerHost('myserver.example')).toEqual({ host: 'myserver.example', secure: null });
+        expect(normalizePeerServerHost(' 192.168.1.10 ')).toEqual({ host: '192.168.1.10', secure: null });
+    });
+
+    it('strips the scheme people paste from PeerJS docs and takes the hint about security', () => {
+        // PeerJS concatenates host straight into https://host:port/path — a "wss://"
+        // prefix built a URL that could never resolve, and the retry loop ran forever.
+        expect(normalizePeerServerHost('wss://myserver.example')).toEqual({ host: 'myserver.example', secure: true });
+        expect(normalizePeerServerHost('https://myserver.example/')).toEqual({ host: 'myserver.example', secure: true });
+        expect(normalizePeerServerHost('ws://myserver.example')).toEqual({ host: 'myserver.example', secure: false });
+        expect(normalizePeerServerHost('http://10.0.0.8')).toEqual({ host: '10.0.0.8', secure: false });
+    });
+
+    it('keeps IPv6 literals bracketed so their colons stay out of the URL syntax', () => {
+        expect(normalizePeerServerHost('fe80::1')).toEqual({ host: '[fe80::1]', secure: null });
+        expect(normalizePeerServerHost('[fe80::1]')).toEqual({ host: '[fe80::1]', secure: null });
+    });
+
+    it('rejects what is not a host at all', () => {
+        expect(normalizePeerServerHost('')).toBeNull();
+        expect(normalizePeerServerHost('   ')).toBeNull();
+        expect(normalizePeerServerHost('wss://')).toBeNull();
+        expect(normalizePeerServerHost('my laptop')).toBeNull();
+        expect(normalizePeerServerHost('myserver.example:443')).toBeNull();   // port belongs in its own field
+        expect(normalizePeerServerHost('10.0.0.8:')).toBeNull();             // mid-typing trailing colon
+    });
+});
+
+describe('normalizePeerServerPath', () => {
+    it('ensures a leading slash, because PeerJS concatenates the path after host:port', () => {
+        expect(normalizePeerServerPath('myapp')).toBe('/myapp');
+        expect(normalizePeerServerPath(' /myapp/ ')).toBe('/myapp');
+        expect(normalizePeerServerPath('/')).toBe('/');
+        expect(normalizePeerServerPath('')).toBe('/');
+        expect(normalizePeerServerPath('///')).toBe('/');
     });
 });

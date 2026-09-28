@@ -109,7 +109,7 @@ import {
 import { TimeoutManager } from './utils/Timeouts';
 import { persistablePeerInfo, sanitizePeerInfo } from './utils/pairing';
 import { isGenericDeviceName, suggestedDeviceName } from './utils/device-name';
-import { collectLocalIpv4, preferLocalIpv4, type LocalIpv4 } from './utils/net';
+import { collectLocalIpv4, preferLocalIpv4, normalizePeerServerHost, normalizePeerServerPath, type LocalIpv4 } from './utils/net';
 import { peerErrorUserMessage, shouldTearDownPeer } from './utils/peer-error';
 import { QueueManager } from './core/QueueManager';
 import { ConnectionManager } from './core/ConnectionManager';
@@ -935,6 +935,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             ...JSON.parse(JSON.stringify(DEFAULT_SETTINGS.customPeerServerConfig)),
             ...(stored.customPeerServerConfig ?? {}),
         };
+        // Self-heal a config the old settings screen let through: a scheme or trailing
+        // slash in the host built a URL PeerJS could never resolve, and the reconnect
+        // loop retried it forever. An unusable host falls back to the default rather than
+        // quietly connecting to the public cloud.
+        {
+            const cfg = this.settings.customPeerServerConfig;
+            const normalized = normalizePeerServerHost(cfg.host ?? '');
+            if (normalized) {
+                cfg.host = normalized.host;
+                if (normalized.secure !== null) cfg.secure = normalized.secure;
+                cfg.path = normalizePeerServerPath(cfg.path ?? '');
+            } else {
+                this.settings.customPeerServerConfig = JSON.parse(JSON.stringify(DEFAULT_SETTINGS.customPeerServerConfig));
+            }
+        }
         // Invalidate folder filter caches whenever settings are (re-)loaded
         this._cachedExcludedFolders = null;
         this._cachedIncludedFolders = null;

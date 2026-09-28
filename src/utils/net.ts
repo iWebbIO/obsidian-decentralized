@@ -57,6 +57,53 @@ export function preferLocalIpv4(addrs: LocalIpv4[]): string | null {
     return addrs[0]?.address ?? null;
 }
 
+export interface NormalizedPeerServerHost {
+    host: string;
+    /**
+     * The security implied by what was typed (wss:// or https:// → true, ws:// or
+     * http:// → false), or null when no scheme was given — the caller's existing
+     * choice stands in that case.
+     */
+    secure: boolean | null;
+}
+
+/**
+ * A custom signaling server host as PeerJS needs it. PeerJS builds its URL as
+ * `${secure ? 'https' : 'http'}://${host}:${port}${path}`, so a scheme pasted with
+ * the host ("wss://myserver.example" — the spelling PeerJS's own docs use) or a
+ * trailing slash produces a URL that can never resolve, and the reconnect loop
+ * retries it forever. Null when nothing usable remains.
+ */
+export function normalizePeerServerHost(raw: string): NormalizedPeerServerHost | null {
+    const trimmed = raw.trim();
+    const scheme = trimmed.match(/^([a-z][a-z0-9+.-]*):\/\/(.*)$/i);
+    const body = (scheme ? scheme[2] : trimmed).replace(/\/.*$/, '').trim();
+    if (body === '') return null;
+    // PeerJS concatenates the host into the URL, so an IPv6 literal must stay
+    // bracketed to keep its own colons out of the URL syntax. A single colon means
+    // "host:port" typed into the host field (or a mid-typing trailing colon): a real
+    // IPv6 literal always has at least two.
+    const bare = body.replace(/^\[(.*)\]$/, '$1');
+    const colons = (bare.match(/:/g) || []).length;
+    const host = colons > 0 ? `[${bare}]` : body;
+    const isIpv6 = colons >= 2 && /^\[[0-9A-Fa-f:.]+\]$/.test(host);
+    const isName = /^[A-Za-z0-9._-]+$/.test(host);
+    if (!isIpv6 && !isName) return null;
+    return {
+        host,
+        secure: scheme ? /^(wss|https)$/i.test(scheme[1]) : null,
+    };
+}
+
+/**
+ * A custom signaling server path as PeerJS needs it: it is concatenated directly
+ * after host:port, so it must start with '/'. "myapp" would build "...:9000myapp".
+ */
+export function normalizePeerServerPath(raw: string): string {
+    const trimmed = raw.trim().replace(/^\/+/, '').replace(/\/+$/, '');
+    return trimmed === '' ? '/' : '/' + trimmed;
+}
+
 /** A host as it goes into a ws:// URL: IPv6 literals need brackets. */
 export function formatHostForUrl(host: string): string {
     const bare = host.trim().replace(/^\[(.*)\]$/, '$1');
