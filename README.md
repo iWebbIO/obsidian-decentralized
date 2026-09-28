@@ -38,7 +38,7 @@ Your notes are your own. This plugin ensures they stay that way.
 -   **🕵️‍♂️ LAN Discovery:** On desktop, Connect devices lists other vaults on the same Wi-Fi. Tap one only after that device also has Connect devices open (it shares the pairing key).
 -   **🤝 Multiple Connection Methods:** Pair with the full pairing code or its QR (device ID plus encryption key). A short device ID alone is refused. On the same Wi-Fi you can tap a nearby device. With no internet, use Offline Mode (one desktop hosts; others join with its IP and token).
 -   **⚙️ Powerful Sync Engine:**
-    -   Handles file/folder creation, deletion, and renaming. Edits made while devices are apart are exchanged when they reconnect.
+    -   Handles file/folder creation, deletion, and renaming. Edits made while devices are apart are exchanged when they reconnect (the "Compare vaults when a device reconnects" toggle, on by default).
     -   Efficiently syncs only the changes.
     -   Intelligently chunks large files to handle attachments and media.
     -   Files deleted on another device go to your trash, so a mistake can be undone.

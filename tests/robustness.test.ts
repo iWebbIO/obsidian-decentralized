@@ -282,3 +282,45 @@ describe('full-sync state machine hardening', () => {
         plugin.abortSync(undefined, { silent: true });
     });
 });
+
+describe('Merkle traversal defenses', () => {
+    function fromA() {
+        return { peer: A, open: true, send: jest.fn() } as any;
+    }
+
+    test('a type conflict is named once, not descended into', async () => {
+        // A folder on one device and a file at the same path on the other used to
+        // loop forever: every child push failed per file with unrelated error
+        // toasts and nothing converged.
+        const b = await createDevice(B, { vault: (() => {
+            const v = new (require('./helpers/fake-vault').FakeVault)();
+            v.seed('clash', 'a note where a folder lives elsewhere', 1000);
+            return v;
+        })() });
+        const plugin: any = b.plugin;
+        const sent: any[] = [];
+        jest.spyOn(plugin, 'sendData').mockImplementation((_p: string, m: any) => { sent.push(m); });
+        await plugin.buildMerkleTree();
+
+        // The peer says 'clash' is a folder holding a child.
+        await plugin.handleMerkleNodeResponse(
+            { type: 'merkle-node-response', path: '', children: { 'clash': 'h1' }, folders: ['clash'] }, fromA());
+
+        expect(sent).toEqual([]);   // no descent, no request-file for phantom children
+    });
+
+    test('a merkle-node-response with absurd fan-out is dropped', async () => {
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        const sent: any[] = [];
+        jest.spyOn(plugin, 'sendData').mockImplementation((_p: string, m: any) => { sent.push(m); });
+        await plugin.buildMerkleTree();
+
+        const children: Record<string, string> = {};
+        for (let i = 0; i < 5000; i++) children[`k${i}`] = `hash-${i}`;
+        await plugin.handleMerkleNodeResponse(
+            { type: 'merkle-node-response', path: '', children, folders: [] }, fromA());
+
+        expect(sent).toEqual([]);   // no queue items spawned from one crafted message
+    });
+});

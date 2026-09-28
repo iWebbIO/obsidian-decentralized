@@ -1643,6 +1643,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const controlMessages = ['request-full-sync', 'sync-plan', 'request-batch', 'batch-complete', 'full-sync-complete', 'sync-control-binary'];
         if (controlMessages.includes(data.type)) return 500000;
 
+        // Reconciliation is round-trip-driven: each folder's descent waits for its own
+        // node request/response to clear the outbound queue — which during a traversal
+        // is full of the higher-priority file transfers those responses spawned. At
+        // the floor priority (-1) they starved behind their own traffic.
+        if (data.type === 'merkle-root' || data.type === 'merkle-node-request' || data.type === 'merkle-node-response' || data.type === 'request-file') return 400000;
+
         if (data.type === 'folder-create' || data.type === 'folder-delete' || data.type === 'folder-rename') return 100000;
         if (data.type === 'file-delete' || data.type === 'file-rename' || data.type === 'file-delta') return 50000;
         if (data.type === 'file-update') {
@@ -1996,11 +2002,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         if (item.data) {
                             // fall through: the payload stands as built.
                         } else {
-                        const statAtRead = { mtime: file.stat.mtime, size: file.stat.size };
+                        let statAtRead = { mtime: file.stat.mtime, size: file.stat.size };
                         let content: string | ArrayBuffer = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
                         let encoding: 'utf8' | 'binary' | 'base64' = this.isBinary(file.extension) ? 'binary' : 'utf8';
                         let hash = '';
                         try { hash = await this.getHash(content); } catch(e) {}
+                        // The send path takes no path lock, so a user save or an incoming
+                        // apply can land between the read and the hash await: the payload
+                        // would carry pre-apply content with a post-merge vector, which
+                        // the receiver applies as a causal successor — silently undoing
+                        // its own edit. If the file moved under us, decide again against
+                        // the fresh bytes (once; a second move is the next task's).
+                        if (file.stat.mtime !== statAtRead.mtime || file.stat.size !== statAtRead.size) {
+                            statAtRead = { mtime: file.stat.mtime, size: file.stat.size };
+                            content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
+                            try { hash = await this.getHash(content); } catch(e) {}
+                        }
 
                         if (!task.forceFull && this.isRemoteEcho(file.path, hash)) {
                             this.log(`Ignoring echo event for ${file.path}`);
@@ -5005,6 +5022,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // A folder we do not have compares against nothing. This used to stop at the deepest
         // folder we DID have and compare the peer's children against that folder's, sending
         // requests for paths that exist on neither side.
+        // One crafted response with unbounded keys is that many queue items plus
+        // per-key work here; every comparable peer-supplied collection is capped
+        // (gossip 256, messageIds 500, vectors 1000).
+        const MAX_MERKLE_CHILDREN = 4096;   // far above any real per-folder fan-out
+        if (Object.keys(data.children).length > MAX_MERKLE_CHILDREN) {
+            this.log(`Dropping a merkle-node-response for ${data.path}: ${Object.keys(data.children).length} children is not a real folder.`);
+            return;
+        }
+
         const myChildren = this.merkleNodeAt(tree, data.path)?.children ?? {};
         const remoteChildren = data.children;
         // Which of the peer's children are folders. Older peers do not say, and the fallback
@@ -5023,6 +5049,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (sanitizeVaultPath(fullPath) !== fullPath || !this.isPathSyncable(fullPath)) continue;
 
             const file = this.app.vault.getAbstractFileByPath(fullPath);
+            // A type conflict (folder on one device, file on the other) used to
+            // descend forever: every child push failed per file with an unrelated
+            // error toast, nothing converged, no copy was made. Name it once.
+            if (remoteFolders?.has(key) && file instanceof TFile) {
+                this.showNotice(`"${fullPath}" is a note here but a folder on the other device — nothing at this path can sync until one side is renamed.`, 'warning', 12000);
+                continue;
+            }
+            if (file instanceof TFolder && !myNode?.children && remoteFolders && !remoteFolders.has(key)) {
+                this.showNotice(`"${fullPath}" is a folder here but a note on the other device — nothing at this path can sync until one side is renamed.`, 'warning', 12000);
+                continue;
+            }
             const isFolder = file instanceof TFolder
                 || !!myNode?.children
                 || (remoteFolders ? remoteFolders.has(key) : (!file && !fullPath.includes('.')));
