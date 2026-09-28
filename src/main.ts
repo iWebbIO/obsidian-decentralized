@@ -997,7 +997,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     async saveKnownPeers() {
         this.settings.knownPeers = Array.from(this.clusterPeers.values()).map(persistablePeerInfo);
-        await this.saveSettings();
+        // Every caller fires and forgets (handshake, gossip, the settings UI, and the
+        // void-forgetDevice chains), so a disk failure here has nobody to observe it:
+        // log it rather than surface as an unhandled rejection.
+        try {
+            await this.saveSettings();
+        } catch (e) {
+            this.log('Could not save the known devices list', e);
+        }
     }
 
 
@@ -3178,7 +3185,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     handleClusterRename(data: ClusterRenamePayload) {
         if (data.targetDeviceId === this.settings.deviceId) {
             this.settings.friendlyName = data.newName;
-            this.saveSettings();
+            // This handler is synchronous, so a disk failure in saveData had no
+            // observer — an unhandled rejection per rename received from a peer.
+            this.saveSettings().catch(e => this.log('Could not save settings after a cluster rename', e));
             this.showNotice(`Your device was renamed to ${data.newName} by the cluster.`, 'info');
         }
         const peer = this.clusterPeers.get(data.targetDeviceId);

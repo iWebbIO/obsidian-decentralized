@@ -14,7 +14,7 @@ containing its fix or a recorded justification with specific evidence.
 | 3 | ui.ts remaining modals (QR, progress, confirm, binary conflict) | logic, error paths | | |
 | 4 | types.ts | constants sanity, payload shapes vs handlers | | |
 | 5 | core/storage impls (NodeFs, InMemory) | edge cases, contract honesty | | |
-| 6 | main.ts | floating/unawaited promises | | |
+| 6 | main.ts | floating/unawaited promises | FIX — saveKnownPeers was fire-and-forget at every call site but rejected on a saveData disk failure (unhandled rejection, also through the void-forgetDevice chains); now logs instead. handleClusterRename floated saveSettings in a sync handler; now .catch-logged. Verified sound with evidence: requestLock (resolve-only), sendFileUpdate (queues only, no awaits), processIncomingData (try/catch + caller-chain catch), folder apply handlers (inner try/catch + runLocked semantics), saveState/saveHashCache/saveQueueState (writeJsonAtomic internal catch), all .then chains (each has .catch). | (this commit) |
 | 7 | main.ts | memory bounds of every Map/Set | | |
 | 8 | main.ts | peer-input validation per message type | | |
 | 9 | main.ts lifecycle (onload/onunload) | registration vs teardown symmetry | | |
