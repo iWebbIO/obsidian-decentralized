@@ -42,6 +42,7 @@ function stubPlugin(deviceId: string) {
         // The transports call these on socket close; the stub records them so a
         // transport that grows a new plugin dependency fails here loudly.
         purgePeerLocks: jest.fn(),
+        settlePeerTransfers: jest.fn(),
         isUnloaded: false,
         handleRawIncomingData: jest.fn(async (message: any, conn: any) => { received.push({ message, conn }); }),
     };
@@ -173,7 +174,7 @@ describe('authentication', () => {
     });
 
     test('a device that reconnects replaces its old socket', async () => {
-        const { server, port } = await startServer();
+        const { server, plugin: host, port } = await startServer();
         const first = startClient(port);
         await waitFor(() => server.hasClient('joining-device'), { what: 'the first link' });
         const second = startClient(port);
@@ -181,6 +182,10 @@ describe('authentication', () => {
 
         await waitFor(() => wsNetwork.clients[0].readyState === 3, { what: 'the old socket to close' });
         expect(server.getClients()).toEqual(['joining-device']);
+        // The dead socket's transfers are settled with it, like PeerJS does on close —
+        // a dropped download's reassembly no longer outlives its link.
+        await waitFor(() => (host.settlePeerTransfers as jest.Mock).mock.calls.some(([id]) => id === 'joining-device'),
+            { what: 'the old link transfers to be settled' });
         first.client.stop();
     });
 });

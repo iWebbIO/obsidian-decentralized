@@ -187,6 +187,8 @@ export class DirectIpServer {
                     try { entry.socket.close(); } catch (_) { /* ignore */ }
                     this.clients.delete(deviceId);
                     this.plugin.connections?.delete(deviceId);
+                    this.plugin.purgePeerLocks?.(deviceId);
+                    this.plugin.settlePeerTransfers?.(deviceId);
                     this.plugin.updateStatus();
                 }
             }
@@ -298,6 +300,11 @@ export class DirectIpServer {
             }
             // Edit locks the joining device held do not survive its link.
             this.plugin.purgePeerLocks?.(deviceId);
+            // Neither do its transfers: PeerJS settles on close, and without this the
+            // direct-ip paths left a dropped download's reassembly (up to 512 MB)
+            // pinned for the 5-minute sweeper and still counting against the
+            // concurrent-reassembly cap.
+            this.plugin.settlePeerTransfers?.(deviceId);
             this.plugin.updateStatus();
         });
 
@@ -665,6 +672,7 @@ export class DirectIpClient {
             this.clearAuthTimeout();
             // The host's edit locks do not survive the link.
             this.plugin.purgePeerLocks?.('direct-ip-host');
+            this.plugin.settlePeerTransfers?.('direct-ip-host');
 
             // Intentional shutdown, or already failed for good — do nothing
             if (this.isStopped || this.isFatalError) return;

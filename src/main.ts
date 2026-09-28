@@ -256,6 +256,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         total: number,
         receivedCount: number,
         lastUpdated: number,
+        /** Absolute age cap for the sweeper: silence alone let a slow-drip transfer live forever. */
+        startedAt: number,
         fileHash: string,
         compressed?: boolean,
         versionVector?: VersionVector
@@ -264,7 +266,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // Timeouts and Keep-alives
     private syncIdleTimeout: number | null = null;
     private syncKeepAliveInterval: number | null = null;
-    private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string }> = new Map();
+    private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string, touch?: () => void }> = new Map();
     private lastStatusUpdate: number = 0;
     /** A throttled status refresh still owed (see updateStatus). */
     private statusTimer: number | null = null;
@@ -1979,6 +1981,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             this.syncState.currentFileSize = file.stat.size;
                         }
                         // NOTE: lastSentContent eviction is handled by the 60-s cleanupPendingChunks interval
+                        // A retry re-enters with item.data already built (the queue re-adds
+                        // the same object); re-reading and re-hashing the file here was
+                        // thrown away by the !item.data build below — a multi-hundred-MB
+                        // file paid a full read + SHA-256 pass per retry for nothing.
+                        if (item.data) {
+                            // fall through: the payload stands as built.
+                        } else {
                         const statAtRead = { mtime: file.stat.mtime, size: file.stat.size };
                         let content: string | ArrayBuffer = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
                         let encoding: 'utf8' | 'binary' | 'base64' = this.isBinary(file.extension) ? 'binary' : 'utf8';
@@ -2043,6 +2052,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             }
                             item.data = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding, transferId: this.generateTransferId(file.path), fileHash: hash, compressed: isCompressedText, versionVector: vv };
                         }
+                        }   // end !item.data build
                     } else {
                         // The file is gone locally, so nothing was delivered. Reporting success
                         // put the path in the batch's receivedPaths, and the peer then dropped
@@ -2196,7 +2206,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     // wire. fileData.fileHash is the hash of the ORIGINAL content, which
                     // only matches the wire bytes when the body was not compressed.
                     const wireHash = fileData.compressed ? undefined : fileData.fileHash;
-                    await this.sendFileInChunks(peerId, fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!, 0, fileData.compressed, fileData.versionVector, wireHash);
+                    await this.sendFileInChunks(peerId, fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!, fileData.compressed, fileData.versionVector, wireHash);
                     await ackPromise;
                     this.log(`Chunked transfer ${transferId} for ${fileData.path} completed successfully.`);
                     
@@ -2405,7 +2415,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      */
     private expectAck(transferId: string, peerId: string, timeoutMs: number): Promise<void> {
         const ack = new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => {
+            let timeout = setTimeout(() => {
                 this.pendingAcks.delete(transferId);
                 reject(new Error(`Transfer ${transferId} timed out`));
             }, timeoutMs);
@@ -2413,6 +2423,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 resolve: () => { clearTimeout(timeout); resolve(); },
                 reject: (e) => { clearTimeout(timeout); reject(e); },
                 peerId,
+                // Slide the deadline on progress: the window used to be a wall-clock
+                // budget over the WHOLE transfer, so any file legitimately taking
+                // longer than 5 minutes (a 512 MB attachment on an ordinary link) could
+                // never succeed — and each retry re-sent the entire file at the same
+                // speed, ~20 full sends for a file the receiver already had.
+                touch: () => {
+                    clearTimeout(timeout);
+                    timeout = setTimeout(() => {
+                        this.pendingAcks.delete(transferId);
+                        reject(new Error(`Transfer ${transferId} timed out`));
+                    }, timeoutMs);
+                },
             });
         });
         ack.catch(() => { /* observed by whoever awaits it, if anyone still does */ });
@@ -2490,6 +2512,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * when that device is back, and drop downloads, which cannot continue without their sender.
      * Clearing everything here used to discard the only record of what a peer still needed.
      */
+    /** Settle this peer's transfers: uploads park as resumable, downloads (which
+     *  cannot continue without their sender) are dropped with their reassemblies. */
+    public settlePeerTransfers(peerId?: string) {
+        this.settleTransfersAfterDisconnect(peerId);
+    }
+
     private settleTransfersAfterDisconnect(peerId?: string) {
         for (const [id, transfer] of this.activeTransfers) {
             if (peerId !== undefined && transfer.peerId !== peerId) continue;
@@ -3757,7 +3785,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      *   processQueueItem always has it, and re-digesting a multi-hundred-MB buffer
      *   here was a full redundant pass over the file.
      */
-    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string, startIndex = 0, compressed?: boolean, versionVector?: VersionVector, knownHash?: string) {
+    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string, compressed?: boolean, versionVector?: VersionVector, knownHash?: string) {
         const isDirectIp = this.getConnectionMode() === 'direct-ip';
         let conn: DataConnection | undefined;
 
@@ -3770,19 +3798,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
         
-        const existingTransfer = this.activeTransfers.get(transferId);
-        // A resumed transfer MUST keep its original chunk size. getChunkSize() adapts to
-        // measured bandwidth, so recomputing it here made the sender re-chunk a partially
-        // sent file at a different boundary than both the receiver's offsets and the
-        // transfer's own recorded totalChunks.
-        const chunkSize = existingTransfer?.chunkSize || this.getChunkSize();
-        this.activeTransfers.set(transferId, existingTransfer || {
+        // Transfers always start from chunk 0: a retry or resume re-sends the whole
+        // file under a fresh id, and the receiver resets on a duplicate start — the
+        // mid-file continuation this used to support never worked and its dead branches
+        // (a startIndex the receiver would ignore, a chunkSize "preserved" from an
+        // entry nothing could still find) only invited a caller to rely on them.
+        const chunkSize = this.getChunkSize();
+        this.activeTransfers.set(transferId, {
             id: transferId,
             path,
             direction: 'upload',
             peerId,
             totalChunks: Math.ceil(fileContent.byteLength / chunkSize),
-            processedChunks: startIndex,
+            processedChunks: 0,
             startTime: Date.now(),
             lastUpdate: Date.now(),
             status: 'active',
@@ -3811,14 +3839,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // ladder before a fresh send picked the right regime.
         const keyApplies = () => !!this.peerKeyFor(peerId);
 
-        if (startIndex === 0) {
+        {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector, totalBytes: fileContent.byteLength, chunkSize };
             const encPayload = keyApplies() ? await this.encryptPayload(startPayload, peerId) : startPayload;
             await this.sendPayloadTo(peerId, encPayload);
             this.resetIdleTimeout();
         }
         
-        for (let i = startIndex; i < totalChunks; i++) {
+        for (let i = 0; i < totalChunks; i++) {
             if (!this.activeTransfers.has(transferId)) {
                 throw new Error("Transfer cancelled or timed out");
             }
@@ -3863,6 +3891,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } else {
                     await this.sendPayloadTo(peerId, encPayload, 16 * 1024 * 1024, 8 * 1024 * 1024);
                 }
+                // Progress: the ack window measures inactivity now, not the whole
+                // transfer's wall-clock time.
+                this.pendingAcks.get(transferId)?.touch?.();
 
                 const transfer = this.activeTransfers.get(transferId);
                 if (transfer) {
@@ -3938,6 +3969,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         if (!this.pendingFileChunks.has(payload.transferId) && this.pendingFileChunks.size >= MAX_CONCURRENT_REASSEMBLIES) {
             this.log(`Rejecting chunked transfer for ${payload.path}: too many concurrent transfers in progress.`);
+            // Say so: the sender used to learn this only by streaming every chunk into
+            // the void and burning the full ack window before the retry ladder —
+            // a one-line nack makes it a cheap 5 s retry instead.
+            if (conn) this.sendDirect(conn, { type: 'nack', transferId: payload.transferId, reason: 'busy' });
             return;
         }
 
@@ -3952,6 +3987,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             total: payload.totalChunks,
             receivedCount: 0,
             lastUpdated: Date.now(),
+            startedAt: Date.now(),
             fileHash: payload.fileHash || '',
             compressed: payload.compressed,
             versionVector: payload.versionVector,
@@ -3984,7 +4020,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.activeTransfers.delete(payload.transferId);
             return;
         }
-        if (payload.index < 0 || payload.index >= transfer.total) {
+        // Safe integer first: a fractional index (1.5) passes the range check, then
+        // reads as undefined in the bitmap (no double-count guard) and its byte offset
+        // lands truncated — mid-way inside a legitimately received chunk, clobbering it.
+        if (!Number.isSafeInteger(payload.index) || payload.index < 0 || payload.index >= transfer.total) {
             this.log(`Received invalid chunk index ${payload.index} for transfer ${payload.transferId}`);
             return;
         }
@@ -4046,13 +4085,25 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         let statusChanged = false;
 
         for (const [id, transfer] of this.pendingFileChunks.entries()) {
-            if (now - transfer.lastUpdated > 60000 * 5) { 
+            // Silence (5 min) reclaims a dead sender; the absolute cap (30 min) reclaims
+            // a slow-drip one — a connected peer sending one small chunk per <5 min
+            // kept a 512 MB preallocation alive forever, and 16 of them pin 8 GB.
+            if (now - transfer.lastUpdated > 60000 * 5 || now - transfer.startedAt > 30 * 60000) {
                 this.log(`Cleaning up stale chunk transfer: ${id}`);
                 this.pendingFileChunks.delete(id);
             }
         }
         for (const [id, transfer] of this.activeTransfers.entries()) {
-            if (transfer.status === 'paused') continue;
+            // A paused upload whose peer never returns used to live here (and in every
+            // state.json) forever; a week of no resume is a peer that is gone.
+            if (transfer.status === 'paused') {
+                if (now - transfer.lastUpdate > 7 * 24 * 60 * 60 * 1000) {
+                    this.log(`Dropping a paused upload that was never resumed: ${id}`);
+                    this.activeTransfers.delete(id);
+                    statusChanged = true;
+                }
+                continue;
+            }
             if (now - transfer.lastUpdate > 60000) { 
                 this.log(`Cleaning up stale active transfer: ${id}`);
                 this.activeTransfers.delete(id);
