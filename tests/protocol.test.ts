@@ -254,3 +254,31 @@ describe('receive-apply hardening (14/15)', () => {
         expect(b.vault.text(made!)).toBe('this device words');
     });
 });
+
+describe('sync keep-alive (19)', () => {
+    test('data from the sync peer counts as responsiveness, not just pongs', async () => {
+        // A serving peer's sync-pong queues behind megabytes of bulk chunks on the
+        // same ordered channel; ping-only liveness declared actively-transferring
+        // syncs dead at ~30 s while chunks flowed at full speed.
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        plugin.syncState.isSyncing = true;
+        plugin.syncState.peerId = A;
+        plugin.syncState.missedPings = 1;   // one missed round already
+
+        await plugin.processIncomingData(
+            { type: 'file-chunk-data', transferId: 't', index: 0, data: new Uint8Array(4) },
+            { peer: A, open: true, send: jest.fn() });
+
+        expect(plugin.syncState.missedPings).toBe(0);
+        plugin.abortSync(undefined, { silent: true });
+    });
+
+    test('the reconnecting state shows while a reconnect is in flight', async () => {
+        const b = await createDevice(B, { waitForOpen: false });
+        const plugin: any = b.plugin;
+        plugin.peerReconnectInFlight = true;
+        expect(plugin.calculateStatus().text).toBe('Reconnecting to the sync network...');
+        plugin.peerReconnectInFlight = false;
+    });
+});

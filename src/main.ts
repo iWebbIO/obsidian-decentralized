@@ -176,7 +176,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         batchStartTimes: new Map()
     };
     private pendingSyncAcks: Map<string, { resolve: () => void, reject: (e: Error) => void }> = new Map();
-    private lastSuccessfulMessageTime: Map<string, number> = new Map();
     // Receiver-side dedup of retried sync control messages (insertion-ordered, capped)
     private processedMessageIds: Set<string> = new Set();
 
@@ -244,6 +243,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public get isUnloaded(): boolean { return this.unloaded; }
     /** Fires if the current Peer never reaches the signalling server. */
     private peerOpenTimeout: number | null = null;
+    /** A reconnect() is in flight: the status bar keeps the honest state until it lands. */
+    private peerReconnectInFlight = false;
     private clusterConnectionInterval: number | null = null;
     public pendingConnections: Set<string> = new Set();
     private pendingFileChunks: Map<string, {
@@ -270,6 +271,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private syncKeepAliveInterval: number | null = null;
     private pendingAcks: Map<string, { resolve: () => void, reject: (e: Error) => void, peerId: string, touch?: () => void }> = new Map();
     private lastStatusUpdate: number = 0;
+    /** A custom status paint holds briefly; recomputes inside the window return. */
+    private customStatusUntil: number = 0;
     /** A throttled status refresh still owed (see updateStatus). */
     private statusTimer: number | null = null;
     private currentConcurrency = 16;
@@ -1903,8 +1906,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         const conn = this.connections.get(peerId);
         if (!conn || !conn.open) return false;
-        const lastSuccess = this.lastSuccessfulMessageTime.get(peerId);
-        if (lastSuccess && (Date.now() - lastSuccess > 35000)) return false;
+        // The heartbeat closes a silent link at 20 s, so a connection still in the
+        // map with open=true IS the liveness signal — a second, never-reachable
+        // 35 s clock here only invited the two windows to diverge.
         return true;
     }
 
@@ -2752,6 +2756,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private destroyPeer() {
         const peer = this.peer;
         this.peer = null;
+        this.peerReconnectInFlight = false;
         if (this.peerOpenTimeout !== null) { window.clearTimeout(this.peerOpenTimeout); this.peerOpenTimeout = null; }
         if (this.peerReconnectFallbackTimeout !== null) { window.clearTimeout(this.peerReconnectFallbackTimeout); this.peerReconnectFallbackTimeout = null; }
         if (!peer) return;
@@ -2805,6 +2810,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         peer.on('open', (id) => {
             if (!isCurrent()) return;
+            this.peerReconnectInFlight = false;
             if (this.peerOpenTimeout !== null) { window.clearTimeout(this.peerOpenTimeout); this.peerOpenTimeout = null; }
             // Cancel the reconnect fallback timer now that the peer is back online.
             if (this.peerReconnectFallbackTimeout !== null) {
@@ -2837,6 +2843,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         peer.on('disconnected', () => {
             if (!isCurrent() || peer.destroyed) return;
             this.showNotice('Sync network disconnected. Attempting to reconnect...', 'transient');
+            // reconnect() clears the disconnected flag synchronously, so the very next
+            // recompute paints the calm "No devices connected" during the whole
+            // reconnect window; the flag below keeps the honest state until it lands.
+            this.peerReconnectInFlight = true;
             this.updateStatus({ text: 'Reconnecting...', icon: 'plug', spin: true, state: 'loading' });
             // Attempt lightweight reconnect first
             try {
@@ -2850,8 +2860,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (this.peerReconnectFallbackTimeout !== null) clearTimeout(this.peerReconnectFallbackTimeout);
             this.peerReconnectFallbackTimeout = window.setTimeout(() => {
                 this.peerReconnectFallbackTimeout = null;
-                // If still disconnected after the window, fall through to full re-init
-                if (isCurrent() && peer.disconnected) {
+                // If still not OPEN after the window, fall through to full re-init.
+                // Openness, not the disconnected flag: reconnect() clears that flag
+                // synchronously, so the old test could never see the one case the
+                // timer exists for — a socket that neither opens nor closes.
+                if (isCurrent() && !peer.open) {
                     this.log('PeerJS reconnect() stalled — falling back to full re-initialization.');
                     this.handlePeerError(new Error('Reconnect timed out'));
                 }
@@ -2944,7 +2957,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.connections.delete(peerId);
             this.lastHeard.delete(peerId);
             this.manualPingStart.delete(peerId);
-            this.lastSuccessfulMessageTime.delete(peerId);
 
             // Locks die with the link that carried them.
             this.purgePeerLocks(peerId);
@@ -3176,7 +3188,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.log("Received data:", data.type, "from", conn?.peer);
         if (conn?.peer) {
             this.lastHeard.set(conn.peer, Date.now());
-            this.lastSuccessfulMessageTime.set(conn.peer, Date.now());
+            // Data-plane evidence: a serving peer's sync-pong queues behind up to
+            // 16 MB of bulk chunks on the same ordered channel, so pings alone
+            // declared actively-transferring syncs dead at ~30 s. Anything that
+            // arrives from the sync peer proves it is alive.
+            if (this.syncState.isSyncing && this.syncState.peerId === conn.peer) {
+                this.syncState.missedPings = 0;
+            }
         }
 
         if (data.messageId && data.type !== 'sync-ack' && conn) {
@@ -6307,6 +6325,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             return { text: "Offline Mode", icon: "network", state: 'neutral' };
         }
+        if (this.peerReconnectInFlight) return { text: 'Reconnecting to the sync network...', icon: 'plug', spin: true, state: 'loading' };
         // Not Offline Mode — that is the LAN-only connection. This is the signaling
         // server being unreachable; "Sync Offline" made people think they were already
         // in Offline Mode, or that they should switch to it.
@@ -6348,6 +6367,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (customStatus) {
             // Shown as given; a refresh owed from before must not paint over it.
             this.clearStatusTimer();
+            // A specific ERROR paint gets a short hold: without one, the next queue
+            // tick's recompute (200 ms throttle) replaced "This device ID is already
+            // in use" with the generic status almost immediately. Loading states
+            // ("Connecting…") are not held — the honest follow-up should land.
+            this.customStatusUntil = customStatus.state === 'error' ? now + 2000 : 0;
+        } else if (this.customStatusUntil && now < this.customStatusUntil) {
+            return;
         } else {
             // At most one refresh per 200 ms — but the last one always happens. Dropping it
             // left the bar on whatever it said mid-burst ("Syncing 1 file…") until something
