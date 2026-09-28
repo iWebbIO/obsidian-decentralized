@@ -31,8 +31,10 @@ export class QueueManager {
     /**
      * Items parked in retry backoff: they are in neither the heap nor active count, so
      * without this number a UI reading only the queue looks idle while work is pending.
+     * They are also what getQueue() reports — an unload during the 5 s window used to
+     * lose the pending change entirely (it was in no persisted collection).
      */
-    private retryingCount: number = 0;
+    private retryingItems: Set<QueueItem> = new Set();
     private maxConcurrency: number = 3;
     private timeoutManager: TimeoutManager;
     private processCallback: (item: QueueItem) => Promise<boolean>;
@@ -116,6 +118,9 @@ export class QueueManager {
         this.epoch++;
         this.syncQueue = [];
         this.inQueueOrProcessing.clear();
+        // Their retry timers still fire but the epoch guard stops the re-add; the
+        // parked copies must not keep reporting as pending work.
+        this.retryingItems.clear();
         // Do not reset activeQueueTransfers; let in-flight items finish naturally
     }
 
@@ -148,7 +153,7 @@ export class QueueManager {
     public getQueueSize(): number { return this.syncQueue.length; }
     public getActiveTransfers(): number { return this.activeQueueTransfers; }
     /** Items currently parked in retry backoff (in no queue, but pending work). */
-    public getRetrying(): number { return this.retryingCount; }
+    public getRetrying(): number { return this.retryingItems.size; }
 
     private processQueue() {
         if (this.queueIsPaused || this.disposed) return;
@@ -158,6 +163,14 @@ export class QueueManager {
             const item = this.heapPop()!;
             this.activeQueueTransfers++;
             this.inFlight.add(item);
+            // Release the dedup slot at POP time. Held until settlement, it was a wall:
+            // an edit made while a send of the same path was still in flight computed
+            // the same id and was silently discarded (its newer words never left), and
+            // the IntegrityError full-resend fallback for a nack'd delta was dropped the
+            // same way. Duplicates are safe: processQueueItem always re-reads fresh
+            // content, and the receiver orders by vector/mtime. Coalescing still holds
+            // for items sitting in the heap, which is the common repeated-flush case.
+            if (item.id) this.inQueueOrProcessing.delete(item.id);
             const epoch = this.epoch;
 
             // Release the item's dedup slot — but only in the epoch that claimed it. clear()
@@ -170,14 +183,15 @@ export class QueueManager {
             const scheduleRetry = () => {
                 if (this.disposed) return;
                 item.retries++;
-                this.retryingCount++;
-                // Keep item.id in inQueueOrProcessing during the retry delay
-                // to prevent duplicates from entering the queue in the window.
+                this.retryingItems.add(item);
                 this.timeoutManager.setTimeout(() => {
-                    this.retryingCount--;
+                    this.retryingItems.delete(item);
                     release();
                     // If clear() ran while we were waiting, the item belongs to an
-                    // aborted sync — don't resurrect it into the fresh queue.
+                    // aborted sync — don't resurrect it into the fresh queue. (The id
+                    // is free during the wait: a newer edit for the same path may have
+                    // enqueued a fresh task, and the retry is then deduped out in its
+                    // favour — its content would have been the staler one.)
                     if (epoch === this.epoch) this.addToQueue(item);
                 }, 5000);
             };
@@ -214,7 +228,7 @@ export class QueueManager {
      * interrupts them: re-sending a change after a restart is harmless, losing it is not.
      */
     public getQueue(): QueueItem[] {
-        return [...this.syncQueue, ...this.inFlight];
+        return [...this.syncQueue, ...this.inFlight, ...this.retryingItems];
     }
 
     public loadQueue(items: QueueItem[]) {

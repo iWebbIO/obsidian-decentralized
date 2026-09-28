@@ -1251,7 +1251,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             return;
         }
 
-        if (this.isTwoDeviceMode() && this.remoteLocks.has(file.path)) {
+        if (this.isTwoDeviceMode() && this.settings.enableRealtimeSync && this.remoteLocks.has(file.path)) {
             const lock = this.remoteLocks.get(file.path)!;
             if (Date.now() < lock.expiresAt) {
                 this.showNotice(`${file.name} is being edited on another device. Sync will wait.`, 'warning');
@@ -1316,7 +1316,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             }
 
-            if (this.isTwoDeviceMode() && file instanceof TFile && !this.isBinary(file.extension)) {
+            // Edit locks coordinate REALTIME typing (their whole reason to exist);
+            // without this gate, every ordinary save grabbed a 30 s lock on the peer
+            // and the peer's own next edit inside that window was deferred behind it.
+            if (this.isTwoDeviceMode() && this.settings.enableRealtimeSync
+                && file instanceof TFile && !this.isBinary(file.extension)) {
                 const held = this.heldLocks.get(file.path);
                 if (!held) {
                     await this.requestLock(file.path);
@@ -1402,6 +1406,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             this.pendingFileChanges.delete(oldPath);
                             void this.sendFileUpdate(file, undefined, true);
                         }
+                        // The flushed-already case: the task sits in the queue under the
+                        // dead old path and will fail as "no longer present"; send-rename
+                        // carries no content, so the edit's words would stay here only.
+                        const queuedEdit = this.queueManager.getQueue().some(q =>
+                            q.task && (q.task as SyncTask).taskType === 'send-file' && q.task.path === oldPath);
+                        if (queuedEdit) void this.sendFileUpdate(file, undefined, true);
                     }
                 } else if (file instanceof TFolder) {
                     // Offline: record each child's move directly. Relying only on the
@@ -1948,6 +1958,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private async processQueueItem(item: { peerId: string | null, task?: SyncTask, data?: any, retries: number, priority: number, retryable?: boolean }) {
         let transferId: string | undefined;
         let isPaused = false;
+        /** Parked for retryFailedSyncs with no peer connected: not delivered (the item's
+         * success cleanup must not splice the just-parked entry), but not a failure
+         * either (no concurrency penalty, no queue retry — the parked entry drives the
+         * later retries). */
+        let parkedForRetry = false;
         let success = false;
         const startTime = Date.now();
 
@@ -1990,7 +2005,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                     // uses the shared module-level dmp instance
                                     const patches = dmp.patch_make(cached.content, newText);
                                     const patchText = dmp.patch_toText(patches);
-                                    if (patchText.length < newText.length * (this.settings.deltaSyncThreshold / 100)) {
+                                    // An unchanged save makes no patches: shipping an empty
+                                    // delta made the receiver rewrite identical content with
+                                    // the sender's mtime — and any real divergence nack'd
+                                    // into the fallback path.
+                                    if (patches.length > 0 && patchText.length < newText.length * (this.settings.deltaSyncThreshold / 100)) {
                                         const baseHash = await this.getHash(cached.content);
                                         item.data = {
                                             type: 'file-delta',
@@ -2123,7 +2142,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             transferId = data.transferId;
 
-            if (!peerId && (data.type === 'file-update' || data.type === 'file-delta')) {
+            if (!peerId && (data.type === 'file-update' || data.type === 'file-delta' || data.type === 'file-delete')) {
                 let connectedPeers: string[] = [];
                 if (this.getConnectionMode() === 'direct-ip') {
                     if (this.directIpServer) connectedPeers = this.directIpServer.getClients();
@@ -2136,7 +2155,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     // No peers right now (e.g. queue restored from disk before connections
                     // came up). Don't discard silently — park in failedSyncs so
                     // retryFailedSyncs() re-sends once a peer reconnects.
-                    if (data.type === 'file-update' || data.type === 'file-delta') {
+                    // Deletes too: they have no other carriage on the wire, and the
+                    // park path already knows how to replay them.
+                    if (data.type === 'file-update' || data.type === 'file-delta' || data.type === 'file-delete') {
                         const existing = this.failedSyncs.find(f => f.path === data.path && !f.peerId);
                         if (!existing) {
                             this.failedSyncs.push({
@@ -2150,7 +2171,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             this.scheduleStateSave();
                         }
                     }
-                    success = true;
+                    parkedForRetry = true;
                     return;
                 }
                 
@@ -2249,7 +2270,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.recordTransferSample(bytesTransferred, Date.now() - startTime);
             }
 
-        } catch (e) {
+        } catch (thrown) {
+            // A worker can rethrow a non-Error (batch reads rethrow the path string);
+            // e.message on those is undefined and .includes raised a TypeError INSIDE
+            // this catch, escaping without the failedSyncs park or the failure notice.
+            const e = thrown instanceof Error ? thrown : new Error(String(thrown));
             // Fix: Clear and resolve pending timeouts in pendingAcks to prevent memory leaks and unhandled promise rejections
             if (transferId && this.pendingAcks.has(transferId)) {
                 const ack = this.pendingAcks.get(transferId);
@@ -2293,7 +2318,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (this.syncState.isSyncing) this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, "Transfer failed permanently.", false, "Check peer connection."));
                 
                 if (item.data && (item.data.type === 'file-update' || item.data.type === 'file-delete' || item.data.type === 'file-delta')) {
-                    const existing = this.failedSyncs.find(f => f.path === item.data.path && f.peerId === item.peerId && f.type === item.data.type);
+                    // update/delta normalize to one record: a parked delta is retried
+                    // via a full file-update, and the strict lookup used to file a
+                    // second entry for the same path+peer that then retried in parallel.
+                    const sameKind = (t: string) => t === 'file-update' || t === 'file-delta';
+                    const existing = this.failedSyncs.find(f => f.path === item.data.path && f.peerId === item.peerId
+                        && (sameKind(f.type) && sameKind(item.data.type) ? true : f.type === item.data.type));
                     if (!existing) {
                         this.failedSyncs.push({
                             path: item.data.path,
@@ -2325,7 +2355,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 isFinal = true;
             }
 
-            if (transferId && !isPaused) {
+            if (transferId && !isPaused && !parkedForRetry) {
                 this.reportTransferResult(success);
                 
                 if (success) {
@@ -2411,6 +2441,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if ((fail.retryCount || 0) >= 5) {
                     this.failedSyncs.splice(i, 1);
                     changed = true;
+                    // Silently splicing left the change abandoned with no trace after
+                    // the one park-time toast — the user never learned it stopped.
+                    this.showNotice(`Gave up syncing ${fail.path} after several attempts. Run Force full sync when the other device is available.`, 'warning', 10000);
                     continue;
                 }
 
