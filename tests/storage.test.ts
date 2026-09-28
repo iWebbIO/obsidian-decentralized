@@ -143,3 +143,19 @@ testStorageSuite('NodeFsVaultStorage', async () => {
         }
     };
 });
+
+// The adapter that will bridge the real Obsidian vault onto the storage interface. It has
+// no production caller yet, so nothing but this suite keeps it honest — an untested
+// shadow implementation is exactly where the core ConflictResolver's fake merge hid.
+testStorageSuite('ObsidianVaultStorage', async () => {
+    const { FakeApp, FakeVault } = await import('./helpers/fake-vault');
+    const { ObsidianVaultStorage } = await import('../src/core/storage/ObsidianVaultStorage');
+    const vault = new FakeVault();
+    const app = new FakeApp(vault);
+    const storage = new ObsidianVaultStorage(app as any);
+    return {
+        storage,
+        // Each test gets a fresh FakeVault from getStorage(), so there is nothing to undo.
+        cleanup: async () => { }
+    };
+});
