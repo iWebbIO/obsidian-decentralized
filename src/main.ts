@@ -3210,6 +3210,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     handleClusterForget(data: ClusterForgetPayload) {
         if (data.targetDeviceId === this.settings.deviceId) return;
+        // Only devices this vault actually knows: the ID is peer-supplied and used to
+        // grow blockedPeers, so acting on arbitrary strings let one malformed message
+        // bloat the list (and data.json with it) without doing anything useful.
+        if (typeof data.targetDeviceId !== 'string' || !this.clusterPeers.has(data.targetDeviceId)) {
+            this.log(`Ignoring cluster-forget for unknown device: ${data.targetDeviceId}`);
+            return;
+        }
         this.log(`Received instruction to forget device: ${data.targetDeviceId}`);
         void this.forgetDevice(data.targetDeviceId, { broadcast: false });
     }
@@ -3668,6 +3675,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`Rejecting chunked transfer for ${payload.path}: invalid totalBytes (${totalBytes}).`);
             return;
         }
+        // The mtime travels onward into the vault's write; non-finite values end up in
+        // the file's stat and in every later conflict comparison.
+        if (!Number.isFinite(payload.mtime)) {
+            this.log(`Rejecting chunked transfer for ${payload.path}: non-finite mtime.`);
+            return;
+        }
         if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0 || chunkSize > MAX_CHUNK_SIZE) {
             this.log(`Rejecting chunked transfer for ${payload.path}: invalid chunkSize (${chunkSize}).`);
             return;
@@ -3841,6 +3854,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // Deltas reached the vault without ever consulting the folder filters or the path
         // guard, unlike every other apply* path.
         if (!this.isPathSyncable(data.path)) return;
+        if (!Number.isFinite(data.mtime)) {
+            this.log(`Dropping delta for ${data.path}: non-finite mtime.`);
+            throw new Error("IntegrityError: non-finite mtime in file-delta");
+        }
         await this.runLocked(data.path, async () => {
             const existingFile = this.app.vault.getAbstractFileByPath(data.path);
             if (!(existingFile instanceof TFile)) {
@@ -3886,6 +3903,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      */
     async applyFileUpdate(data: FileUpdatePayload, fromPeer?: string) {
         if (!this.isPathSyncable(data.path)) return;
+
+        // Type coherence: the encoding decides how the content is written, and a
+        // mismatched pair (text encoding with binary content) used to reach
+        // vault.modify and land "[object ArrayBuffer]" in the note — silent
+        // corruption from one malformed message. Non-finite mtimes are the same
+        // class: they flow into conflict math and the vault's own stat.
+        const expectsText = data.encoding !== 'binary' && data.encoding !== 'base64';
+        if (!Number.isFinite(data.mtime)) {
+            this.log(`Dropping file-update for ${data.path}: non-finite mtime.`);
+            throw new Error('IntegrityError: non-finite mtime in file-update');
+        }
+        if (expectsText ? typeof data.content !== 'string' : !(data.content instanceof ArrayBuffer)) {
+            this.log(`Dropping file-update for ${data.path}: encoding "${data.encoding}" does not match the content type.`);
+            throw new Error('IntegrityError: encoding/content mismatch');
+        }
 
         if (data.compressed && data.content instanceof ArrayBuffer) {
             data.content = decompressText(data.content);
