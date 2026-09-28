@@ -32,8 +32,17 @@ export class ObsidianVaultStorage implements IVaultStorage {
         return await this.app.vault.adapter.readBinary(norm);
     }
 
-    public async write(path: string, content: string, mtime?: number): Promise<void> {
+    /** The vault root is not a file any operation may target. */
+    private requirePath(path: string): string {
         const norm = normalizePath(path);
+        if (!norm || norm === '/' || norm === '.') {
+            throw new Error(`Refusing to operate on the vault root: "${path}"`);
+        }
+        return norm;
+    }
+
+    public async write(path: string, content: string, mtime?: number): Promise<void> {
+        const norm = this.requirePath(path);
         const existing = this.app.vault.getAbstractFileByPath(norm);
 
         if (existing instanceof TFile) {
@@ -51,7 +60,7 @@ export class ObsidianVaultStorage implements IVaultStorage {
     }
 
     public async writeBinary(path: string, content: ArrayBuffer, mtime?: number): Promise<void> {
-        const norm = normalizePath(path);
+        const norm = this.requirePath(path);
         const existing = this.app.vault.getAbstractFileByPath(norm);
 
         if (existing instanceof TFile) {
@@ -69,7 +78,7 @@ export class ObsidianVaultStorage implements IVaultStorage {
     }
 
     public async delete(path: string): Promise<void> {
-        const norm = normalizePath(path);
+        const norm = this.requirePath(path);
         const item = this.app.vault.getAbstractFileByPath(norm);
         if (item) {
             await this.app.vault.delete(item, true);
@@ -79,8 +88,8 @@ export class ObsidianVaultStorage implements IVaultStorage {
     }
 
     public async rename(oldPath: string, newPath: string): Promise<void> {
-        const normOld = normalizePath(oldPath);
-        const normNew = normalizePath(newPath);
+        const normOld = this.requirePath(oldPath);
+        const normNew = this.requirePath(newPath);
         const item = this.app.vault.getAbstractFileByPath(normOld);
 
         if (item) {
@@ -89,17 +98,25 @@ export class ObsidianVaultStorage implements IVaultStorage {
         } else if (await this.app.vault.adapter.exists(normOld)) {
             await this.ensureParentFolder(normNew);
             await this.app.vault.adapter.rename(normOld, normNew);
+        } else {
+            // The other adapters throw for a missing source; a silent no-op here made
+            // the caller believe the rename had happened.
+            throw new Error(`File not found: ${oldPath}`);
         }
     }
 
     public async exists(path: string): Promise<boolean> {
         const norm = normalizePath(path);
+        // The vault root always exists but no file lives at it; the other adapters
+        // answer false for the root, so this one must not diverge.
+        if (!norm || norm === '/' || norm === '.') return false;
         if (this.app.vault.getAbstractFileByPath(norm)) return true;
         return await this.app.vault.adapter.exists(norm);
     }
 
     public async stat(path: string): Promise<FileStat | null> {
         const norm = normalizePath(path);
+        if (!norm || norm === '/' || norm === '.') return null;
         const item = this.app.vault.getAbstractFileByPath(norm);
         if (item instanceof TFile) {
             return {
@@ -108,7 +125,9 @@ export class ObsidianVaultStorage implements IVaultStorage {
             };
         }
         const adapterStat = await this.app.vault.adapter.stat(norm);
-        if (adapterStat) {
+        // A folder is not a file: stat answers for files, and null otherwise, on every
+        // implementation.
+        if (adapterStat && adapterStat.type === 'file') {
             return {
                 size: adapterStat.size,
                 mtime: adapterStat.mtime
@@ -164,7 +183,11 @@ export class ObsidianVaultStorage implements IVaultStorage {
             }
         });
         const refDelete = this.app.vault.on('delete', (file) => {
-            listener({ type: 'delete', path: file.path });
+            // Folders are dropped like the other adapters do: Obsidian fires one delete
+            // per contained file as well, and those carry the information.
+            if (file instanceof TFile) {
+                listener({ type: 'delete', path: file.path });
+            }
         });
         const refRename = this.app.vault.on('rename', (file, oldPath) => {
             listener({ type: 'rename', path: file.path, oldPath });

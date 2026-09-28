@@ -25,6 +25,13 @@ export class InMemoryVaultStorage implements IVaultStorage {
         return path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
     }
 
+    /** Normalized and non-empty: the root is not a file any operation may target. */
+    private requirePath(path: string): string {
+        const norm = this.normalize(path);
+        if (!norm) throw new Error(`Refusing to operate on the vault root: "${path}"`);
+        return norm;
+    }
+
     public async read(path: string): Promise<string> {
         const norm = this.normalize(path);
         const file = this.files.get(norm);
@@ -47,7 +54,7 @@ export class InMemoryVaultStorage implements IVaultStorage {
     }
 
     public async write(path: string, content: string, mtime?: number): Promise<void> {
-        const norm = this.normalize(path);
+        const norm = this.requirePath(path);
         const data = this.encoder.encode(content);
         const exists = this.files.has(norm);
         let fileMtime = mtime ?? Date.now();
@@ -66,7 +73,7 @@ export class InMemoryVaultStorage implements IVaultStorage {
     }
 
     public async writeBinary(path: string, content: ArrayBuffer, mtime?: number): Promise<void> {
-        const norm = this.normalize(path);
+        const norm = this.requirePath(path);
         const data = new Uint8Array(content.slice(0));
         const exists = this.files.has(norm);
         let fileMtime = mtime ?? Date.now();
@@ -85,7 +92,7 @@ export class InMemoryVaultStorage implements IVaultStorage {
     }
 
     public async delete(path: string): Promise<void> {
-        const norm = this.normalize(path);
+        const norm = this.requirePath(path);
         if (this.files.has(norm)) {
             this.files.delete(norm);
             this.emit({ type: 'delete', path: norm });
@@ -108,10 +115,19 @@ export class InMemoryVaultStorage implements IVaultStorage {
     }
 
     public async rename(oldPath: string, newPath: string): Promise<void> {
-        const oldNorm = this.normalize(oldPath);
-        const newNorm = this.normalize(newPath);
+        const oldNorm = this.requirePath(oldPath);
+        const newNorm = this.requirePath(newPath);
 
         if (this.files.has(oldNorm)) {
+            // A file cannot land where a folder lives — the vault would then hold both a
+            // file 'docs' and 'docs/a.md', a state no filesystem can represent and one
+            // the Merkle tree silently overwrites with the folder's hash, stranding the
+            // file from every diff. Renaming onto another file replaces it, as fs does.
+            if (oldNorm !== newNorm) {
+                for (const key of this.files.keys()) {
+                    if (key.startsWith(newNorm + '/')) throw new Error(`Destination is a folder: ${newPath}`);
+                }
+            }
             const entry = this.files.get(oldNorm)!;
             this.files.delete(oldNorm);
             this.files.set(newNorm, entry);
@@ -119,7 +135,8 @@ export class InMemoryVaultStorage implements IVaultStorage {
             return;
         }
 
-        // Folder rename
+        // Folder rename: a tree-shaped store cannot tell an existing empty folder from a
+        // missing one, so "no file at or below the source" is "source does not exist".
         const oldPrefix = oldNorm + '/';
         const newPrefix = newNorm + '/';
         const renames: Array<{ from: string; to: string; entry: StoredFile }> = [];
@@ -132,6 +149,14 @@ export class InMemoryVaultStorage implements IVaultStorage {
                     entry
                 });
             }
+        }
+        if (renames.length === 0) {
+            throw new Error(`File not found: ${oldPath}`);
+        }
+        // A folder cannot land on a file, nor on a folder that already holds files.
+        if (this.files.has(newNorm)) throw new Error(`Destination already exists: ${newPath}`);
+        for (const key of this.files.keys()) {
+            if (key.startsWith(newPrefix)) throw new Error(`Destination already exists: ${newPath}`);
         }
 
         for (const { from, to, entry } of renames) {

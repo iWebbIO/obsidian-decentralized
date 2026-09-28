@@ -2,6 +2,18 @@
  * Core vault storage interface.
  * Abstracts local file system operations away from Obsidian's Vault API,
  * allowing the sync engine to run both in Obsidian and in headless virtual device test harnesses.
+ *
+ * Contract (shared by every implementation, pinned by tests/storage.test.ts):
+ *   - Paths are non-empty vault-relative paths; the root ('' or '/') is refused.
+ *   - read/readBinary throw on a missing path (MerkleManager treats that as "vanished").
+ *   - stat returns a FILE's stat, or null — for a folder, and for a missing path.
+ *   - delete removes a file or a folder recursively and emits one 'delete' event per
+ *     file the tree actually lost; nothing at all when the path was already gone.
+ *   - rename throws when the source is missing or the destination is occupied by a
+ *     folder (a file where a folder lives is a state no filesystem can represent).
+ *   - Events carry the same normalized path listFiles reports.
+ *   - Implementations expect to be the sole writer of their tree; external changes
+ *     are not observed.
  */
 
 export interface FileStat {
@@ -60,8 +72,21 @@ export interface IVaultStorage {
     onVaultChange(listener: (event: VaultChangeEvent) => void): () => void;
 }
 
-/** Standard text extension whitelist matching the plugin logic. */
-export const TEXT_EXTENSIONS = new Set(['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml']);
+/**
+ * A vault path is a non-empty relative path: `''` names the vault root, where a write,
+ * delete or rename would act on every file at once, so implementations must refuse it.
+ */
+export function requireVaultPath(path: string): string {
+    const normalized = path.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
+    if (!normalized) throw new Error(`Refusing to operate on the vault root: "${path}"`);
+    return normalized;
+}
+
+/**
+ * Standard text extension set — the single copy; src/main.ts imports it so the
+ * simulation model and the plugin can never disagree about what is text.
+ */
+export const TEXT_EXTENSIONS = new Set(['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'yml', 'toml']);
 
 export function isBinaryPath(path: string): boolean {
     const ext = path.split('.').pop()?.toLowerCase() || '';

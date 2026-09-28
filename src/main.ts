@@ -113,12 +113,20 @@ import { collectLocalIpv4, preferLocalIpv4, normalizePeerServerHost, normalizePe
 import { peerErrorUserMessage, shouldTearDownPeer } from './utils/peer-error';
 import { QueueManager } from './core/QueueManager';
 import { ConnectionManager } from './core/ConnectionManager';
+// The one text-extension set, shared with the simulation model's storage layer so the
+// two can never disagree about what counts as text (`.yml` was missing from both).
+import { TEXT_EXTENSIONS } from './core/storage/IVaultStorage';
 
-/** Extensions treated as text (everything else is binary). */
-const TEXT_EXTENSIONS = new Set(['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml']);
+    /** Extensions still synced when 'syncAllFileTypes' is off. */
+    const TEXT_WHITELIST = new Set(['md', 'css', 'js', 'json']);
 
-/** Extensions still synced when 'syncAllFileTypes' is off. */
-const TEXT_WHITELIST = new Set(['md', 'css', 'js', 'json']);
+    /**
+     * Ceiling on the saved devices list. Gossip is the cheap vector: one message can
+     * carry 256 entries, and every entry is dialled on every reconnect interval and
+     * written to data.json — an unbounded list let a single connected peer turn both
+     * into an unending churn.
+     */
+    const MAX_KNOWN_PEERS = 256;
 
 /**
  * Single shared diff-match-patch instance. It holds no per-call state across the
@@ -331,7 +339,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private pendingLockRequests: Map<string, { resolve: (granted: boolean) => void, timeout: number }> = new Map();
     
     // Real-time Editor Sync State
-    public activeEditorLocks: Map<string, string> = new Map();
     private isApplyingRemoteEdit: boolean = false;
     private debouncedEditorChange: Debouncer<[any, TFile], Promise<void>>;
 
@@ -1652,6 +1659,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // messages were matched against stale ids and its in-flight bookkeeping never settled.
         this.syncState.activePullBatches?.clear();
         this.syncState.inFlightPulls?.clear();
+        // Both sync-start paths reset it; an aborted sync is equally done with it.
+        this.syncState.batchStartTimes?.clear();
         this.localSyncComplete.clear();
         this.peerSyncComplete.clear();
         this.pullRetries.clear();
@@ -3048,6 +3057,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (peerInfo.deviceId === this.settings.deviceId || this.connections.has(peerInfo.deviceId)) continue;
             if (this.isBlocked(peerInfo.deviceId)) continue;
             if (!this.clusterPeers.has(peerInfo.deviceId)) {
+                // The saved list is dialled on every reconnect interval and rewritten to
+                // data.json on every change; beyond the ceiling a gossip flood would turn
+                // both into unending churn rather than a growing address book.
+                if (this.clusterPeers.size >= MAX_KNOWN_PEERS) break;
                 this.clusterPeers.set(peerInfo.deviceId, peerInfo);
                 hasNew = true;
             }
@@ -3358,7 +3371,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     // --- Editor Sync Handlers ---
     handleEditorActive(data: EditorActivatePayload, conn: DataConnection) {
-        this.activeEditorLocks.set(data.path, conn.peer);
+        // The peer holds the note's edit lock (requestLock/heldLocks governs that);
+        // this is only the "someone else is typing" heads-up.
         this.showNotice(`Another device is editing ${data.path.split('/').pop() || data.path}`, 'info', 3000);
     }
 

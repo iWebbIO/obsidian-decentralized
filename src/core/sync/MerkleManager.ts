@@ -10,6 +10,13 @@ export interface MerkleDiffResult {
 }
 
 export class MerkleManager {
+    /**
+     * Ceiling on the per-path hash cache. Entries are only ever removed for paths that
+     * change again, so a daemon that deletes or renames whole folders grew it without
+     * bound; the oldest entries fall off instead.
+     */
+    private static readonly MAX_HASH_CACHE_ENTRIES = 10_000;
+
     private hashCache: Map<string, { hash: string; mtime: number; size: number }> = new Map();
     private cachedTree: MerkleNode | null = null;
     private treeBuiltAt: number = 0;
@@ -96,19 +103,23 @@ export class MerkleManager {
                 // Size+mtime surrogate for large files to avoid reading huge chunks into memory
                 const surrogate = `size-${file.size}-mtime-${file.mtime}`;
                 fileHashes.set(file.path, surrogate);
-            } else {
-                try {
-                    const content = file.isBinary
-                        ? await this.storage.readBinary(file.path)
-                        : await this.storage.read(file.path);
-                    const hash = await this.computeHash(content);
-                    this.hashCache.set(file.path, { hash, mtime: file.mtime, size: file.size });
-                    fileHashes.set(file.path, hash);
-                } catch {
-                    // File vanished or deleted concurrently mid-build; skip it
-                    continue;
+                } else {
+                    try {
+                        const content = file.isBinary
+                            ? await this.storage.readBinary(file.path)
+                            : await this.storage.read(file.path);
+                        const hash = await this.computeHash(content);
+                        this.hashCache.set(file.path, { hash, mtime: file.mtime, size: file.size });
+                        if (this.hashCache.size > MerkleManager.MAX_HASH_CACHE_ENTRIES) {
+                            const oldest = this.hashCache.keys().next().value;
+                            if (oldest !== undefined) this.hashCache.delete(oldest);
+                        }
+                        fileHashes.set(file.path, hash);
+                    } catch {
+                        // File vanished or deleted concurrently mid-build; skip it
+                        continue;
+                    }
                 }
-            }
         }
 
         // 2. Insert into tree structure

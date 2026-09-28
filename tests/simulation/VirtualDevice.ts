@@ -49,9 +49,11 @@ export class VirtualDevice {
         this.conflictResolver = new ConflictResolver();
         this.role = config.role ?? 'primary';
 
-        // Auto-invalidate Merkle cache on local storage changes
+        // Auto-invalidate Merkle cache on local storage changes. A rename moves content
+        // away from its old path, so the old path's cached hash is stale too.
         this.unsubscribeStorage = this.storage.onVaultChange((event) => {
             this.merkleManager.invalidateFile(event.path);
+            if (event.oldPath !== undefined) this.merkleManager.invalidateFile(event.oldPath);
         });
     }
 
@@ -186,6 +188,16 @@ export class VirtualDevice {
             return;
         }
 
+        // Nothing awaits this handler, so a malformed message or a storage error must
+        // not escape as an unhandled rejection — log it and keep the device alive.
+        try {
+            await this.dispatchMessage(fromPeerId, msg);
+        } catch (err) {
+            console.error(`VirtualDevice ${this.deviceId}: failed to apply ${(msg as any)?.type} for ${(msg as any)?.path}:`, err);
+        }
+    }
+
+    private async dispatchMessage(fromPeerId: string, msg: WireMessage): Promise<void> {
         switch (msg.type) {
             case 'merkle-root': {
                 const localRoot = await this.merkleManager.getMerkleTree();

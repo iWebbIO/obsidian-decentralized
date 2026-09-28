@@ -122,6 +122,76 @@ function testStorageSuite(name: string, getStorage: () => Promise<{ storage: IVa
             expect(events[2].oldPath).toBe('event.md');
             expect(events[3].type).toBe('delete');
         });
+
+        test('refuses to operate on the vault root', async () => {
+            // '' (and '/') name the vault itself: a delete there removed every file at
+            // once on the filesystem adapter, and a write is meaningless everywhere.
+            await expect(storage.write('', 'nope')).rejects.toThrow();
+            await expect(storage.delete('')).rejects.toThrow();
+            await expect(storage.rename('', 'x.md')).rejects.toThrow();
+            await expect(storage.exists('')).resolves.toBe(false);
+            await expect(storage.stat('')).resolves.toBeNull();
+        });
+
+        test('rename throws on a missing source, and never puts a file where a folder lives', async () => {
+            await storage.write('docs/a.md', 'A');
+            await storage.write('x.md', 'X');
+
+            // A silent no-op here (in-memory) left the sender believing the rename
+            // happened; the filesystem adapter throws, so the contract is: throw.
+            await expect(storage.rename('missing.md', 'y.md')).rejects.toThrow();
+
+            // A file at 'docs' next to 'docs/a.md' is a state no filesystem can
+            // represent, and one the Merkle tree quietly overwrote with the folder's
+            // hash — stranding the file from every later diff.
+            await expect(storage.rename('x.md', 'docs')).rejects.toThrow();
+            expect(await storage.read('docs/a.md')).toBe('A');
+            expect(await storage.read('x.md')).toBe('X');
+        });
+
+        test('stat answers for files only; a folder is not a file', async () => {
+            await storage.write('folder/file.md', 'content');
+
+            expect(await storage.stat('folder/file.md')).toMatchObject({ size: 'content'.length });
+            expect(await storage.stat('folder')).toBeNull();
+        });
+
+        test('deleting a missing path emits nothing and throws nothing', async () => {
+            const events: any[] = [];
+            const unsubscribe = storage.onVaultChange(e => events.push(e));
+
+            await expect(storage.delete('never-existed.md')).resolves.toBeUndefined();
+
+            unsubscribe();
+            expect(events).toEqual([]);
+        });
+
+        test('a folder delete emits one delete event per file it contained', async () => {
+            await storage.write('gone/a.md', '1');
+            await storage.write('gone/b.md', '2');
+            const events: any[] = [];
+            const unsubscribe = storage.onVaultChange(e => events.push(e));
+
+            await storage.delete('gone');
+
+            unsubscribe();
+            const deleted = events.filter(e => e.type === 'delete').map(e => e.path);
+            expect(deleted).toContain('gone/a.md');
+            expect(deleted).toContain('gone/b.md');
+            expect(await storage.exists('gone/a.md')).toBe(false);
+        });
+
+        test('events carry the same path spelling listFiles reports', async () => {
+            const events: any[] = [];
+            const unsubscribe = storage.onVaultChange(e => events.push(e));
+
+            await storage.write('a/b.md/', 'trailing slash');
+
+            unsubscribe();
+            expect(events[events.length - 1].path).toBe('a/b.md');
+            expect(await storage.exists('a/b.md')).toBe(true);
+            expect((await storage.listFiles()).map(f => f.path)).toContain('a/b.md');
+        });
     });
 }
 
