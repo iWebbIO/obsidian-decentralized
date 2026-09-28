@@ -51,10 +51,12 @@ describe('large files diffed through the size+mtime surrogate', () => {
         await heal(a, b);
 
         // Reconnect: A (the primary) sends its Merkle root, the traversal finds the
-        // changed surrogate, and the new bytes must arrive on B.
+        // changed surrogate, and the new bytes must arrive on B. The budget is generous:
+        // the surrogate path digests the 6 MB content several times, which alone runs
+        // ~20 s on a busy machine — a tighter wait made this test flip on timing.
         await waitFor(() => vaultB.text('media/big.bin') === second,
-            { what: 'the large edit to reach the other device', timeout: 20000 });
-    }, 60000);
+            { what: 'the large edit to reach the other device', timeout: 60000 });
+    }, 90000);
 
     test('identical large files are not turned into conflicts by their different mtimes', async () => {
         const content = 'z'.repeat(BIG);

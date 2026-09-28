@@ -256,6 +256,13 @@ export class ConnectionModal extends Modal {
         return new Promise(resolve => {
             const started = Date.now();
             const tick = () => {
+                // A closed modal must stop re-arming: the chain used to keep firing
+                // after onClose cleared the one pending timer (a late 'open' event
+                // started a fresh chain), rendering into detached DOM for 15 s.
+                if (this.closed) {
+                    resolve(false);
+                    return;
+                }
                 if (this.plugin.connections.has(peerId)) {
                     resolve(true);
                     return;
@@ -330,6 +337,7 @@ export class ConnectionModal extends Modal {
         }, 20000);
 
         conn.on('open', async () => {
+            if (this.closed) return;
             if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
             this.statusState = 'connecting';
             this.statusMessage = 'Confirming the pairing…';
@@ -342,6 +350,7 @@ export class ConnectionModal extends Modal {
         });
 
         conn.on('error', () => {
+            if (this.closed) return;
             if (this.connectTimeout) window.clearTimeout(this.connectTimeout);
             // A pairing that already succeeded stays succeeded: the key is stored and
             // auto-reconnect will re-establish the link, but overwriting the success

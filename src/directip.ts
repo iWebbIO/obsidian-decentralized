@@ -93,6 +93,15 @@ export class DirectIpServer {
     private wss: any | null = null;
     /** deviceId → authenticated socket */
     private clients: Map<string, ServerClientEntry> = new Map();
+    /**
+     * Sockets accepted but not yet authenticated. stop() used to close only admitted
+     * clients — a socket mid-handshake survived unload, kept its 10 s auth timer and
+     * message handler, and an in-flight completeAuth admitted it into a stopped
+     * server where nothing ever reaped it.
+     */
+    private pendingAuth: Set<any> = new Set();
+    /** Set by stop(): no admissions, no deliveries, no re-arming. */
+    private stopped = false;
     private pin: string;
     private reapInterval: number | null = null;
     private notifiedOutdatedClient = false;
@@ -188,6 +197,11 @@ export class DirectIpServer {
 
     /** A new socket: challenge it, and admit it only once it proves it holds the token. */
     private acceptSocket(socket: any, request: any) {
+        if (this.stopped) {
+            try { socket.close(); } catch (_) { /* already gone */ }
+            return;
+        }
+        this.pendingAuth.add(socket);
         let url: URL;
         try {
             url = new URL(request?.url || '/', 'http://localhost');
@@ -229,6 +243,13 @@ export class DirectIpServer {
                 authenticating = true;
                 const admit = (ready: SecureChannel) => {
                     clearTimeout(authTimer);
+                    this.pendingAuth.delete(socket);
+                    // completeAuth is async and can settle after stop(): admitting into
+                    // a stopped server resurrected a client nothing would ever reap.
+                    if (this.stopped) {
+                        try { socket.close(1000, 'Server stopped'); } catch (_) { /* gone */ }
+                        return;
+                    }
                     channel = ready;
                     const previous = this.clients.get(deviceId);
                     this.clients.set(deviceId, { socket, lastHeard: Date.now(), channel: ready });
@@ -245,6 +266,7 @@ export class DirectIpServer {
                 return;
             }
 
+            if (this.stopped) return;
             if (!isBinary) {
                 this.plugin.log(`Server: ignoring an unencrypted frame from ${deviceId}.`);
                 return;
@@ -267,6 +289,7 @@ export class DirectIpServer {
 
         socket.on('close', () => {
             clearTimeout(authTimer);
+            this.pendingAuth.delete(socket);
             // Only remove the registration if it still belongs to THIS socket. A stale socket's
             // late close event must not evict a client that has already reconnected.
             if (this.clients.get(deviceId)?.socket === socket) {
@@ -331,6 +354,7 @@ export class DirectIpServer {
     }
 
     private deliver(deviceId: string, mockConn: any, message: any) {
+        if (this.stopped || this.plugin.isUnloaded) return;
         this.plugin.handleRawIncomingData(message, mockConn).catch((e: any) => {
             this.plugin.log(`Server: Failed to handle raw incoming data from ${deviceId}:`, e);
             this.plugin.showNotice(`Error processing received sync message from ${deviceId}.`, 'error');
@@ -374,6 +398,7 @@ export class DirectIpServer {
     }
 
     stop() {
+        this.stopped = true;
         if (this.reapInterval !== null) {
             clearInterval(this.reapInterval);
             this.reapInterval = null;
@@ -382,6 +407,14 @@ export class DirectIpServer {
             try { entry.socket.close(); } catch (_) { /* ignore */ }
         }
         this.clients.clear();
+        // Sockets still mid-handshake: ws.close() does not terminate established
+        // connections and these are not in `clients`, so they used to outlive the
+        // server that accepted them — with their auth timers and message handlers
+        // feeding a plugin that may already be gone.
+        for (const socket of this.pendingAuth) {
+            try { socket.close(1000, 'Server stopped'); } catch (_) { /* ignore */ }
+        }
+        this.pendingAuth.clear();
         if (this.wss) {
             this.wss.close();
         }

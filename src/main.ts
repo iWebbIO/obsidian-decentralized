@@ -231,6 +231,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * and each of them used to be able to restart networking on a disabled instance.
      */
     private unloaded = false;
+    /** Public read for transports and callbacks that outlive the plugin instance. */
+    public get isUnloaded(): boolean { return this.unloaded; }
     /** Fires if the current Peer never reaches the signalling server. */
     private peerOpenTimeout: number | null = null;
     private clusterConnectionInterval: number | null = null;
@@ -382,7 +384,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.addSettingTab(new ObsidianDecentralizedSettingTab(this.app, this));
         this.conflictCenter = new ConflictCenter(this.app, this);
         this.conflictCenter.registerRibbon();
-        this.app.workspace.onLayoutReady(() => this.conflictCenter.scanVault());
+        this.app.workspace.onLayoutReady(() => {
+            if (this.unloaded) return;
+            this.conflictCenter.scanVault();
+        });
         this.addRibbonIcon('users', 'Connect devices', () => new ConnectionModal(this.app, this).open());
         this.addRibbonIcon('refresh-cw', 'Force full sync', () => {
             if (this.connections.size === 0) {
@@ -727,6 +732,32 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     // folding it into every save meant re-serialising megabytes of JSON roughly once a
     // second for the whole duration of a sync.
 
+    /**
+     * The freshest readable copy of a state file: the primary, or — after a crash
+     * between writing `.tmp` and the final rename, or between the two renames — the
+     * newer of the leftover `.tmp` (the save that never took its place) and the
+     * `.bak` (the state before the interrupted save).
+     */
+    private async readBestJson(path: string): Promise<{ data: any | null; recoveredFrom: string | null }> {
+        const primary = await this.readJson(path);
+        if (primary) return { data: primary, recoveredFrom: null };
+        const adapter = this.app.vault.adapter;
+        const candidates: Array<[string, number]> = [];
+        for (const suffix of ['.tmp', '.bak']) {
+            const candidate = path + suffix;
+            if (await adapter.exists(candidate)) {
+                const stat = await adapter.stat(candidate).catch(() => null);
+                candidates.push([candidate, stat?.mtime ?? 0]);
+            }
+        }
+        candidates.sort((a, b) => b[1] - a[1]);
+        for (const [candidate] of candidates) {
+            const data = await this.readJson(candidate);
+            if (data) return { data, recoveredFrom: candidate };
+        }
+        return { data: null, recoveredFrom: null };
+    }
+
     private async readJson(path: string): Promise<any | null> {
         try {
             if (await this.app.vault.adapter.exists(path)) {
@@ -747,9 +778,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const tmpPath = path + '.tmp';
         const bakPath = path + '.bak';
         const adapter = this.app.vault.adapter;
+        // When this write began. A plugin reload races the dying instance's final saves:
+        // if the file at `path` changed after this point, a newer instance has taken it
+        // over, and completing our rotation would revert its content with ours. The
+        // late rotation is re-checked just before the final rename, where the window is.
+        const startedAt = Date.now();
         try {
             await adapter.write(tmpPath, json);
             if (await adapter.exists(path)) {
+                const existing = await adapter.stat(path).catch(() => null);
+                // A newer writer owns the file: rotate nothing, write nothing.
+                if (existing && existing.mtime > startedAt) {
+                    this.log(`Not saving ${path}: a newer write has taken it over.`);
+                    try { await adapter.remove(tmpPath); } catch (_) { /* best effort */ }
+                    return;
+                }
                 if (await adapter.exists(bakPath)) {
                     try { await adapter.remove(bakPath); } catch (_) { /* best effort */ }
                 }
@@ -773,12 +816,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async loadState() {
-        let state = await this.readJson(this.statePath);
-        // No state.json at all is a first run, not a failure worth reporting.
-        if (!state && (await this.app.vault.adapter.exists(this.statePath) || await this.app.vault.adapter.exists(this.statePath + '.bak'))) {
-            console.warn('Primary state.json failed — attempting backup recovery...');
-            state = await this.readJson(this.statePath + '.bak');
-            if (state) this.showNotice('We restored sync info from a backup file.', 'warning');
+        // No state.json at all is a first run, not a failure worth reporting; a
+        // readable leftover (.tmp/.bak) means an interrupted save.
+        const { data: state, recoveredFrom } = await this.readBestJson(this.statePath);
+        if (recoveredFrom) {
+            console.warn(`Primary state.json failed — recovering from ${recoveredFrom}.`);
+            this.showNotice('We restored sync info from a backup file.', 'warning');
         }
 
         if (state) {
@@ -810,7 +853,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
 
-        const cache = await this.readJson(this.hashCachePath);
+        const { data: cache } = await this.readBestJson(this.hashCachePath);
         if (cache && cache.syncedHashes) {
             for (const [p, d] of Object.entries(cache.syncedHashes)) {
                 this.syncedHashes.set(p, d as any);
@@ -2599,6 +2642,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * gate refuses — and what an impersonator would send.
      */
     private async sendHandshake(conn: DataConnection) {
+        if (this.unloaded || !conn.open) return;
         // persistablePeerInfo strips the ephemeral pairing key: the handshake goes out
         // in PLAINTEXT to peers we hold no key for, and getMyPeerInfo embeds the ACTIVE
         // PAIRING KEY for the LAN beacon. Sending that in the clear handed the key to
@@ -2621,6 +2665,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async handleRawIncomingData(raw: any, conn: DataConnection) {
+        // The one funnel every inbound message passes through, and the only big entry
+        // point without an unload guard: PeerJS continuations and the direct-ip
+        // deliveries can settle after onunload, and a late handshake then mutated
+        // connections/clusterPeers, wrote data.json and even started a Merkle build
+        // on a dead instance.
+        if (this.unloaded) return;
         let data = raw;
         let wasEncrypted = false;
 
@@ -3495,7 +3545,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async loadQueueState() {
-        const items = await this.readJson(`${this.manifest.dir}/queue.json`);
+        const { data: items } = await this.readBestJson(`${this.manifest.dir}/queue.json`);
         if (this.queueManager && Array.isArray(items)) {
             // Defensively drop anything without a task: an older build persisted 'data'
             // items whose ArrayBuffer bodies serialised to {}.
