@@ -71,6 +71,8 @@ export interface SyncState {
     isSyncing: boolean;
     currentPhase: SyncPhase;
     peerId: string | null;
+    /** The running sync's identity (16-F10): plans whose epoch differs are stale. */
+    syncEpoch: string | null;
     pendingPulls: Set<string>;
     inFlightPulls: Set<string>;
     allowedPulls: Set<string>;
@@ -246,10 +248,15 @@ export type ControlPayload = { messageId?: string };
 export type FullSyncRequestPayload = ControlPayload & {
     type: 'request-full-sync';
     manifest: VaultManifest;
+    /** Identifies THIS sync run: echoed on the plan, so a stale plan still retrying
+     *  after an abort cannot be applied into a newer sync with the same peer. */
+    syncEpoch?: string;
 };
 
 export type SyncPlanPayload = ControlPayload & {
     type: 'sync-plan';
+    /** The epoch of the request this plan answers (see FullSyncRequestPayload). */
+    syncEpoch?: string;
     filesReceiverWillSend: string[];
     filesInitiatorMustSend: string[];
     filesReceiverMustDelete: string[];
@@ -270,6 +277,13 @@ export type BatchCompletePayload = ControlPayload & {
     batchId: string;
     receivedPaths: string[];
     failedPaths: string[];
+};
+
+export type BatchApplyFailedPayload = {
+    type: 'batch-apply-failed';
+    batchId: string;
+    /** Paths the batch's SENDER reported as delivered but whose writes failed here. */
+    paths: string[];
 };
 
 export type FullSyncCompletePayload = ControlPayload & {
@@ -487,6 +501,7 @@ export type SyncData =
     | SyncPlanPayload
     | RequestBatchPayload
     | BatchCompletePayload
+    | BatchApplyFailedPayload
     | FullSyncCompletePayload
     | RequestFilePayload
     | FileChunkStartPayload

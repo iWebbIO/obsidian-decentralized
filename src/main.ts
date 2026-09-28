@@ -51,6 +51,7 @@ import {
     SyncPlanPayload,
     RequestBatchPayload,
     BatchCompletePayload,
+    BatchApplyFailedPayload,
     RequestFilePayload,
     FileChunkStartPayload,
     FileChunkDataPayload,
@@ -152,6 +153,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         isSyncing: false,
         currentPhase: SyncPhase.IDLE,
         peerId: null,
+        syncEpoch: null,
         pendingPulls: new Set(),
         allowedPulls: new Set(),
         activeBatches: new Map(),
@@ -330,6 +332,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private merkleTreeBuiltAt: number = 0;
     /** Bumped by every vault change; a tree built across a change is not cached as current. */
     private merkleGeneration = 0;
+    /** Paths changed since the cached tree was built; applied incrementally on next read. */
+    private merkleDirtyPaths: Set<string> = new Set();
+    /** One shared build: concurrent getMerkleTree callers each ran a full build. */
+    private merkleBuildInFlight: Promise<MerkleNode> | null = null;
     
     // Pull-based Sync State
     private pullRetries: Map<string, number> = new Map();
@@ -445,10 +451,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             callback: () => this.conflictCenter.showConflictList(),
         });
 
-        // Any vault mutation — local or applied from a peer — makes the cached Merkle
-        // tree stale.
+        // Any vault mutation of a SYNCED path — local or applied from a peer — dirties
+        // the cached Merkle tree. Out-of-scope events (the config folder, excluded
+        // folders) can never be in the tree, and dirtying on them forced a full rebuild
+        // per ConfigSync write.
         const onVaultEvent = (file: TAbstractFile, kind?: 'modify' | 'delete' | 'rename' | 'create') => {
-            this.invalidateMerkleTree();
+            if (this.isPathSyncable(file.path)) this.invalidateMerkleTree(file.path);
             this.handleEvent(file, kind);
         };
         // Obsidian reports every existing file as "created" while it loads the vault. Heard
@@ -464,7 +472,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 onVaultEvent(file, 'delete');
             }));
             this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
-                this.invalidateMerkleTree();
+                if (this.isPathSyncable(file.path) || this.isPathSyncable(oldPath)) {
+                    this.invalidateMerkleTree(file.path);
+                    this.invalidateMerkleTree(oldPath);
+                }
                 this.forgetKnownFolders(oldPath);
                 this.handleRenameEvent(file, oldPath);
             }));
@@ -744,13 +755,138 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      */
     private async getMerkleTree(): Promise<MerkleNode> {
         const cached = this.twoDeviceState.merkleTreeRoot;
-        if (cached && this.merkleTreeBuiltAt > 0) return cached;
-        return this.buildMerkleTree();
+        if (cached && this.merkleTreeBuiltAt > 0) {
+            // Apply pending per-path changes before serving: a traversal touching N
+            // files used to force N FULL rebuilds (each O(N) over the whole vault),
+            // because every applied file dirtied the whole tree.
+            if (this.merkleDirtyPaths.size > 0) {
+                const dirty = this.merkleDirtyPaths;
+                this.merkleDirtyPaths = new Set();
+                try {
+                    await this.applyMerkleDirtyPaths(cached, dirty);
+                } catch (e) {
+                    // A failed incremental pass must not leave a wrong tree current.
+                    this.log('Incremental Merkle update failed; rebuilding fully.', e);
+                    this.merkleTreeBuiltAt = 0;
+                    return this.buildMerkleTree();
+                }
+            }
+            return cached;
+        }
+        // Single-flight: concurrent callers (a handshake build racing a node request)
+        // each ran a full build and the last write silently won.
+        if (!this.merkleBuildInFlight) {
+            this.merkleBuildInFlight = this.buildMerkleTree().finally(() => { this.merkleBuildInFlight = null; });
+        }
+        return this.merkleBuildInFlight;
     }
 
-    private invalidateMerkleTree() {
+    /**
+     * Invalidate the cached Merkle tree for `path` — or wholly, when no path is known.
+     *
+     * Path-scoped invalidation accumulates in a dirty set that getMerkleTree applies
+     * incrementally (recompute the leaf and its ancestors, O(depth)); past the
+     * threshold a full rebuild is cheaper, so the cache drops outright. Out-of-scope
+     * paths never dirty anything (they cannot be in the tree).
+     */
+    private invalidateMerkleTree(path?: string) {
         this.merkleGeneration++;
+        if (path !== undefined && this.merkleTreeBuiltAt > 0 && this.merkleDirtyPaths.size < 64) {
+            this.merkleDirtyPaths.add(path);
+            return;
+        }
         this.merkleTreeBuiltAt = 0;
+        this.merkleDirtyPaths = new Set();
+    }
+
+    /** Fold the dirty paths into a current tree: create/update/remove each leaf and
+     *  recompute its ancestors. Mirrors buildMerkleTree's hash choices (real digest
+     *  for small files, size+mtime surrogate for large ones). */
+    private async applyMerkleDirtyPaths(tree: MerkleNode, paths: Set<string>) {
+        for (const path of paths) {
+            const file = this.app.vault.getAbstractFileByPath(path);
+            if (file instanceof TFile && this.isPathSyncable(path)) {
+                const cached = this.cachedHashFor(file);
+                let hash: string;
+                if (cached) {
+                    hash = cached;
+                } else if (file.stat.size > 5 * 1024 * 1024) {
+                    hash = `size-${file.stat.size}-mtime-${file.stat.mtime}`;
+                } else {
+                    const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
+                    hash = await this.getHash(content);
+                    this.updateHashCache(path, hash, { mtime: file.stat.mtime, size: file.stat.size });
+                }
+                await this.updateMerkleLeaf(tree, path, hash);
+            } else {
+                await this.removeMerkleLeaf(tree, path);
+            }
+        }
+        // The tree is current again: stamp it so the next reader takes the cache path.
+        this.merkleTreeBuiltAt = Date.now();
+    }
+
+    /** Set the leaf hash for `path` (creating intermediate nodes), then recompute the
+     *  ancestor hashes bottom-up. Synchronous tree surgery; the caller awaits the
+     *  recomputation through the returned chain. */
+    private updateMerkleLeaf(tree: MerkleNode, path: string, hash: string): Promise<void> {
+        const parts = path.split('/');
+        const ancestors: MerkleNode[] = [];
+        let node = tree;
+        for (let i = 0; i < parts.length; i++) {
+            ancestors.push(node);
+            if (!node.children) node.children = {};
+            let next = node.children[parts[i]];
+            if (!next && i < parts.length - 1) {
+                next = { hash: '', children: {} };
+                node.children[parts[i]] = next;
+            } else if (!next) {
+                next = { hash: '' };
+                node.children[parts[i]] = next;
+            }
+            node = next;
+        }
+        node.hash = hash;
+        return this.recomputeAncestors(ancestors);
+    }
+
+    /** Delete the leaf for `path` and any ancestor folders it empties, then recompute. */
+    private removeMerkleLeaf(tree: MerkleNode, path: string): Promise<void> {
+        const parts = path.split('/');
+        const ancestors: MerkleNode[] = [];
+        let node = tree;
+        for (const part of parts) {
+            ancestors.push(node);
+            const next = node.children?.[part];
+            if (!next) return Promise.resolve();   // not in the tree — nothing to do
+            node = next;
+        }
+        // Walk up, deleting the node and any parent it leaves empty.
+        for (let i = parts.length - 1; i >= 0; i--) {
+            const parent = ancestors[i];
+            if (!parent.children) break;
+            delete parent.children[parts[i]];
+            if (Object.keys(parent.children).length > 0) break;   // parent still has content
+        }
+        return this.recomputeAncestors(ancestors);
+    }
+
+    /** Recompute the combined hash of each ancestor, deepest first. */
+    private async recomputeAncestors(ancestors: MerkleNode[]) {
+        for (let i = ancestors.length - 1; i >= 0; i--) {
+            const n = ancestors[i];
+            if (!n.children || Object.keys(n.children).length === 0) {
+                // A node whose last child left takes buildMerkleTree's empty form —
+                // keeping the old hash made a emptied tree compare EQUAL to a peer
+                // still holding that file, and reconciliation declared "in sync".
+                n.hash = '';
+                continue;
+            }
+            const childKeys = Object.keys(n.children).sort();
+            let combined = '';
+            for (const k of childKeys) combined += n.children[k].hash;
+            n.hash = await this.getHash(combined);
+        }
     }
 
     // --- State Management ---
@@ -1816,6 +1952,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const syncPeer = this.syncState.peerId;
         this.transitionToPhase(SyncPhase.ABORTING);
         this.syncState.isSyncing = false;
+        this.syncState.syncEpoch = null;
         this.currentSyncIsTwoDeviceMode = null;
         // Only this sync's items: the queue is shared by all traffic, and clearing it
         // wholesale also discarded other peers' pending edits — then persisted the loss.
@@ -1877,6 +2014,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         
         this.syncState.currentPhase = SyncPhase.IDLE;
         this.updateStatus();
+        this.rearmReconciliation();
     }
 
     public getConcurrencyLimit() { 
@@ -2320,6 +2458,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (e.message === 'Paused') {
                 this.log(`Transfer ${transferId} paused due to connection loss.`);
                 isPaused = true;
+                return;
+            }
+            if (e.message === 'Out of sync scope on the peer') {
+                // The peer's filters exclude this path: delivered-by-verdict. Retrying
+                // (3 queue rounds, then failedSyncs, then retryFailedSyncs forever)
+                // re-sent a file the peer had already refused, every cycle.
+                this.log(`The peer does not sync ${item.data?.path ?? 'this path'} — dropping it as refused.`);
+                success = true;
                 return;
             }
             if (e instanceof Error && e.message.includes('IntegrityError')) {
@@ -3076,14 +3222,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 case 'nack':
                     if (this.pendingAcks.has(data.transferId)) {
                         this.log(`Nack received for ${data.transferId} (Reason: ${data.reason}).`);
-                        this.pendingAcks.get(data.transferId)!.reject(new Error(`IntegrityError: ${data.reason}`));
+                        // A scope refusal is a verdict, not a fault: the peer does not
+                        // sync this path, and no amount of retrying changes that.
+                        const message = data.reason === 'out-of-scope'
+                            ? 'Out of sync scope on the peer'
+                            : `IntegrityError: ${data.reason}`;
+                        this.pendingAcks.get(data.transferId)!.reject(new Error(message));
                         this.pendingAcks.delete(data.transferId);
                         this.resetIdleTimeout();
                     }
                     break;
                 case 'file-update': 
-                    this.applyFileUpdate(data, conn?.peer).then(() => {
-                        if (conn && data.transferId && !data.skipAck) this.sendDirect(conn, { type: 'ack', transferId: data.transferId });
+                    this.applyFileUpdate(data, conn?.peer).then(applied => {
+                        // A scope refusal used to be acknowledged as delivered: the
+                        // sender marked it sent, and every later reconciliation pushed
+                        // the file again — each push also acked, forever.
+                        if (conn && data.transferId && !data.skipAck) {
+                            if (applied === 'out-of-scope') {
+                                this.sendDirect(conn, { type: 'nack', transferId: data.transferId, reason: 'out-of-scope' });
+                            } else {
+                                this.sendDirect(conn, { type: 'ack', transferId: data.transferId });
+                            }
+                        }
                         this.resetIdleTimeout();
                     }).catch(e => {
                         this.log(`Failed to apply file update: ${data.path}`, e);
@@ -3103,6 +3263,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         // via recordBatchTaskCompletion once all its tasks finish.
                         if (results.failed.length > 0) {
                             this.log(`Batch ${data.batchId}: failed to apply ${results.failed.length} file(s):`, results.failed);
+                            // The sender's queue-success said these were delivered; only
+                            // this device knows its own writes failed. Tell it, so the
+                            // paths are re-sent individually instead of silently missing.
+                            if (conn && results.failed.length <= 500) {
+                                this.sendDirect(conn, { type: 'batch-apply-failed', batchId: data.batchId, paths: results.failed });
+                            }
                         }
                     }).catch(e => {
                         this.log(`Critical failure unpacking file batch`, e);
@@ -3147,6 +3313,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 case 'sync-plan': await this.handleSyncPlan(data, conn!); break;
                 case 'request-batch': await this.handleRequestBatch(data, conn!); break;
                 case 'batch-complete': this.handleBatchComplete(data, conn!); break;
+                case 'batch-apply-failed': this.handleBatchApplyFailed(data, conn!); break;
                 
                 case 'full-sync-complete':
                     if (!this.syncState.isSyncing || this.syncState.peerId !== conn?.peer) break;
@@ -4242,8 +4409,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * @param fromPeer the device that sent the update, when known. Needed to answer a stale
      *   copy of a file we deleted, and to break ties between concurrent edits.
      */
-    async applyFileUpdate(data: FileUpdatePayload, fromPeer?: string) {
-        if (!this.isPathSyncable(data.path)) return;
+    /** 'out-of-scope' means: refused because this device does not sync that path —
+     *  the caller should tell the sender instead of acknowledging delivery. */
+    async applyFileUpdate(data: FileUpdatePayload, fromPeer?: string): Promise<'out-of-scope' | void> {
+        if (!this.isPathSyncable(data.path)) return 'out-of-scope';
 
         // Type coherence: the encoding decides how the content is written, and a
         // mismatched pair (text encoding with binary content) used to reach
@@ -4595,7 +4764,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 //
                 // Note: applyFileUpdate takes its own runLocked on the same path, so this must
                 // NOT be wrapped in one — runLocked chains per path and would deadlock.
-                await this.applyFileUpdate({
+                const applied = await this.applyFileUpdate({
                     type: 'file-update',
                     path: fileData.path,
                     content: contentBuf ?? contentStr,
@@ -4609,6 +4778,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
                 // Progress is counted once, in handleBatchComplete, which is authoritative for
                 // the batch. Counting here too made the UI report up to twice filesTotal.
+                if (applied === 'out-of-scope') throw `${fileData.path} (out of this device's sync scope)`;
                 return fileData.path;
             } catch (e) {
                 this.log(`Failed to write batched file ${fileData.path}`, e);
@@ -4929,6 +5099,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.showNotice(`Starting full sync with ${this.clusterPeers.get(peerId)?.friendlyName}...`, 'info');
             this.syncState.isSyncing = true;
             this.syncState.peerId = peerId;
+            this.syncState.syncEpoch = this.generateTransferId('epoch');
             this.syncState.filesTotal = 0;
             this.syncState.filesTransferred = 0;
             this.syncState.bytesTotal = 0;
@@ -4958,7 +5129,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 localManifest.filter(e => e.type === 'file').map(e => [e.path, (e as FileManifestEntry).mtime])
             );
             this.log(`Sending sync request with ${localManifest.length} items.`);
-            await this.sendSyncMessage(peerId, { type: 'request-full-sync', manifest: localManifest });
+            await this.sendSyncMessage(peerId, { type: 'request-full-sync', manifest: localManifest, syncEpoch: this.syncState.syncEpoch });
         } catch (e) {
             this.abortSync(e instanceof SyncError ? e : new SyncError(SyncErrorCategory.PROTOCOL_ERROR, String(e), false, "Check network connection."));
         }
@@ -5084,6 +5255,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.sendFileUpdate(file, conn.peer, true);
                 if (remoteHash) {
                     this.sendData(conn.peer, { type: 'request-file', path: fullPath });
+                } else if (Date.now() - file.stat.mtime > (this.settings.tombstoneRetentionDays || 30) * 24 * 60 * 60 * 1000) {
+                    // The peer lacks a file this device has had, unchanged, for longer
+                    // than either side remembers deletions: if the peer deleted it and
+                    // pruned the tombstone, this push resurrects it there with no
+                    // explanation. The full-sync plan warns for the mirror case; say so
+                    // here too (identical notices dedupe for 15 s).
+                    this.showNotice(`"${fullPath}" is missing on the other device and older than this vault remembers deletions — it may be a deletion coming back. Raise tombstone retention if this matters.`, 'warning', 15000);
                 }
             }
         }
@@ -5102,6 +5280,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); 
             this.syncState.isSyncing = true; 
             this.syncState.peerId = conn.peer;
+            this.syncState.syncEpoch = data.syncEpoch ?? this.generateTransferId('epoch');
             this.syncState.filesTotal = 0;
             this.syncState.filesTransferred = 0;
             this.syncState.bytesTotal = 0;
@@ -5239,7 +5418,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log("Vaults are completely identical. No sync needed.");
             }
             
-            await this.sendSyncMessage(conn.peer, { type: 'sync-plan', filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes, deletions });
+            await this.sendSyncMessage(conn.peer, { type: 'sync-plan', syncEpoch: this.syncState.syncEpoch, filesReceiverWillSend, filesInitiatorMustSend, filesReceiverMustDelete, filesInitiatorMustDelete, fileSizes, deletions });
             
             for (const path of filesReceiverMustDelete) {
                 const entry = localIndex.get(path);
@@ -5322,6 +5501,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
         if (this.syncState.currentPhase !== SyncPhase.PLANNING && this.syncState.currentPhase !== SyncPhase.REQUESTING) {
             this.log(`Received sync plan but current phase is ${this.syncState.currentPhase}. Ignoring.`);
+            return;
+        }
+        // A plan from an ABORTED sync can still be retrying on the wire; applied into a
+        // newer sync it computed pulls against the old manifest and churned unauthorized
+        // batches. The epoch identifies the run a plan belongs to.
+        if ((data.syncEpoch ?? null) !== (this.syncState.syncEpoch ?? null)) {
+            this.log(`Dropping a sync plan from ${conn.peer}: it answers an earlier sync run.`);
             return;
         }
         this.transitionToPhase(SyncPhase.PLANNING);
@@ -5483,6 +5669,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
     
+    /** The puller's disk said no where our queue said yes: re-send those paths
+     *  individually, where each carries its own ack, retry and failure parking. */
+    handleBatchApplyFailed(data: BatchApplyFailedPayload, conn: DataConnection) {
+        if (!Array.isArray(data.paths)) return;
+        const paths = data.paths.filter(p => typeof p === 'string').slice(0, 500);
+        if (paths.length === 0) return;
+        this.log(`Re-sending ${paths.length} path(s) the peer could not write from batch ${data.batchId}.`);
+        for (const path of paths) {
+            const file = this.app.vault.getAbstractFileByPath(path);
+            if (file instanceof TFile) this.sendFileUpdate(file, conn.peer, true);
+        }
+    }
+
     handleBatchComplete(data: BatchCompletePayload, conn: DataConnection) {
         if (!this.syncState.isSyncing || this.syncState.peerId !== conn.peer) return;
         if (this.syncState.currentPhase !== SyncPhase.TRANSFERRING) return;
@@ -5646,6 +5845,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * file the peer gave up on after three failures stayed allowed forever, so neither side
      * ever finished and one bad file ended every full sync in a timeout error.
      */
+    /**
+     * A handshake that lands while a sync is running never starts its Merkle exchange
+     * (both ends gate on isSyncing), and nothing re-ran it — two devices that connected
+     * during a sync kept their apart-time changes until the next reconnect. After any
+     * sync ends, the primary of each open link re-offers the exchange; comparing equal
+     * roots is one cheap message, so re-offering is idempotent.
+     */
+    private rearmReconciliation() {
+        if (this.unloaded || !this.settings.enableTwoDeviceOptimizations) return;
+        if (this.syncState.isSyncing) return;
+        for (const peerId of Array.from(this.connections.keys())) {
+            const conn = this.connections.get(peerId);
+            if (!conn || conn.open === false) continue;
+            if (this.getMyRole(peerId) !== 'primary') continue;
+            this.getMerkleTree()
+                .then(tree => this.sendData(peerId, { type: 'merkle-root', rootHash: tree.hash }))
+                .catch(e => this.log('Failed to re-arm reconciliation', e));
+        }
+    }
+
     checkFullSyncCompletion(peerId: string) {
         if (!this.syncState.isSyncing) return;
         const pending = this.syncState.pendingPulls;
@@ -5679,6 +5898,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.syncKeepAliveInterval) { clearInterval(this.syncKeepAliveInterval); this.syncKeepAliveInterval = null; }
         if (this.syncState.phaseTimeoutHandle) { clearTimeout(this.syncState.phaseTimeoutHandle); this.syncState.phaseTimeoutHandle = null; }
         this.syncState.isSyncing = false; 
+        this.syncState.syncEpoch = null;
         this.syncState.currentPhase = SyncPhase.IDLE;
         this.currentSyncIsTwoDeviceMode = null;
         this.syncState.pendingPulls.clear();
@@ -5697,6 +5917,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.processQueue();
         this.updateStatus(); 
         this.showNotice(`Sync complete. Transferred ${this.syncState.filesTransferred} files.`, 'important'); 
+        this.rearmReconciliation();
     }
 
     handleRequestFile(data: RequestFilePayload, conn: DataConnection) {
