@@ -25,6 +25,13 @@ export type WireMessage =
 /**
  * Headless virtual device that encapsulates vault storage, sync algorithms,
  * version vectors, and networking transport.
+ *
+ * PARITY NOTE: this model exercises src/core/sync (MerkleManager, ConflictResolver,
+ * VersionVectorManager) and src/core/storage — none of which the production plugin
+ * imports (main.ts carries its own tree builder, its vectors come from
+ * utils/versions.ts, and its conflict rule is pickVersion-based). These suites pin
+ * the core library's correctness; regressions in main.ts's own paths are covered by
+ * the real-plugin harness suites (conflicts/scope/protocol/event-windows/...).
  */
 export class VirtualDevice {
     public readonly deviceId: string;
@@ -45,7 +52,11 @@ export class VirtualDevice {
         this.deviceId = config.deviceId;
         this.storage = config.storage ?? new InMemoryVaultStorage();
         this.merkleManager = new MerkleManager(this.storage);
-        this.conflictStrategy = config.conflictStrategy ?? 'three-way-merge';
+        // Defaults to the PRODUCTION outcome (newest content wins, the loser is
+        // preserved) so a green simulation certifies behavior the plugin actually
+        // has; 'three-way-merge' and the other strategies remain available for
+        // library-level scenarios, but they are not what the plugin does.
+        this.conflictStrategy = config.conflictStrategy ?? 'create-conflict-file';
         this.conflictResolver = new ConflictResolver();
         this.role = config.role ?? 'primary';
 

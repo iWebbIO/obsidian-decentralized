@@ -51,7 +51,7 @@ describe('PeerJS lifecycle', () => {
 
         a.plugin.unload();
         // The retry backoff after a torn-down peer is 2 s; wait past it.
-        await sleep(2300);
+        await sleep(4500);   // 2x the retry backoff: the check is an absence, so a machine where the 2 s timer fires late must not make it pass
 
         expect(network().created.length).toBe(created);
         expect((a.plugin as any).peerInitRetryTimeout).toBeNull();

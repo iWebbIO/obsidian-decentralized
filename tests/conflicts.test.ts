@@ -552,6 +552,10 @@ describe('hash cache', () => {
         expect(vault.text('note.md')).toBe('newer here');
         const manifest = await plugin.buildVaultManifest();
         const entry = manifest.find((e: any) => e.path === 'note.md');
+        // The rejected peer's hash must never be advertised for our content: that made
+        // manifests and Merkle trees claim two different files were identical.
+        const peerHash = await plugin.getHash('older on the peer');
+        expect(entry.hash).not.toBe(peerHash);
         expect(entry.hash === undefined || entry.hash === await plugin.getHash('newer here')).toBe(true);
     });
 

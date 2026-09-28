@@ -14,11 +14,12 @@ jest.mock('dgram', () => {
             if (cb) cb();
         }
         send(msg: Buffer, offset: number, length: number, port: number, address: string, cb: (err?: Error|null) => void) {
-            // Simulate multicast send by emitting 'message' on all MockSockets
+            // Real multicast loops back to the sender (IP_MULTICAST_LOOP default on):
+            // include this socket too, so the discovery layer's my-deviceId filter is
+            // actually load-bearing — suppressing self-delivery here let deleting that
+            // filter pass this whole suite.
             MockSocket.sockets.forEach(s => {
-                if (s !== this) {
-                    setTimeout(() => s.emit('message', msg, { address: '127.0.0.1' }), 10);
-                }
+                setTimeout(() => s.emit('message', msg, { address: '127.0.0.1' }), 10);
             });
             if (cb) cb(null);
         }

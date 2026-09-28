@@ -31,6 +31,9 @@ describe('Stress Test: Concurrent Conflict Resolution', () => {
     });
 
     test('cleanly performs 3-way text merge on concurrent non-overlapping edits', async () => {
+        // NOTE: this pins the core ConflictResolver's 3-way merge — a library
+        // capability the production plugin does NOT use (it keeps the newest version
+        // and preserves the loser as a copy). Kept to protect the library path.
         const base = "Title\nSection A\nSection B\nFooter";
         await devA.writeFile('document.md', base);
         await devA.syncWith('node-B');
@@ -85,17 +88,22 @@ describe('Stress Test: Concurrent Conflict Resolution', () => {
         await devB.syncWith('node-A');
         await new Promise(r => setTimeout(r, 80));
 
-        // Verify conflict file was generated
-        const filesA = await devA.storage.listFiles();
-        const filesB = await devB.storage.listFiles();
-
-        const conflictFileA = filesA.find(f => f.path.includes('.conflict-'));
-        const conflictFileB = filesB.find(f => f.path.includes('.conflict-'));
-
-        // At least one device generated a conflict file to prevent overwriting
-        expect(conflictFileA || conflictFileB).toBeDefined();
-
-        // Original image.png still exists on both
+        // Both edits must survive — somewhere between the primary path and the
+        // conflict copy, on every device. (The old assertions only checked that a
+        // file named like a copy existed: a resolver that silently adopted one side
+        // and wrote empty conflict files passed.)
+        const bytesOf = (buf: ArrayBuffer) => Array.from(new Uint8Array(buf)).join(',');
+        const surviving = new Set<string>();
+        for (const dev of [devA, devB]) {
+            const files = await dev.storage.listFiles();
+            for (const f of files) {
+                if (f.path === 'image.png' || f.path.includes('.conflict-')) {
+                    surviving.add(bytesOf(await dev.storage.readBinary(f.path)));
+                }
+            }
+        }
+        expect(surviving.has('1,1,1,1')).toBe(true);
+        expect(surviving.has('2,2,2,2')).toBe(true);
         expect(await devA.storage.exists('image.png')).toBe(true);
         expect(await devB.storage.exists('image.png')).toBe(true);
     });

@@ -75,10 +75,10 @@ describe('DirectIpServer', () => {
         (server as any).clients.set('device-1', {
             socket: mockSocket,
             peerId: 'device-1',
-            lastHeard: Date.now() - 5000 // 5 seconds ago (active)
+            lastHeard: Date.now()   // fresh at the tick: 20 s of silence at the 20 s tick is NOT greater than the window // 5 seconds ago (active)
         });
 
-        jest.advanceTimersByTime(10000); 
+        jest.advanceTimersByTime(21000);   // past one full 20 s reaper tick — the old 10 s advance fired it zero times, so the assertions could not fail 
 
         expect(closeSpy).not.toHaveBeenCalled();
         expect((server as any).clients.size).toBe(1);

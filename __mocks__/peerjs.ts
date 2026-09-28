@@ -97,7 +97,12 @@ export class FakeDataConnection extends EventEmitter {
         const partner = this.partner;
         const copy = wireClone(data);
         setTimeout(() => {
-            if (partner && partner.open) partner.emit('data', copy);
+            if (!partner || !partner.open) return;
+            // A partitioned pair must not exchange data even on an established link:
+            // without this, a test that partitions without closing both ends silently
+            // kept syncing — the opposite of what partition() promises.
+            if (__network.isPartitioned(this.peer, partner.peer)) return;
+            partner.emit('data', copy);
         }, __network.latencyMs);
     }
 

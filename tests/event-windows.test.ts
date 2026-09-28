@@ -52,6 +52,11 @@ describe('a user change landing inside a plugin window', () => {
         await sleep(400);
 
         expect(b.vault.text('note.md')).toBe('newer from the peer');
+        // The flush genuinely ran AND took the echo branch: the remote-write record
+        // was consumed by the content comparison, not left to expire. (A re-send here
+        // is not observable through the queue — the reconciliation's own legitimate
+        // push of the newer content rides the same send path.)
+        expect((b.plugin as any).remoteEchoHashes.has('note.md')).toBe(false);
         const copies = conflictCopies(b);
         expect(copies).toHaveLength(1);
         expect(b.vault.text(copies[0])).toBe('the user words');

@@ -154,10 +154,13 @@ export class ConflictResolver {
                 }
                 // No common ancestor (or the edits overlap, or the content is binary):
                 // a merge is not possible, so keep both versions like any other conflict.
+                // The copy holds the LOSING side: filling it with the remote content
+                // when the remote also won the primary path dropped the local edit
+                // entirely — the exact loss the copy exists to prevent.
                 return {
                     action: 'create-conflict-file',
                     conflictFilePath: this.getConflictPath(filePath, remoteDeviceId, remoteMtime),
-                    conflictFileContent: remoteContent,
+                    conflictFileContent: remoteIsNewer ? localContent : remoteContent,
                     contentToSave: remoteIsNewer ? remoteContent : undefined
                 };
 
@@ -166,7 +169,7 @@ export class ConflictResolver {
                 return {
                     action: 'create-conflict-file',
                     conflictFilePath: this.getConflictPath(filePath, remoteDeviceId, remoteMtime),
-                    conflictFileContent: remoteContent,
+                    conflictFileContent: remoteIsNewer ? localContent : remoteContent,
                     contentToSave: remoteIsNewer ? remoteContent : undefined
                 };
         }

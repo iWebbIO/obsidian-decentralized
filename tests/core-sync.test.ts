@@ -212,7 +212,11 @@ describe('Core Sync Modules', () => {
             });
             expect(outcome.action).toBe('create-conflict-file');
             expect(outcome.conflictFilePath).toMatch(/^folder\/my-note\.conflict-peerB-2000\.md$/);
-            expect(outcome.conflictFileContent).toBe('Remote');
+            // The remote version wins the primary path, so the copy preserves the
+            // LOSING local edit — filling the copy with the remote content too
+            // dropped the local edit entirely, the exact loss a copy exists to prevent.
+            expect(outcome.conflictFileContent).toBe('Local');
+            expect(outcome.contentToSave).toBe('Remote');
         });
 
         test('three-way merge merges non-conflicting edits', () => {
