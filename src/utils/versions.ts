@@ -49,6 +49,10 @@ export function sanitizeVersionVector(raw: unknown): VersionVector | undefined {
         if (++count > 1000) break;
         if (!device || device.length > 128) continue;
         if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) continue;
+        // '__proto__' goes through the prototype setter rather than an own property —
+        // harmless today only because the value is a number, which the setter ignores.
+        // Dropped outright: a device key is data, never a prototype hop.
+        if (device === '__proto__') continue;
         clean[device] = value;
     }
     return Object.keys(clean).length ? clean : undefined;

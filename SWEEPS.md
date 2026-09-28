@@ -41,7 +41,7 @@ containing its fix or a recorded justification with specific evidence.
 | 30 | utils framing (pack/unpack/TLV/base64/deflate) | truncation, overflow guards | | |
 | 31 | utils versions.ts | property tests: symmetry, determinism | | |
 | 32 | utils pairing/device-name/peer-error/net | edge inputs | | |
-| 33 | utils direct-ip-auth.ts | crypto correctness, constant-time | | |
+| 33 | utils direct-ip-auth.ts | crypto correctness, constant-time | CLEAN — full manual review + existing suite pins the properties: proofs are domain-separated (client/host labels differ, pinned by test), bound to token + BOTH nonces + deviceId (pinned), session keys derived per direction via HKDF with distinct info strings (wrong-direction decrypt rejects, pinned), frames are AES-GCM (tamper rejects, pinned), proofsMatch is constant-time (all chars compared, length mismatch false — pinned), base64 nonce length-checked (pinned), concat is length-prefixed so no two part-lists collide. No defect found. | — |
 | 34 | manifest/state persistence (state.json, queue.json, hash-cache) | atomicity, recovery, migration | | |
 | 35 | tombstone retention & pruning | expiry, resurrection windows | | |
 | 36 | failed-sync retry machinery | backoff, retry caps, duplication | | |
@@ -52,9 +52,9 @@ containing its fix or a recorded justification with specific evidence.
 | 41 | README accuracy | claims vs behavior | | |
 | 42 | constants & timeouts vs real networks | BATCH_TIMEOUT etc. vs slow links | | |
 | 43 | rollup/build/CI config | build integrity, CI gates | | |
-| 44 | property: pickVersion/newerVersion | symmetry across orderings | | |
-| 45 | property: sanitizeVaultPath fuzz | traversal/encoding attacks | | |
-| 46 | property: TLV/framing round-trip | fuzz round-trips | | |
+| 44 | property: pickVersion/newerVersion | symmetry across orderings | FIX+PIN — fuzz found sanitizeVersionVector accepting a peer-supplied '__proto__' device key, which goes through the prototype setter rather than an own property (harmless only because validated values are numbers); dropped outright with a pollution-canary test. Pinned at scale (seeded, 2000 cases): pickVersion is anti-symmetric unless the two versions are indistinguishable in every field (both orderings then return 'a' — picking either is picking the same thing), deterministic, and mergeVectors is commutative/idempotent and dominates both inputs (no input keeps an edit the merge lacks). | (this commit) |
+| 45 | property: sanitizeVaultPath fuzz | traversal/encoding attacks | PIN (3000 seeded cases, adversarial char pool incl. unicode/NUL/backslash/drive dots) — every accepted path is vault-relative (no absolute/drive/UNC prefix), separator-consistent (no backslash, no NUL), traversal-free (no '..'/''/'.' segments), free of Windows-ambiguous trailing dots/spaces, ≤1024, and idempotent (sanitize(sanitize(x)) === sanitize(x)). Everything else is refused with null. No defect found beyond what regressions.test.ts already pins by example. | (this commit) |
+| 46 | property: TLV/framing round-trip | fuzz round-trips | PIN — packFrame/unpackFrame round-trip arbitrary headers (unicode, nested) and bodies incl. empty/zero-byte (via the __emptyBody marker); packFilesToTLV/unpackTLVToFiles round-trip arbitrary batches (unicode paths, negative/fractional/huge mtimes, all encodings, empty contents). Truncation contracts pinned precisely: a cut in a frame's HEADER region is always a SyncError; a cut in the BODY returns exactly the remaining bytes (the format carries no body length — integrity is the encrypted/chunk layer's job, so the test pins that boundary honestly); a cut TLV batch throws OR yields an exact intact PREFIX of the original files, never a half-invented entry. Forged header lengths refused. | (this commit) |
 | 47 | chaos: 3+ device mesh convergence | partition/heal matrix | | |
 | 48 | e2e: three-device conflict convergence | same winner everywhere | | |
 | 49 | e2e: rename/delete across three devices | tombstone propagation | | |
