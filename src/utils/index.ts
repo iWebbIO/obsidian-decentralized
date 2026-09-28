@@ -162,8 +162,9 @@ export function hasHiddenSegment(path: string): boolean {
     return path.split('/').some(segment => segment.startsWith('.'));
 }
 
-/** Inverse of getConflictPath: `Note (conflict on 2024-01-02).md` → `Note.md`. */
-const CONFLICT_COPY_RE = /^(.*) \(conflict on \d{4}-\d{2}-\d{2}(?: \d+)?\)(\.[^./]+)?$/;
+/** Inverse of getConflictPath: `Note (conflict on 2024-01-02 by device-1).md` → `Note.md`.
+ *  The `by <device>` group is optional: copies made before it was added keep parsing. */
+const CONFLICT_COPY_RE = /^(.*) \(conflict on \d{4}-\d{2}-\d{2}(?: by [a-zA-Z0-9-]+)?(?: \d+)?\)(\.[^./]+)?$/;
 
 export function originalPathFromConflictCopy(path: string): string | null {
     const normalized = path.replace(/\\/g, '/');
@@ -398,7 +399,12 @@ export function taskQueueId(peerId: string | null, task: SyncTask): string {
         // A pull retried in a later batch must not be swallowed by the earlier batch's task,
         // and a conflict reply carries its own vector, so neither may merge with a plain send.
         if (task.batchId) target += `\0batch:${task.batchId}`;
-        if (task.versionVector) target += '\0reply';
+        if (task.versionVector) {
+            // Two replies with DIFFERENT vectors must not merge: the surviving task
+            // would send fresh content labelled with the older vector — a causal
+            // lie the receiver then believed.
+            target += `\0reply:` + Object.entries(task.versionVector).map(([d, n]) => `${d}=${n}`).join(',');
+        }
     }
     return `${peerId || '*'}\0${task.taskType}\0${target}`;
 }

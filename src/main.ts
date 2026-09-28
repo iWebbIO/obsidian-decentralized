@@ -4555,7 +4555,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     await this.app.vault.createFolder(currentPath);
                 } catch (e) { /* Ignore if created concurrently */ }
             }
-            this.knownFolders.add(currentPath);
+            // Only memoize VERIFIED folders: a segment occupied by a file (or whose
+            // create just failed) used to be cached as "known", and every later write
+            // into that subtree then skipped the create and failed forever.
+            if (this.app.vault.getAbstractFileByPath(currentPath) instanceof TFolder) {
+                this.knownFolders.add(currentPath);
+            }
         }
     }
 
@@ -4805,16 +4810,33 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // getConflictPath is string surgery on a peer-supplied path, so validate before it
         // is used to create anything.
         if (!this.isPathSyncable(originalPath)) return null;
-        const conflictPath = this.getConflictPath(originalPath);
+        let conflictPath = this.getConflictPath(originalPath);
         if (!sanitizeVaultPath(conflictPath)) return null;
         // Not silenced: the copy syncs like any note, so the losing edit is kept on every
         // device and the conflict can be resolved from any of them.
         const folderPath = conflictPath.substring(0, conflictPath.lastIndexOf('/'));
         if (folderPath) await this.ensureFolderExists(folderPath);
-        if (typeof content === 'string') {
-            await this.app.vault.create(conflictPath, content);
-        } else {
-            await this.app.vault.createBinary(conflictPath, toExactArrayBuffer(content));
+        // A peer's same-named copy (or any concurrent create) can land between the
+        // path probe and this create: unhandled, the throw aborted the whole apply —
+        // the winner's content was not written either. Retry once on the next name.
+        try {
+            if (typeof content === 'string') {
+                await this.app.vault.create(conflictPath, content);
+            } else {
+                await this.app.vault.createBinary(conflictPath, toExactArrayBuffer(content));
+            }
+        } catch (e) {
+            if (e instanceof Error && /exists/i.test(e.message)) {
+                const retryPath = this.getConflictPath(originalPath);
+                if (retryPath !== conflictPath) {
+                    if (typeof content === 'string') {
+                        await this.app.vault.create(retryPath, content);
+                    } else {
+                        await this.app.vault.createBinary(retryPath, toExactArrayBuffer(content));
+                    }
+                    conflictPath = retryPath;
+                } else throw e;
+            } else throw e;
         }
         this.conflictCenter.addConflict(originalPath, conflictPath);
         return conflictPath;
@@ -4894,20 +4916,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const from = this.clusterPeers.get(fromPeer ?? '')?.friendlyName || 'another device';
                 this.showNotice(`${existingFile.name} was deleted on ${from} after it was changed here. This device's version is in the trash.`, 'important', 12000);
             }
+            // Commit the deletion only once the trash succeeded: adopting the merged
+            // vector (which includes the deletion's own count) while the file stayed
+            // alive made the survivor's copy dominate the deletion — a third device
+            // pulled it from us and it was resurrected on the device that deleted it.
+            try {
+                this.log(`Deleting file: ${data.path}`);
+                await this.trashForPeer(existingFile);
+            } catch (e) {
+                console.error(`Error deleting file: ${data.path}`, e);
+                this.showNotice(`Could not delete ${data.path} on this device.`, 'error');
+                // Not deleted here: keep the pre-delete vector and no tombstone, so
+                // the deletion stays concurrent and the usual rules re-arbitrate.
+                return;
+            }
             this.adoptVector(data.path, merged);
-
             this.tombstones[data.path] = data.deletedAt ?? Date.now();
             this.scheduleStateSave();
             this.syncedHashes.delete(data.path);
-            if (existingFile) {
-                try {
-                    this.log(`Deleting file: ${data.path}`);
-                    await this.trashForPeer(existingFile);
-                } catch (e) {
-                    console.error(`Error deleting file: ${data.path}`, e);
-                    this.showNotice(`Could not delete ${data.path} on this device.`, 'error');
-                }
-            }
         });
     }
 
@@ -4919,6 +4945,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`Ignoring rename ${data.oldPath} -> ${data.newPath}: outside this device's sync scope.`);
             return;
         }
+        // A rename onto its own path is a no-op; applying it used to wipe the file's
+        // own version vector (deleting the old-path entry it had just adopted).
+        if (data.oldPath === data.newPath) return;
         const [firstLock, secondLock] = [data.oldPath, data.newPath].sort();
         await this.runLocked(firstLock, async () => {
             await this.runLocked(secondLock, async () => {
@@ -4929,10 +4958,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         this.log(`Renaming file: ${data.oldPath} -> ${data.newPath}`);
                         this.ignoreNextEventForPath(data.oldPath, 2000, 'rename');
                         this.ignoreNextEventForPath(data.newPath, 2000, 'rename');
-                        this.moveFileRecords(data.oldPath, data.newPath, data.versionVector);
                         const parent = data.newPath.substring(0, data.newPath.lastIndexOf('/'));
                         if (parent) await this.ensureFolderExists(parent);
                         await this.app.vault.rename(fileToRename, data.newPath);
+                        // Records move only once the rename they describe happened: on
+                        // a failed rename the old path kept a live tombstone and no
+                        // vector (they had "moved"), so a third device's stale copy of
+                        // the old path beat the orphaned deletion and resurrected it.
+                        this.moveFileRecords(data.oldPath, data.newPath, data.versionVector);
                         // The rename preserved the bytes, so the moved hash cache entry
                         // (or a fresh digest) is the echo hash: an edit saved right after
                         // the rename now escapes the rename marker via the content
@@ -4949,6 +4982,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e);
                         this.showNotice(`Could not rename ${data.oldPath} on this device.`, 'error');
                     }
+                } else if (target instanceof TFolder) {
+                    // A file cannot move where a folder lives (and vice versa): both
+                    // used to fall through every branch as a SILENT no-op — the peer
+                    // believed the rename applied while the devices held the file under
+                    // different names until a full sync re-arbitrated.
+                    this.showNotice(`"${data.newPath}" is a folder here but a note on the other device — nothing at this path can sync until one side is renamed.`, 'warning', 12000);
+                } else if (fileToRename instanceof TFolder && target instanceof TFile) {
+                    this.showNotice(`"${data.oldPath}" is a folder here but a note on the other device — nothing at this path can sync until one side is renamed.`, 'warning', 12000);
                 } else if (target instanceof TFile) {
                     // Already renamed here (or the rename arrived after the file itself).
                     if (data.versionVector) {
@@ -4979,9 +5020,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // Merged, not replaced: a peer's rename of a note edited here must not forget that edit.
         const vector = mergeVectors(this.twoDeviceState.fileVersions[oldPath], versionVector);
         if (Object.keys(vector).length) this.twoDeviceState.fileVersions[newPath] = vector;
-        delete this.twoDeviceState.fileVersions[oldPath];
-        this.tombstones[oldPath] = Date.now();
-        delete this.tombstones[newPath];
+        // The old path's vector survives while its deletion is still being decided:
+        // dropping it here left the tombstone vector-less, so a third device's stale
+        // old-path copy beat the deletion by pure vector ordering and resurrected it.
+        if (this.tombstones[oldPath] === undefined) delete this.twoDeviceState.fileVersions[oldPath];
+        // The rename's "deletion" of the old path is stamped no later than any record
+        // already there: a re-stamp made it look newer than a real deletion it should
+        // have lost to, and re-armed the retention clock.
+        this.tombstones[oldPath] = Math.min(this.tombstones[oldPath] ?? Number.MAX_SAFE_INTEGER, Date.now());
+        // A deletion already recorded at the target is not ours to clear: renames
+        // carry no time, so letting one beat a concurrent deletion unilaterally made
+        // the rename win against a delete that happened after it.
+        if (this.tombstones[newPath] === undefined) delete this.tombstones[newPath];
         this.scheduleStateSave();
     }
 
@@ -6077,9 +6127,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const base = hasExtension ? originalPath.substring(0, lastDot) : originalPath;
         const extension = hasExtension ? originalPath.substring(lastDot + 1) : '';
 
+        // The losing device's ID makes the name deterministic and collision-free: in
+        // a three-device conflict, two different losers used to create the same-day
+        // copy at the same path, and when the copies reached each other the second
+        // became a copy OF THE COPY — a nesting chain one level deep per collision
+        // that the Conflict Center's parser cannot unwind.
+        const device = this.settings.deviceId.replace(/[^a-zA-Z0-9-]/g, '').substring(0, 16);
+
         const build = (suffix: string) => hasExtension
-            ? `${base} (conflict on ${date}${suffix}).${extension}`
-            : `${base} (conflict on ${date}${suffix})`;
+            ? `${base} (conflict on ${date} by ${device}${suffix}).${extension}`
+            : `${base} (conflict on ${date} by ${device}${suffix})`;
 
         let candidate = build('');
         for (let n = 2; this.app.vault.getAbstractFileByPath(candidate) && n < 1000; n++) {

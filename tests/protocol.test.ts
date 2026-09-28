@@ -184,3 +184,73 @@ describe('reconciliation re-arm', () => {
         await waitFor(() => b.vault.text('late.md') === 'edited during the sync', { timeout: 15000, what: 'the post-sync exchange to deliver the edit' });
     });
 });
+
+describe('receive-apply hardening (14/15)', () => {
+    test('a failed trash does not commit the deletion', async () => {
+        // Adopting the deletion's vector while the file stayed alive made the
+        // survivor's copy dominate the deletion cluster-wide — a third device then
+        // resurrected the file on the very device that deleted it.
+        const b = await createDevice(B, { vault: vaultWith({ 'keep.md': ['mine', T] }) });
+        const plugin: any = b.plugin;
+        jest.spyOn(plugin, 'trashForPeer').mockRejectedValue(new Error('trash refused'));
+
+        await plugin.applyFileDelete({
+            type: 'file-delete', path: 'keep.md', transferId: 't-del',
+            versionVector: { [A]: 1 }, deletedAt: Date.now() + 60_000,
+        }, A);
+
+        expect(b.vault.has('keep.md')).toBe(true);
+        expect(plugin.tombstones['keep.md']).toBeUndefined();
+        // No vector was adopted from the deletion, so it stays concurrent and the
+        // usual rules re-arbitrate on retry.
+        expect(plugin.twoDeviceState.fileVersions['keep.md']).toBeUndefined();
+    });
+
+    test('a rename onto a folder is named, not silently dropped', async () => {
+        const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['x', T] }) });
+        await b.vault.createFolder('note.md folder');
+        const plugin: any = b.plugin;
+        const renames = jest.spyOn(b.vault, 'rename');
+
+        await plugin.applyFileRename({ type: 'file-rename', oldPath: 'note.md', newPath: 'note.md folder', transferId: 't-r1' }, undefined);
+
+        expect(renames).not.toHaveBeenCalled();
+        expect(b.vault.text('note.md')).toBe('x');
+    });
+
+    test('a rename onto its own path leaves the vector intact', async () => {
+        const b = await createDevice(B, { vault: vaultWith({ 'same.md': ['x', T] }) });
+        const plugin: any = b.plugin;
+        plugin.twoDeviceState.fileVersions['same.md'] = { [B]: 2 };
+
+        await plugin.applyFileRename({ type: 'file-rename', oldPath: 'same.md', newPath: 'same.md', transferId: 't-r2' }, undefined);
+
+        expect(plugin.twoDeviceState.fileVersions['same.md']).toEqual({ [B]: 2 });
+    });
+
+    test('conflict copies carry the losing device, so same-day copies do not nest', async () => {
+        const b = await createDevice(B, { vault: vaultWith({ 'shared.md': ['v1', T] }) });
+        const plugin: any = b.plugin;
+        const path = plugin.getConflictPath('shared.md');
+        expect(path).toMatch(/\(conflict on \d{4}-\d{2}-\d{2} by device-bbbb0002\)\.md$/);
+
+        // And the parser unwinds both the new and the legacy spelling.
+        const { originalPathFromConflictCopy } = require('../src/utils');
+        expect(originalPathFromConflictCopy(path)).toBe('shared.md');
+        expect(originalPathFromConflictCopy('shared (conflict on 2026-09-28).md')).toBe('shared.md');
+        expect(originalPathFromConflictCopy('shared (conflict on 2026-09-28 2).md')).toBe('shared.md');
+    });
+
+    test('a same-name copy landing mid-create retries on the next name', async () => {
+        const b = await createDevice(B, { vault: vaultWith({ 'note.md': ['v1', T] }) });
+        const plugin: any = b.plugin;
+        const first = plugin.getConflictPath('note.md');
+        // Another copy lands between the probe and the create.
+        await b.vault.create(first, 'a peer copy');
+
+        const made = await plugin.createConflictCopy('note.md', 'this device words');
+        expect(made).toBeTruthy();
+        expect(made).not.toBe(first);
+        expect(b.vault.text(made!)).toBe('this device words');
+    });
+});
