@@ -355,7 +355,7 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Modification Time Tolerance (ms)")
-            .setDesc("Time difference to consider files 'the same' to account for clock skew.")
+            .setDesc("How close in modification time two files must be to count as the same file when comparing vaults (accounts for clock skew). Conflict outcomes do not use this — they are decided by edit order, identically on every device.")
             .addText(text => text
                 .setValue(this.plugin.settings.mtimeTolerance.toString())
                 .onChange(async (value) => {

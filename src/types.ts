@@ -6,15 +6,18 @@ export const TARGET_CHUNK_TIME_MS = 3000;
 export const MIN_CHUNK_SIZE = 64 * 1024;
 export const MAX_CHUNK_SIZE = 4 * 1024 * 1024;
 export const MAX_BANDWIDTH_SAMPLES = 10;
-export const MAX_QUEUE_DEPTH = 50;
 export const LOCK_EXPIRATION_MS = 30000;
 export const MAX_HASH_CACHE_SIZE = 10000;
 
 // Phase Timeouts
-export const REQUESTING_TIMEOUT = 120000;
 export const PLANNING_TIMEOUT = 120000;
+/**
+ * The initiator's REQUESTING window must contain the responder's entire PLANNING window
+ * plus the request/plan deliveries (each up to 30 s per ack attempt): with equal values,
+ * any vault whose planning uses most of its own budget made the requester abort first.
+ */
+export const REQUESTING_TIMEOUT = PLANNING_TIMEOUT + 30000;
 export const BATCH_TIMEOUT = 300000;
-export const COMPLETING_TIMEOUT = 60000;
 
 export enum SyncPhase {
     IDLE = 'IDLE',
@@ -73,7 +76,6 @@ export interface SyncState {
     allowedPulls: Set<string>;
     activeBatches: Map<string, BatchState>;
     activePullBatches: Set<string>;
-    phaseStartTime: number;
     phaseTimeoutHandle: number | null;
     missedPings: number;
     filesTotal: number;
@@ -134,7 +136,6 @@ export type BasePayload = {
 export type HandshakePayload = {
     type: 'handshake';
     peerInfo: PeerInfo;
-    pin?: string;
     isResponse?: boolean;
     /** Wire protocol version; see PROTOCOL_VERSION in utils.ts. Absent on 2.x peers. */
     protocolVersion?: number;
@@ -178,10 +179,19 @@ export type FileUpdatePayload = BasePayload & {
     path: string;
     content: string | ArrayBuffer;
     mtime: number;
+    /**
+     * 'base64' is a legacy arm: nothing in this codebase produces it any more, and the
+     * receivers that still read it do so for peers running older builds.
+     */
     encoding: 'utf8' | 'binary' | 'base64';
     fileHash?: string;
     compressed?: boolean;
     versionVector?: VersionVector;
+    /**
+     * Set on direct-IP batch items: the batch-complete message, not a per-file ack,
+     * carries their reliability, so the receiver skips the ack.
+     */
+    skipAck?: boolean;
 };
 
 export type FileDeltaPayload = BasePayload & {
@@ -225,12 +235,20 @@ export type FolderRenamePayload = BasePayload & {
 };
 
 // Full Sync Pull-based Payloads
-export type FullSyncRequestPayload = {
+
+/**
+ * Sync-control messages travel through sendSyncMessage, which stamps a messageId that
+ * the peer acks and dedups on — modelled here so a future typed handler cannot
+ * silently lose that mechanism.
+ */
+export type ControlPayload = { messageId?: string };
+
+export type FullSyncRequestPayload = ControlPayload & {
     type: 'request-full-sync';
     manifest: VaultManifest;
 };
 
-export type SyncPlanPayload = {
+export type SyncPlanPayload = ControlPayload & {
     type: 'sync-plan';
     filesReceiverWillSend: string[];
     filesInitiatorMustSend: string[];
@@ -241,25 +259,21 @@ export type SyncPlanPayload = {
     deletions?: Record<string, { at: number; vv?: VersionVector }>;
 };
 
-export type RequestBatchPayload = {
+export type RequestBatchPayload = ControlPayload & {
     type: 'request-batch';
     paths: string[];
     batchId: string;
 };
 
-export type BatchCompletePayload = {
+export type BatchCompletePayload = ControlPayload & {
     type: 'batch-complete';
     batchId: string;
     receivedPaths: string[];
     failedPaths: string[];
 };
 
-export type FullSyncCompletePayload = {
+export type FullSyncCompletePayload = ControlPayload & {
     type: 'full-sync-complete';
-};
-
-export type InitiatorSyncDonePayload = {
-    type: 'initiator-sync-done';
 };
 
 export type RequestFilePayload = {
@@ -298,6 +312,8 @@ export type FileBatchBinaryPayload = {
     type: 'file-batch-binary';
     batchId: string;
     data: ArrayBuffer | Uint8Array;
+    /** Present on the wire (the sender stamps every payload with one); nothing reads it. */
+    transferId?: string;
 };
 
 export type PingPayload = {
@@ -472,7 +488,6 @@ export type SyncData =
     | RequestBatchPayload
     | BatchCompletePayload
     | FullSyncCompletePayload
-    | InitiatorSyncDonePayload
     | RequestFilePayload
     | FileChunkStartPayload
     | FileChunkDataPayload

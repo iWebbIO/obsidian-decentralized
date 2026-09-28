@@ -28,7 +28,6 @@ import {
     REQUESTING_TIMEOUT,
     PLANNING_TIMEOUT,
     BATCH_TIMEOUT,
-    COMPLETING_TIMEOUT,
     SyncPhase,
     SyncErrorCategory,
     SyncError,
@@ -156,7 +155,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         pendingPulls: new Set(),
         allowedPulls: new Set(),
         activeBatches: new Map(),
-        phaseStartTime: 0,
         phaseTimeoutHandle: null,
         missedPings: 0,
         filesTotal: 0,
@@ -786,7 +784,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (state) {
             if (state.activeTransfers) {
                 for (const t of state.activeTransfers) {
-                    this.activeTransfers.set(t.id, { ...t, status: 'paused' });
+                    // Paused uploads are resumable — keep them. A paused download cannot
+                    // continue without its sender, so after an unclean shutdown it would
+                    // sit in memory and every future state.json forever; drop it (the
+                    // unload path already drops downloads deliberately).
+                    if (t.direction === 'upload') {
+                        this.activeTransfers.set(t.id, { ...t, status: 'paused' });
+                    }
                 }
                 this.updateStatus();
             }
@@ -1561,21 +1565,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.scheduleQueueSave();
     }
 
-    public getQueuePressure(): number {
-        return this.queueManager.getQueuePressure();
+    /**
+     * Progress evidence during TRANSFERRING re-arms the phase timer: BATCH_TIMEOUT
+     * otherwise expires mid-batch on a slow link even though data is flowing (the idle
+     * timeout keeps resetting, but nothing re-armed the phase timer per chunk).
+     */
+    private rearmTransferringPhase() {
+        if (this.syncState.isSyncing && this.syncState.currentPhase === SyncPhase.TRANSFERRING) {
+            this.transitionToPhase(SyncPhase.TRANSFERRING);
+        }
     }
 
     public transitionToPhase(newPhase: SyncPhase) {
         this.log(`Sync phase transition: ${this.syncState.currentPhase} -> ${newPhase}`);
         this.syncState.currentPhase = newPhase;
-        this.syncState.phaseStartTime = Date.now();
         if (this.syncState.phaseTimeoutHandle) { clearTimeout(this.syncState.phaseTimeoutHandle); this.syncState.phaseTimeoutHandle = null; }
-        
+
         let timeoutMs = 0;
         if (newPhase === SyncPhase.REQUESTING) timeoutMs = REQUESTING_TIMEOUT;
         else if (newPhase === SyncPhase.PLANNING) timeoutMs = PLANNING_TIMEOUT;
         else if (newPhase === SyncPhase.TRANSFERRING) timeoutMs = BATCH_TIMEOUT;
-        else if (newPhase === SyncPhase.COMPLETING) timeoutMs = COMPLETING_TIMEOUT;
 
         if (timeoutMs > 0) {
             this.syncState.phaseTimeoutHandle = window.setTimeout(() => {
@@ -1653,7 +1662,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // Only this sync's transfers. Clearing them all also discarded paused uploads to
         // other devices, which are the only record that those devices still need a file.
         for (const [id, transfer] of this.activeTransfers) {
-            if (transfer.peerId === syncPeer) this.activeTransfers.delete(id);
+            if (transfer.peerId === syncPeer) {
+                this.activeTransfers.delete(id);
+                // The matching reassembly too: an aborted download's preallocated
+                // buffer otherwise lingers for the 5-minute sweeper and keeps counting
+                // against the concurrent-reassembly limit, so a sync restarted right
+                // after an abort could have its next chunked transfer refused.
+                this.pendingFileChunks.delete(id);
+            }
         }
         this.syncState.pendingPulls.clear();
         this.syncState.allowedPulls.clear();
@@ -1704,10 +1720,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return this.currentConcurrency; 
     }
     
-    public getChunkSize() { 
-        if (this.settings.chunkSize) return this.settings.chunkSize;
+    public getChunkSize() {
+        if (this.settings.chunkSize) {
+            // A hand-edited data.json can hold anything; the receive-side chunk check
+            // compares against MAX_CHUNK_SIZE, so an over-large setting made every
+            // chunk of every transfer fail while the sender kept sending.
+            return Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, this.settings.chunkSize));
+        }
         if (this.getConnectionMode() === 'direct-ip') return 2 * 1024 * 1024; // 2MB for direct-ip
-        return this.currentChunkSize; 
+        return this.currentChunkSize;
     }
 
     private recordTransferSample(bytes: number, durationMs: number) {
@@ -2024,12 +2045,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     item.data = null as any;
                 }
             } else {
-                const finalPayload = peerId ? await this.toWire(peerId, data) : data;
-
                 const isBatchItem = item.task && (item.task as any).batchId;
                 const isSmallFile = (data.type === 'file-update' || data.type === 'file-delta');
                 const isDirectIp = this.getConnectionMode() === 'direct-ip';
                 const skipAck = (isBatchItem && isSmallFile && isDirectIp) || data.type === 'file-batch-binary';
+
+                // Say so on the wire too: the flag used to be computed here but never
+                // travelled, so the receiver acked every direct-IP batch item anyway —
+                // stray acks the protocol says it should not send.
+                if (skipAck && peerId && data.type === 'file-update') {
+                    (data as FileUpdatePayload).skipAck = true;
+                }
+
+                const finalPayload = peerId ? await this.toWire(peerId, data) : data;
 
                 if (isSmallFile && peerId && !skipAck) {
                     const ackPromise = this.expectAck(transferId!, peerId, 60000);
@@ -2491,14 +2519,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }, backoff);
     }
 
-    setupConnection(conn: DataConnection, pin?: string) {
+    setupConnection(conn: DataConnection) {
         this.pendingConnections.add(conn.peer);
         conn.on('open', () => {
             this.pendingConnections.delete(conn.peer);
             this.log("DataConnection open with:", conn.peer);
             // Role announcement and resuming interrupted uploads wait for handleHandshake, once
             // the connection is registered and the peer has proved who it is.
-            void this.sendHandshake(conn, pin);
+            void this.sendHandshake(conn);
         });
         // Decryption is asynchronous, so messages handled independently can finish out of
         // order: a file-chunk-data that overtakes its file-chunk-start is dropped as unknown,
@@ -2569,8 +2597,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * We hold a key for this peer, so a plaintext handshake is exactly what its receive-side
      * gate refuses — and what an impersonator would send.
      */
-    private async sendHandshake(conn: DataConnection, pin?: string) {
-        const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin, protocolVersion: PROTOCOL_VERSION };
+    private async sendHandshake(conn: DataConnection) {
+        const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), protocolVersion: PROTOCOL_VERSION };
         if (!this.peerKeyFor(conn.peer)) {
             conn.send(payload);
             return;
@@ -3576,8 +3604,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
                 const encPayload: any = encryptFor ? await this.encryptPayload(chunkPayload, peerId) : chunkPayload;
 
-                this.syncState.bytesTransferred += chunk.byteLength;
-
                 // Larger high/low water marks than small messages: the chunk loop wants
                 // to keep the pipe full rather than round-trip per chunk.
                 if (isDirectIp) {
@@ -3628,7 +3654,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const totalChunks = payload.totalChunks;
         // Integer check first: NaN and negatives both compare false against the ceiling
         // below, so a bare `> max` test let them straight through.
-        if (!Number.isSafeInteger(totalChunks) || totalChunks <= 0 || totalChunks > MAX_REASSEMBLY_SIZE / MAX_CHUNK_SIZE) {
+        // The ceiling divides by the SMALLEST legal chunk size: dividing by MAX rejected
+        // ordinary transfers (512 KB chunks over a 64 MB file is already 128 chunks, and
+        // the adapter deliberately drops to 64 KB on a flaky link). totalBytes ≤ 512 MB
+        // plus the ceil-consistency check below bound memory exactly on their own.
+        if (!Number.isSafeInteger(totalChunks) || totalChunks <= 0 || totalChunks > MAX_REASSEMBLY_SIZE / MIN_CHUNK_SIZE) {
             this.log(`Rejecting chunked transfer for ${payload.path}: invalid totalChunks (${totalChunks}).`);
             return;
         }
@@ -3677,10 +3707,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             processedChunks: 0,
             startTime: Date.now(),
             lastUpdate: Date.now(),
-            status: 'active'
+            status: 'active',
+            // The transfer's own size, not the current adaptive default the UI would
+            // otherwise fall back to (which drifts as the connection adapts).
+            chunkSize: payload.chunkSize
         });
+        this.rearmTransferringPhase();
         this.resetIdleTimeout();
-        this.log(`Receiving chunked file: ${payload.path}, ID: ${payload.transferId}`); 
+        this.log(`Receiving chunked file: ${payload.path}, ID: ${payload.transferId}`);
     }
 
     async handleFileChunkData(payload: FileChunkDataPayload, conn: DataConnection) {
@@ -3710,11 +3744,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const bytes = payload.data instanceof Uint8Array ? payload.data : new Uint8Array(payload.data);
             transfer.buffer.set(bytes, offset);
             transfer.receivedCount++;
-            this.syncState.bytesTransferred += payload.data.byteLength;
         }
         transfer.lastUpdated = Date.now();
         const active = this.activeTransfers.get(payload.transferId);
         if (active) { active.processedChunks = transfer.receivedCount; active.lastUpdate = Date.now(); }
+        // Progress evidence: a slow link moving data must not trip the phase timeout
+        // mid-file. (Bytes are counted once, at batch-complete — per-chunk increments
+        // double-counted every chunked pull.)
+        this.rearmTransferringPhase();
         this.resetIdleTimeout();
         
         if (transfer.receivedCount === transfer.total) {
@@ -4110,6 +4147,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async applyFileBatchBinary(data: FileBatchBinaryPayload, fromPeer?: string): Promise<{ succeeded: string[], failed: string[] }> {
+        // Batch arrival is progress evidence like any chunk: a big batch on a slow
+        // link must not let BATCH_TIMEOUT expire mid-arrival.
+        this.rearmTransferringPhase();
         const results = { succeeded: [] as string[], failed: [] as string[] };
         // A Uint8Array body is parsed in place; unpackTLVToFiles slices out each file's
         // content, so nothing keeps the batch alive afterwards.
@@ -4911,6 +4951,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         batch.sentCount += paths.length;
         if (success) {
             batch.succeededPaths.push(...paths);
+            // Serve-side progress: filesTotal counts both directions, so the bar was
+            // stuck at zero on a device that only served.
+            if (this.syncState.isSyncing) this.syncState.filesTransferred += paths.length;
         } else {
             batch.failedPaths.push(...paths);
             // Re-authorize failed paths so the peer's retry request isn't rejected as "unauthorized"

@@ -83,6 +83,12 @@ export interface VersionInfo {
  * lacks — for two devices that is simply the lower device ID — then to the smaller content
  * hash, then to the device with the lower ID. Symmetric: swapping the arguments swaps the
  * answer, so the devices on both ends agree.
+ *
+ * The mtime comparison is deliberately exact. Every device holding either version must
+ * reach the same verdict, and each has its own settings: folding a local mtime-tolerance
+ * in here would let two devices with different tolerances pick different winners. The
+ * mtimeTolerance setting applies to manifest equality only (deciding whether two entries
+ * even describe the same file); from there on, the exact rule decides.
  */
 export function newerVersion(a: VersionInfo, b: VersionInfo): 'a' | 'b' {
     if (a.mtime !== b.mtime) return a.mtime > b.mtime ? 'a' : 'b';

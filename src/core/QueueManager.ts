@@ -1,5 +1,4 @@
 import { TimeoutManager } from '../utils/Timeouts';
-import { MAX_QUEUE_DEPTH } from '../types';
 
 export interface QueueItem {
     id?: string;
@@ -139,10 +138,6 @@ export class QueueManager {
         if (item.seq === undefined) item.seq = this.seqCounter++;
         this.heapPush(item);
         this.processQueue();
-    }
-
-    public getQueuePressure(): number {
-        return Math.min(1, (this.syncQueue.length + this.activeQueueTransfers) / MAX_QUEUE_DEPTH);
     }
 
     public getQueueSize(): number { return this.syncQueue.length; }
