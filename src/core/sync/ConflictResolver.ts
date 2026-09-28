@@ -10,6 +10,24 @@ export interface ConflictResolutionOutcome {
     conflictFileContent?: string | ArrayBuffer;
 }
 
+export interface ConflictResolutionInput {
+    strategy: ConflictStrategy;
+    filePath: string;
+    localContent: string | ArrayBuffer;
+    localMtime: number;
+    remoteContent: string | ArrayBuffer;
+    remoteMtime: number;
+    remoteDeviceId: string;
+    myRole: DeviceRole;
+    localDeviceId?: string;
+    /**
+     * The last content both versions are known to share, when the caller tracks it.
+     * Only with a common ancestor can a real three-way merge be attempted; without
+     * it "merge" would just be adopting one side.
+     */
+    baseContent?: string;
+}
+
 export class ConflictResolver {
     private dmp = new DiffMatchPatch();
 
@@ -72,7 +90,23 @@ export class ConflictResolver {
     }
 
     /**
+     * A real three-way merge: replay the remote side's changes (base -> remote) on top of
+     * the local version. Both edits land when they touch different regions; edits that
+     * overlap enough for patch application to fail report success: false and the caller
+     * must fall back to a conflict copy — a "merged" result must never silently be one
+     * side's content.
+     */
+    public mergeThreeWay(base: string, local: string, remote: string): { mergedText: string; success: boolean } {
+        const patch = this.createPatch(base, remote);
+        return this.mergePatches(local, patch);
+    }
+
+    /**
      * Resolve a conflict according to the selected strategy.
+     *
+     * mtimes from two devices are never compared at finer resolution than
+     * mtimeToleranceMs: inside the window they are a tie (clocks skew), decided
+     * deterministically by device ID so both ends pick the same winner.
      */
     public resolve({
         strategy,
@@ -83,25 +117,17 @@ export class ConflictResolver {
         remoteMtime,
         remoteDeviceId,
         myRole,
-        localDeviceId
-    }: {
-        strategy: ConflictStrategy;
-        filePath: string;
-        localContent: string | ArrayBuffer;
-        localMtime: number;
-        remoteContent: string | ArrayBuffer;
-        remoteMtime: number;
-        remoteDeviceId: string;
-        myRole: DeviceRole;
-        localDeviceId?: string;
-    }): ConflictResolutionOutcome {
+        localDeviceId,
+        baseContent
+    }: ConflictResolutionInput): ConflictResolutionOutcome {
         if (this.areContentsEqual(localContent, remoteContent)) {
             return { action: 'keep-local' };
         }
 
-        const remoteIsNewer = (remoteMtime !== localMtime)
-            ? remoteMtime > localMtime
-            : (remoteDeviceId > (localDeviceId ?? ''));
+        const mtimesAreTied = Math.abs(remoteMtime - localMtime) <= this.mtimeToleranceMs;
+        const remoteIsNewer = mtimesAreTied
+            ? (remoteDeviceId > (localDeviceId ?? ''))
+            : remoteMtime > localMtime;
 
         switch (strategy) {
             case 'role-based':
@@ -119,14 +145,15 @@ export class ConflictResolver {
                 }
 
             case 'three-way-merge':
-                if (typeof localContent === 'string' && typeof remoteContent === 'string') {
-                    const patch = this.createPatch(localContent, remoteContent);
-                    const { mergedText, success } = this.mergePatches(localContent, patch);
+                if (typeof localContent === 'string' && typeof remoteContent === 'string'
+                    && typeof baseContent === 'string') {
+                    const { mergedText, success } = this.mergeThreeWay(baseContent, localContent, remoteContent);
                     if (success) {
                         return { action: 'write-merged', contentToSave: mergedText };
                     }
                 }
-                // Fallback to conflict file if merge fails or is binary
+                // No common ancestor (or the edits overlap, or the content is binary):
+                // a merge is not possible, so keep both versions like any other conflict.
                 return {
                     action: 'create-conflict-file',
                     conflictFilePath: this.getConflictPath(filePath, remoteDeviceId, remoteMtime),

@@ -13,6 +13,12 @@ export class MerkleManager {
     private hashCache: Map<string, { hash: string; mtime: number; size: number }> = new Map();
     private cachedTree: MerkleNode | null = null;
     private treeBuiltAt: number = 0;
+    /**
+     * Bumped by every invalidation. A tree built while the vault changed underneath it
+     * must not be cached as current: a mid-build change would otherwise stay invisible
+     * until the next vault event, and anti-entropy would compare against a stale tree.
+     */
+    private generation = 0;
 
     constructor(
         private storage: IVaultStorage,
@@ -49,6 +55,7 @@ export class MerkleManager {
      * Invalidate the cached Merkle tree so it is rebuilt on the next query.
      */
     public invalidate() {
+        this.generation++;
         this.cachedTree = null;
         this.treeBuiltAt = 0;
     }
@@ -75,6 +82,7 @@ export class MerkleManager {
      * Rebuild the Merkle tree from storage.
      */
     public async buildMerkleTree(): Promise<MerkleNode> {
+        const generationAtStart = this.generation;
         const files = await this.storage.listFiles();
         const tree: MerkleNode = { hash: '', children: {} };
 
@@ -149,13 +157,26 @@ export class MerkleManager {
         };
 
         await computeHashes(tree);
-        this.cachedTree = tree;
-        this.treeBuiltAt = Date.now();
+        // A file changed while this tree was being built (hashing awaits): use it this
+        // once, but build afresh next time — caching it would hide the change until
+        // some later vault event, and anti-entropy would compare against a stale tree.
+        if (generationAtStart === this.generation) {
+            this.cachedTree = tree;
+            this.treeBuiltAt = Date.now();
+        } else {
+            this.cachedTree = null;
+            this.treeBuiltAt = 0;
+        }
         return tree;
     }
 
     /**
      * Compare local tree against a remote tree and find differences without transmitting full file manifests.
+     *
+     * Two empty trees diff as fully identical (no phantom "" entry), and a file on one
+     * side facing a directory on the other is reported for both sides — the file is
+     * missing remotely and the directory's contents are missing locally — instead of
+     * being silently dropped from the diff.
      */
     public diffTrees(localRoot: MerkleNode, remoteRoot: MerkleNode): MerkleDiffResult {
         const result: MerkleDiffResult = {
@@ -172,9 +193,6 @@ export class MerkleManager {
         }
 
         const walk = (local: MerkleNode | undefined, remote: MerkleNode | undefined, currentPath: string) => {
-            const isLocalLeaf = !local?.children || Object.keys(local.children).length === 0;
-            const isRemoteLeaf = !remote?.children || Object.keys(remote.children).length === 0;
-
             if (local && !remote) {
                 this.collectPaths(local, currentPath, result.missingRemotely);
                 return;
@@ -185,30 +203,43 @@ export class MerkleManager {
                 return;
             }
 
-            if (local && remote) {
-                if (local.hash === remote.hash && local.hash !== '') {
-                    this.collectPaths(local, currentPath, result.identical);
-                    return;
-                }
+            if (!local || !remote) return;
 
-                if (isLocalLeaf && isRemoteLeaf) {
-                    if (local.hash !== remote.hash) {
-                        result.changed.push(currentPath);
-                    } else {
-                        result.identical.push(currentPath);
-                    }
-                    return;
-                }
+            if (local.hash === remote.hash && local.hash !== '') {
+                this.collectPaths(local, currentPath, result.identical);
+                return;
+            }
 
-                const allKeys = new Set([
-                    ...Object.keys(local.children || {}),
-                    ...Object.keys(remote.children || {})
-                ]);
+            const isLocalLeaf = !local.children || Object.keys(local.children).length === 0;
+            const isRemoteLeaf = !remote.children || Object.keys(remote.children).length === 0;
 
-                for (const key of allKeys) {
-                    const nextPath = currentPath ? `${currentPath}/${key}` : key;
-                    walk(local.children?.[key], remote.children?.[key], nextPath);
+            if (isLocalLeaf && isRemoteLeaf) {
+                // The vault roots ("") of two empty trees are both childless with an empty
+                // hash: that is "everything matches", not an identical file at "".
+                if (currentPath === '') return;
+                if (local.hash !== remote.hash) {
+                    result.changed.push(currentPath);
+                } else {
+                    result.identical.push(currentPath);
                 }
+                return;
+            }
+
+            // A file facing a directory: the file has no counterpart remotely (and vice
+            // versa), and the directory's contents still need walking.
+            if (currentPath !== '') {
+                if (isLocalLeaf) result.missingRemotely.push(currentPath);
+                if (isRemoteLeaf) result.missingLocally.push(currentPath);
+            }
+
+            const allKeys = new Set([
+                ...Object.keys(local.children || {}),
+                ...Object.keys(remote.children || {})
+            ]);
+
+            for (const key of allKeys) {
+                const nextPath = currentPath ? `${currentPath}/${key}` : key;
+                walk(local.children?.[key], remote.children?.[key], nextPath);
             }
         };
 

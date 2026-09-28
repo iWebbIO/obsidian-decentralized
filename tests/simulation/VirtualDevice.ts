@@ -313,21 +313,10 @@ export class VirtualDevice {
             ? remoteContent.buffer.slice(remoteContent.byteOffset, remoteContent.byteOffset + remoteContent.byteLength)
             : remoteContent;
 
-        // Try 3-way text merge if enabled
-        if (this.conflictStrategy === 'three-way-merge' && typeof localContent === 'string' && typeof remoteContent === 'string') {
-            const base = this.baseContents.get(msg.path) || localContent;
-            const patch = this.conflictResolver.createPatch(base, remoteContent);
-            const { mergedText, success } = this.conflictResolver.mergePatches(localContent, patch);
-            if (success) {
-                await this.storage.write(msg.path, mergedText, Math.max(localMtime, msg.mtime) + 1);
-                this.baseContents.set(msg.path, mergedText);
-                const mergedVV = VersionVectorManager.merge(localVV, remoteVV);
-                mergedVV[this.deviceId] = (mergedVV[this.deviceId] || 0) + 1;
-                this.fileVersions.set(msg.path, mergedVV);
-                return;
-            }
-        }
-
+        // Concurrent edit: invoke ConflictResolver. The tracked base (the last content
+        // both devices are known to share) is what makes a real three-way merge possible;
+        // without it the resolver keeps both versions as a conflict instead of quietly
+        // adopting one side.
         const outcome = this.conflictResolver.resolve({
             strategy: this.conflictStrategy,
             filePath: msg.path,
@@ -337,7 +326,8 @@ export class VirtualDevice {
             remoteContent: remoteBuf,
             remoteMtime: msg.mtime,
             remoteDeviceId: msg.deviceId,
-            myRole: this.role
+            myRole: this.role,
+            baseContent: this.baseContents.get(msg.path)
         });
 
         if (outcome.action === 'adopt-remote') {

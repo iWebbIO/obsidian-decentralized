@@ -826,7 +826,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const json = JSON.stringify({
             activeTransfers: Array.from(this.activeTransfers.values()),
             failedSyncs: this.failedSyncs,
-            twoDeviceState: this.twoDeviceState,
+            // The Merkle tree is rebuilt from the vault on first use after a restart
+            // (merkleTreeBuiltAt is not persisted), so writing it here only made every
+            // save re-serialise the largest structure in the file — megabytes of JSON
+            // on a large vault, several times a minute for the whole sync.
+            twoDeviceState: { fileVersions: this.twoDeviceState.fileVersions, merkleTreeRoot: null },
             tombstones: this.tombstones,
             configSync: this.configSync?.state,
         });
@@ -1114,6 +1118,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // the deletion at all. On the next connection the stale hash made the vaults look
         // identical, and peers resurrected files that had been deleted offline.
         if (!this.hasPeers() && !checkContent) {
+            // Only files carry version vectors and tombstones. A folder event offline is
+            // noise: manifests and tombstones describe files, Obsidian fires a delete for
+            // each child of a removed folder, and a folder create is implied by any file
+            // written inside it. Recording it here filed meaningless vectors and tombstones
+            // under folder paths, forever (no tombstone is ever written for them to prune).
+            if (!(file instanceof TFile)) return;
             if (!this.app.vault.getAbstractFileByPath(file.path)) {
                 this.syncedHashes.delete(file.path);
                 this.recordLocalEdit(file.path);
@@ -4497,8 +4507,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleMerkleNodeRequest(data: MerkleNodeRequestPayload, conn: DataConnection) {
         this.resetIdleTimeout();
-        const tree = this.twoDeviceState.merkleTreeRoot;
-        if (!tree || typeof data.path !== 'string') return;
+        if (typeof data.path !== 'string') return;
+        // The current tree, not the raw field: it must not answer from a tree that
+        // predates the latest vault change.
+        const tree = await this.getMerkleTree();
         const targetNode = this.merkleNodeAt(tree, data.path);
         if (!targetNode) return;
 
@@ -4515,8 +4527,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleMerkleNodeResponse(data: MerkleNodeResponsePayload, conn: DataConnection) {
         this.resetIdleTimeout();
-        const tree = this.twoDeviceState.merkleTreeRoot;
-        if (!tree || typeof data.path !== 'string' || !data.children || typeof data.children !== 'object') return;
+        if (typeof data.path !== 'string' || !data.children || typeof data.children !== 'object') return;
+        // The current tree, not the raw field: comparing the peer's children against a
+        // stale tree requests paths that exist on neither side.
+        const tree = await this.getMerkleTree();
 
         // A folder we do not have compares against nothing. This used to stop at the deepest
         // folder we DID have and compare the peer's children against that folder's, sending

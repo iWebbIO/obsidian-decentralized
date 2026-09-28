@@ -63,6 +63,64 @@ describe('Core Sync Modules', () => {
             expect(diff.missingLocally).toContain('onlyB.md');
             expect(diff.changed).toContain('diff.md');
         });
+
+        test('diffTrees reports two empty vaults as identical without a phantom "" path', async () => {
+            // Both roots are childless with an empty hash; the leaf-leaf branch used to
+            // push "" into `identical`, handing callers a path that names no file.
+            const emptyA = new MerkleManager(new InMemoryVaultStorage());
+            const emptyB = new MerkleManager(new InMemoryVaultStorage());
+            const treeA = await emptyA.buildMerkleTree();
+            const treeB = await emptyB.buildMerkleTree();
+
+            const diff = emptyA.diffTrees(treeA, treeB);
+
+            expect(diff).toEqual({ missingLocally: [], missingRemotely: [], changed: [], identical: [] });
+        });
+
+        test('diffTrees reports a file facing a directory on both sides instead of dropping the file', async () => {
+            // "a" is a file locally and a folder remotely (it holds "a/x.md"). The old
+            // walk only descended into the directory's children, so the local file "a"
+            // vanished from the diff and no reconciliation would ever push it.
+            const storageA = new InMemoryVaultStorage();
+            const storageB = new InMemoryVaultStorage();
+            await storageA.write('a', 'a file');
+            await storageB.write('a/x.md', 'inside the folder');
+
+            const merkleA = new MerkleManager(storageA);
+            const merkleB = new MerkleManager(storageB);
+            const diff = merkleA.diffTrees(await merkleA.buildMerkleTree(), await merkleB.buildMerkleTree());
+
+            expect(diff.missingRemotely).toContain('a');
+            expect(diff.missingLocally).toContain('a/x.md');
+        });
+
+        test('a tree built while the vault changed is not cached as current', async () => {
+            // Hashing awaits, so a vault write can land mid-build. The finished tree must
+            // not be cached, or the change stays invisible until the next vault event and
+            // anti-entropy compares against a stale tree. One listFiles call is one
+            // build, which is what distinguishes a rebuild from a hash-cache hit.
+            let builds = 0;
+            const probing = new (class extends InMemoryVaultStorage {
+                public async listFiles() {
+                    builds++;
+                    if (builds === 1) merkle.invalidate();   // the vault changes mid-build
+                    return super.listFiles();
+                }
+            })();
+            const merkle = new MerkleManager(probing);
+            await probing.write('a.md', 'A');
+            await probing.write('b.md', 'B');
+
+            await merkle.buildMerkleTree();
+
+            // Mid-build change: the tree was not cached, so this had to rebuild...
+            expect(builds).toBe(1);
+            await merkle.getMerkleTree();
+            expect(builds).toBe(2);
+            // ...and with no further changes, that rebuild is cached.
+            await merkle.getMerkleTree();
+            expect(builds).toBe(2);
+        });
     });
 
     describe('VersionVectorManager', () => {
@@ -168,6 +226,101 @@ describe('Core Sync Modules', () => {
             expect(success).toBe(true);
             expect(mergedText).toContain('Line 2 modified');
             expect(mergedText).toContain('Line 4 added');
+        });
+
+        test('last-write-wins treats mtimes within tolerance as a tie and breaks it by device id', () => {
+            // Clocks on two devices skew by seconds; comparing those mtimes at full
+            // resolution made "newer" depend on the skew. Within the tolerance the
+            // device ID decides, and both ends reach the same verdict.
+            const remoteNewer = resolver.resolve({
+                strategy: 'last-write-wins',
+                filePath: 'file.txt',
+                localContent: 'Local',
+                localMtime: 1000,
+                localDeviceId: 'device-a',
+                remoteContent: 'Remote',
+                remoteMtime: 2500,   // 1500 ms apart, inside the 2000 ms tolerance
+                remoteDeviceId: 'device-b',
+                myRole: 'primary'
+            });
+            expect(remoteNewer.action).toBe('adopt-remote');
+
+            const localNewer = resolver.resolve({
+                strategy: 'last-write-wins',
+                filePath: 'file.txt',
+                localContent: 'Local',
+                localMtime: 2500,
+                localDeviceId: 'device-b',
+                remoteContent: 'Remote',
+                remoteMtime: 1000,   // same pair of times, ids swapped
+                remoteDeviceId: 'device-a',
+                myRole: 'primary'
+            });
+            expect(localNewer.action).toBe('keep-local');
+        });
+
+        test('three-way merge with a common base lands both sides\' edits', () => {
+            const base = "Line 1\nLine 2\nLine 3";
+            const local = "Line 1\nLine 2\nLine 3\nLine 4 added";
+            const remote = "Line 1\nLine 2 modified\nLine 3";
+
+            const outcome = resolver.resolve({
+                strategy: 'three-way-merge',
+                filePath: 'document.md',
+                localContent: local,
+                localMtime: 1000,
+                localDeviceId: 'device-a',
+                remoteContent: remote,
+                remoteMtime: 1100,
+                remoteDeviceId: 'device-b',
+                myRole: 'primary',
+                baseContent: base
+            });
+
+            expect(outcome.action).toBe('write-merged');
+            expect(outcome.contentToSave).toContain('Line 2 modified');
+            expect(outcome.contentToSave).toContain('Line 4 added');
+        });
+
+        test('three-way merge without a common base keeps both versions instead of "merging" into one side', () => {
+            // With no base to diff against, the old code built a patch from local to
+            // remote and applied it to local — which is always exactly the remote
+            // content — and returned it as a successful merge. A merge that cannot be
+            // attempted must fall back to a conflict file like the comment always claimed.
+            const outcome = resolver.resolve({
+                strategy: 'three-way-merge',
+                filePath: 'document.md',
+                localContent: 'the local edit',
+                localMtime: 5000,     // local is the newer change
+                localDeviceId: 'device-a',
+                remoteContent: 'the remote edit',
+                remoteMtime: 1000,
+                remoteDeviceId: 'device-b',
+                myRole: 'primary'
+                // no baseContent: the caller never tracked what both sides shared
+            });
+
+            expect(outcome.action).toBe('create-conflict-file');
+            expect(outcome.conflictFileContent).toBe('the remote edit');
+            expect(outcome.contentToSave).toBeUndefined();   // the newer local version stays primary
+        });
+
+        test('three-way merge of binary content falls back to a conflict file', () => {
+            const outcome = resolver.resolve({
+                strategy: 'three-way-merge',
+                filePath: 'image.png',
+                localContent: new Uint8Array([1, 1, 1, 1]).buffer,
+                localMtime: 5000,
+                localDeviceId: 'device-a',
+                remoteContent: new Uint8Array([2, 2, 2, 2]).buffer,
+                remoteMtime: 1000,
+                remoteDeviceId: 'device-b',
+                myRole: 'primary',
+                baseContent: 'not applicable'
+            });
+
+            expect(outcome.action).toBe('create-conflict-file');
+            expect(outcome.conflictFileContent).toEqual(new Uint8Array([2, 2, 2, 2]).buffer);
         });
     });
 });
