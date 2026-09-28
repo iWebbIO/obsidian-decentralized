@@ -126,6 +126,10 @@ export default {
       strictRequires: [/node_modules[\\/]ws[\\/]/, /ws-loader\.js$/],
     }),
     isProd && terser({
+      // 'pure' drops console calls whose result is unused (log/info/warn) while
+      // keeping side-effect-bearing ones — an unrecoverable bind failure used to
+      // console.error + console.log every 10 s forever in production builds.
+      compress: { drop_console: 'pure' },
       format: { comments: false },
     }),
     assertNoEagerNodeRequires,

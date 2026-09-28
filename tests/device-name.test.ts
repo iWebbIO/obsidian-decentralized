@@ -4,7 +4,10 @@ describe('isGenericDeviceName', () => {
     it('flags the factory default and empty names', () => {
         expect(isGenericDeviceName('My New Device')).toBe(true);
         expect(isGenericDeviceName('  ')).toBe(true);
-        expect(isGenericDeviceName('Phone')).toBe(false);
+        // Phone/Desktop are now generic too: they are the plugin's own fresh-install
+        // suggestions, and two phones in one household would both read "Phone".
+        expect(isGenericDeviceName('Phone')).toBe(true);
+        expect(isGenericDeviceName('Desktop')).toBe(true);
     });
 });
 

@@ -30,6 +30,20 @@ jobs:
     - name: Install dependencies
       run: npm ci
 
+    - name: Check release file version sync
+      # A PR that bumps one release file without the others passes CI silently; the
+      # community registry then has no mapping for the shipped version.
+      run: |
+        node -e "
+        const m = require('./manifest.json');
+        const pkg = require('./package.json');
+        const v = require('./versions.json');
+        const fail = (msg) => { console.error(msg); process.exit(1); };
+        if (m.version !== pkg.version) fail('manifest.json and package.json versions differ: ' + m.version + ' vs ' + pkg.version);
+        if (v[m.version] !== m.minAppVersion) fail('versions.json has no mapping for ' + m.version);
+        console.log('Release files in sync at ' + m.version);
+        "
+
     - name: Type-check
       run: npm run typecheck
 

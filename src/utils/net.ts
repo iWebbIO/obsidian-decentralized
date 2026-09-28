@@ -27,8 +27,11 @@ export function scoreLocalIpv4(entry: LocalIpv4): number {
 
     // Host-only / ICS ranges that are almost never the shared Wi-Fi.
     if (a === 192 && b === 168 && (c === 56 || c === 137 || c === 99)) score -= 30;
-    // Docker / WSL defaults sit in 172.16/12 and beat a real LAN if we only take the first NIC.
-    if (a === 172 && (b === 17 || b === 18 || b === 19 || b === 23 || b === 24 || b === 29)) score -= 15;
+    // Docker's default address pool draws from anywhere in 172.16-31; Linux bridges
+    // are named br-<hash> (not matched by the adapter regex), so the octet range is
+    // the only signal. Penalize the whole private 172.16/12 range: a genuine LAN
+    // there still scores above link-local, and 192.168/10.x LANs outrank it anyway.
+    if (a === 172 && b >= 16 && b <= 31) score -= 15;
     if (VIRTUAL_IFACE.test(entry.name)) score -= 40;
     return score;
 }

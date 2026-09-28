@@ -525,7 +525,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.networkChangeHandler = () => this.handleNetworkChange();
         window.addEventListener('online',  this.networkChangeHandler);
         window.addEventListener('offline', this.networkChangeHandler);
-        this.lanDiscovery.on('network-change', this.networkChangeHandler);
+
     }
 
     onunload() {
@@ -535,7 +535,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (this.networkChangeHandler) {
             window.removeEventListener('online',  this.networkChangeHandler);
             window.removeEventListener('offline', this.networkChangeHandler);
-            this.lanDiscovery.off('network-change', this.networkChangeHandler);
             this.networkChangeHandler = null;
         }
 

@@ -2,7 +2,10 @@ export const FACTORY_DEVICE_NAME = 'My New Device';
 
 export const FRIENDLY_NAME_HINT = 'Name must be 1–64 characters.';
 
-const GENERIC = new Set(['', 'my new device', 'device', 'my device', 'new device']);
+// 'phone' and 'desktop' are the plugin's OWN suggestions on fresh installs — two
+// phones in one household would both be "Phone" with no warning, exactly the case
+// the name-this-device prompt exists for.
+const GENERIC = new Set(['', 'my new device', 'device', 'my device', 'new device', 'phone', 'desktop']);
 
 export function isGenericDeviceName(name: string | undefined | null): boolean {
     return GENERIC.has((name ?? '').trim().toLowerCase());

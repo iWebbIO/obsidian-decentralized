@@ -1,5 +1,7 @@
 import { Notice } from 'obsidian';
 import { ILANDiscovery, PeerInfo, DiscoveryBeacon, DISCOVERY_PORT, DISCOVERY_MULTICAST_ADDRESS } from './types';
+import { sanitizePeerInfo } from './utils/pairing';
+import { PSK_PATTERN } from './utils/pairing';
 
 export class DummyLANDiscovery implements ILANDiscovery {
     on(event: string, listener: (...args: any[]) => void): this { return this; }
@@ -47,8 +49,10 @@ export class DesktopLANDiscovery implements ILANDiscovery {
         } else {
             this.startListening();
         }
-        // Forward the event so the plugin can respond (Phase 3.2)
-        this.emit('network-change');
+        // NOTE: the event is NOT forwarded. main.ts attaches its own window
+        // online/offline listeners, and forwarding made every OS network change run
+        // the handler twice back-to-back — for direct-ip, that restarted the
+        // just-armed reconnect on each event.
         this.isRestarting = false;
     };
 
@@ -152,7 +156,16 @@ export class DesktopLANDiscovery implements ILANDiscovery {
             try {
                 const data: DiscoveryBeacon = JSON.parse(msg.toString());
                 if (data.type === 'obsidian-decentralized-beacon' && data.peerInfo?.deviceId) {
-                    const peerId = data.peerInfo.deviceId;
+                    // The beacon's peerInfo is the one inbound peer source not run
+                    // through sanitizePeerInfo: its fields go straight into the UI
+                    // and (for a discovered host's port) into the join settings, so
+                    // a hostile or buggy peer on the LAN could steer them.
+                    const clean = sanitizePeerInfo(data.peerInfo);
+                    if (!clean) return;
+                    const pairingKey = typeof data.peerInfo.pairingKey === 'string' && PSK_PATTERN.test(data.peerInfo.pairingKey)
+                        ? data.peerInfo.pairingKey : undefined;
+
+                    const peerId = clean.deviceId;
                     if (this.myDeviceId && peerId === this.myDeviceId) return;
 
                     if (this.peerTimeouts.has(peerId)) {
@@ -161,15 +174,23 @@ export class DesktopLANDiscovery implements ILANDiscovery {
 
                     const prev = this.discoveredPeers.get(peerId);
                     const isNew = !prev;
-                    data.peerInfo.ip = rinfo.address;
-                    this.discoveredPeers.set(peerId, data.peerInfo);
-                    // Re-emit when the pairing key appears or disappears so a
-                    // nearby list that already showed this device can switch
-                    // from "open Connect on that device" to a real Connect tap.
-                    const pairingChanged = !!prev && prev.pairingKey !== data.peerInfo.pairingKey;
-                    if (isNew || pairingChanged) {
+                    const cur = { ...clean, ip: rinfo.address, pairingKey };
+                    this.discoveredPeers.set(peerId, cur);
+                    // Re-emit when anything a connection decision depends on changes —
+                    // not just the pairing key. A desktop that starts hosting after
+                    // this list opened re-broadcasts with mode/port filled in; without
+                    // the re-emit, the stale port-less copy kept the host out of the
+                    // Discovered Hosts list until the modal was reopened, and a DHCP
+                    // renew filled the join box with a dead address.
+                    const changed = !!prev && (
+                        prev.pairingKey !== cur.pairingKey
+                        || prev.port !== cur.port
+                        || prev.mode !== cur.mode
+                        || prev.ip !== cur.ip
+                    );
+                    if (isNew || changed) {
                         if (isNew) this.currentBroadcastIntervalMs = 2000;
-                        this.emit('discover', data.peerInfo);
+                        this.emit('discover', cur);
                     }
 
                     const timeout = setTimeout(() => {
@@ -216,7 +237,10 @@ export class DesktopLANDiscovery implements ILANDiscovery {
                     this.consecutiveErrors = 0;
                 }
             });
-            if (this.currentBroadcastIntervalMs < 5000) {
+            // Cap the ramp at 3 s: against the 15 s peer-expiry, a 5 s steady state
+            // tolerates only two lost multicast beacons (no MAC-layer retries) before
+            // a device flickers out of the Nearby list.
+            if (this.currentBroadcastIntervalMs < 3000) {
                 this.currentBroadcastIntervalMs += 1000;
             }
             this.broadcastTimer = setTimeout(sendBeacon, this.currentBroadcastIntervalMs) as any as number;
