@@ -294,9 +294,18 @@ export class DirectIpServer {
             this.pendingAuth.delete(socket);
             // Only remove the registration if it still belongs to THIS socket. A stale socket's
             // late close event must not evict a client that has already reconnected.
-            if (this.clients.get(deviceId)?.socket === socket) {
+            const stillOurs = this.clients.get(deviceId)?.socket === socket;
+            if (stillOurs) {
                 this.clients.delete(deviceId);
                 this.plugin.connections?.delete(deviceId);
+            }
+            // A replacement's late close (the old TCP peer gone without a FIN —
+            // suspend/resume, network change) arrives up to ~30 s after admit()
+            // retired it; by then the NEW link owns the locks and transfers, and
+            // purging them here deleted state belonging to the live connection.
+            if (!stillOurs) {
+                this.plugin.updateStatus();
+                return;
             }
             // Edit locks the joining device held do not survive its link.
             this.plugin.purgePeerLocks?.(deviceId);
@@ -384,7 +393,18 @@ export class DirectIpServer {
         if (!entry || entry.socket.readyState !== 1 /* OPEN */) return;
         entry.channel
             .send(data, frame => {
-                if (entry.socket.readyState === 1) entry.socket.send(frame);
+                if (entry.socket.readyState === 1) {
+                    entry.socket.send(frame);
+                    return;
+                }
+                // The entry was replaced while this frame was being sealed: the old
+                // socket is gone and the frame carries the OLD channel's keys, so it
+                // cannot simply be forwarded — re-send the original data through the
+                // new entry's channel instead of silently dropping it.
+                const current = this.clients.get(peerId);
+                if (current && current !== entry && current.socket.readyState === 1) {
+                    this.sendTo(peerId, data);
+                }
             })
             .catch(err => this.plugin.log(`DirectIpServer: Failed to send message to peer ${peerId}:`, err));
     }
@@ -605,18 +625,24 @@ export class DirectIpClient {
         // Events from a socket we have since replaced must not touch the current one's state.
         const isCurrent = () => this.ws === ws;
 
+        // Arm at CREATION, not at open: while CONNECTING the client had zero timers
+        // (the auth timeout below armed only on open) and triggerReconnect deliberately
+        // ignores state 0 — a TCP endpoint that accepts but never answers the
+        // upgrade left the ladder stopped on one stuck socket until the OS gave up.
+        // The body covers both cases: closing a CONNECTING socket fires onclose and
+        // resumes the ladder.
+        this.clearAuthTimeout();
+        this.authTimeout = window.setTimeout(() => {
+            this.authTimeout = null;
+            if (isCurrent() && !this.channel) ws.close();
+        }, AUTH_TIMEOUT_MS);
+
         ws.onopen = () => {
             if (!isCurrent()) return;
             if (this.reconnectTimeout !== null) {
                 clearTimeout(this.reconnectTimeout);
                 this.reconnectTimeout = null;
             }
-            // Wait for the host's challenge; something that never sends one is not our host.
-            this.clearAuthTimeout();
-            this.authTimeout = window.setTimeout(() => {
-                this.authTimeout = null;
-                if (isCurrent() && !this.channel) ws.close();
-            }, AUTH_TIMEOUT_MS);
             this.plugin.updateStatus({ text: 'Verifying the host…', icon: 'plug', spin: true, state: 'loading' });
         };
 
@@ -839,6 +865,12 @@ export class DirectIpClient {
         this.stopHeartbeat();
         this.clearAuthTimeout();
         this.drainSendBuffer('Client stopped');
+        // The socket's own onclose returns early once isStopped, and nulling this.ws
+        // below makes isCurrent false anyway — so the close-path cleanups never ran
+        // on purpose: the host's locks survived to expiry and any reassembly to the
+        // sweeper. Run them here.
+        this.plugin.purgePeerLocks?.('direct-ip-host');
+        this.plugin.settlePeerTransfers?.('direct-ip-host');
 
         if (this.reconnectTimeout !== null) {
             clearTimeout(this.reconnectTimeout);

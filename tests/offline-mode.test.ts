@@ -182,10 +182,10 @@ describe('authentication', () => {
 
         await waitFor(() => wsNetwork.clients[0].readyState === 3, { what: 'the old socket to close' });
         expect(server.getClients()).toEqual(['joining-device']);
-        // The dead socket's transfers are settled with it, like PeerJS does on close —
-        // a dropped download's reassembly no longer outlives its link.
-        await waitFor(() => (host.settlePeerTransfers as jest.Mock).mock.calls.some(([id]) => id === 'joining-device'),
-            { what: 'the old link transfers to be settled' });
+        // A REPLACEMENT's late close must not settle the new link's transfers (or
+        // purge its locks): the new socket owns them now. A genuine drop — the
+        // socket's own close with no replacement — settles, like PeerJS does.
+        expect((host.settlePeerTransfers as jest.Mock).mock.calls.some(([id]) => id === 'joining-device')).toBe(false);
         first.client.stop();
     });
 });
@@ -297,5 +297,33 @@ describe('two plugins in Offline Mode', () => {
 
         await host.vault.create('From host.md', 'hello from the host');
         await waitFor(() => join.vault.text('From host.md') === 'hello from the host', { what: 'the note to reach the joiner' });
+    });
+});
+
+describe('transport hardening (25/26/27)', () => {
+    test('a genuine drop settles that peer\'s transfers and locks', async () => {
+        const { server, plugin: host, port } = await startServer();
+        const { client } = startClient(port);
+        await waitFor(() => client.isOpen && server.hasClient('joining-device'), { what: 'the link to authenticate' });
+
+        // The socket dies with no replacement (the network vanished).
+        (server as any).clients.get('joining-device').socket.close(1006, 'abnormal');
+        await waitFor(() => (host.settlePeerTransfers as jest.Mock).mock.calls.some(([id]) => id === 'joining-device'),
+            { what: 'the dropped link\'s transfers to be settled' });
+        await waitFor(() => (host.purgePeerLocks as jest.Mock).mock.calls.some(([id]) => id === 'joining-device'),
+            { what: 'the dropped link\'s locks to be purged' });
+    });
+
+    test('stop() runs the close-path cleanups itself', async () => {
+        const { port } = await startServer();
+        const { client, plugin } = startClient(port);
+        await waitFor(() => client.isOpen, { what: 'the link to authenticate' });
+
+        client.stop();
+
+        await waitFor(() => (plugin.purgePeerLocks as jest.Mock).mock.calls.some(([id]) => id === 'direct-ip-host'),
+            { what: 'the host\'s locks to be purged on stop' });
+        await waitFor(() => (plugin.settlePeerTransfers as jest.Mock).mock.calls.some(([id]) => id === 'direct-ip-host'),
+            { what: 'the host\'s transfers to be settled on stop' });
     });
 });
