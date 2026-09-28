@@ -171,3 +171,114 @@ describe('chunked transfer defenses', () => {
         expect(plugin.activeTransfers.has('t-recent')).toBe(true);   // still resumable
     });
 });
+
+describe('full-sync state machine hardening', () => {
+    function fromA() {
+        return { peer: A, open: true, send: jest.fn() } as any;
+    }
+
+    test('sync-busy is honored only from the device being synced with', async () => {
+        // Any connected peer could abort an unrelated in-progress sync with one
+        // message — including the shared-queue wipe that came with it.
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        plugin.syncState.isSyncing = true;
+        plugin.syncState.peerId = A;
+
+        await plugin.processIncomingData({ type: 'sync-busy' }, { peer: 'device-cccc0003', open: true, send: jest.fn() });
+        expect(plugin.syncState.isSyncing).toBe(true);
+
+        await plugin.processIncomingData({ type: 'sync-busy' }, fromA());
+        expect(plugin.syncState.isSyncing).toBe(false);
+    });
+
+    test('a pull given up after 3 attempts is recorded and reported', async () => {
+        // The give-up used to leave no trace at all: the sync completed "cleanly"
+        // and the vaults silently diverged until a manual full sync.
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        Object.assign(plugin.syncState, {
+            isSyncing: true, peerId: A, currentPhase: 'TRANSFERRING',
+            pendingPulls: new Set(['stuck.md']),
+        });
+        plugin.syncState.activePullBatches = new Set(['b1']);
+        plugin.pullRetries.set('stuck.md', 3);
+
+        await plugin.handleBatchComplete({ type: 'batch-complete', batchId: 'b1', receivedPaths: [], failedPaths: ['stuck.md'] }, fromA());
+
+        const parked = plugin.failedSyncs.find((f: any) => f.path === 'stuck.md');
+        expect(parked).toMatchObject({ peerId: A, reason: 'Pull failed 3 times during sync' });
+        expect(plugin.syncState.pendingPulls.has('stuck.md')).toBe(false);
+        plugin.abortSync(undefined, { silent: true });
+    });
+
+    test('the responder sums its own pull bytes into bytesTotal', async () => {
+        // bytesTotal was only ever initialized on the initiator; the responder's
+        // progress readout divided by zero for the whole sync.
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        jest.spyOn(plugin, 'sendSyncMessage').mockResolvedValue(undefined);
+
+        await plugin.handleFullSyncRequest({
+            type: 'request-full-sync',
+            manifest: [{ type: 'file', path: 'from-a.md', mtime: 1000, size: 123 }],
+        }, fromA());
+
+        expect(plugin.syncState.bytesTotal).toBe(123);
+        plugin.abortSync(undefined, { silent: true });
+    });
+
+    test('completion waits until our own full-sync-complete is delivered', async () => {
+        // Tearing the sync down while the completion message was still retrying
+        // left the peer never learning "I will request nothing more" — it then
+        // burned its whole BATCH_TIMEOUT before erroring out.
+        const b = await createDevice(B);
+        const plugin: any = b.plugin;
+        let deliver: (() => void) | null = null;
+        const send = jest.spyOn(plugin, 'sendSyncMessage').mockImplementation(
+            () => new Promise<void>(resolve => { deliver = resolve; }));
+        Object.assign(plugin.syncState, {
+            isSyncing: true, peerId: A, pendingPulls: new Set(),
+            activeBatches: new Map(), activePullBatches: new Set(),
+        });
+        plugin.peerSyncComplete.set(A, true);
+
+        plugin.checkFullSyncCompletion(A);
+        expect(plugin.syncState.isSyncing).toBe(true);      // decided, not delivered
+
+        deliver!();
+        await new Promise(r => setTimeout(r, 20));
+        expect(plugin.syncState.isSyncing).toBe(false);    // delivered → completed
+        expect(send).toHaveBeenCalledWith(A, { type: 'full-sync-complete' });
+        send.mockRestore();
+    });
+
+    test('a batch item exhausting retries degrades per path, not by aborting the sync', async () => {
+        const b = await createDevice(B, { vault: (() => {
+            const v = new (require('./helpers/fake-vault').FakeVault)();
+            v.seed('note.md', 'x', 1000);
+            return v;
+        })() });
+        const plugin: any = b.plugin;
+        jest.spyOn(plugin, 'sendSyncMessage').mockResolvedValue(undefined);
+        jest.spyOn(plugin, 'sendPayloadTo').mockRejectedValue(new Error('Connection closed'));
+        Object.assign(plugin.syncState, {
+            isSyncing: true, peerId: A, currentPhase: 'TRANSFERRING',
+            pendingPulls: new Set(), activePullBatches: new Set(),
+        });
+        plugin.syncState.activeBatches.set('b1', {
+            peerId: A, batchId: 'b1', totalCount: 1, sentCount: 0, succeededPaths: [], failedPaths: [],
+        });
+
+        await plugin.processQueueItem({
+            peerId: A, retries: 3, priority: 100,
+            task: { taskType: 'send-file-batch', paths: ['note.md'], batchId: 'b1' },
+        });
+
+        // The sync survives; the batch is reported failed per path.
+        expect(plugin.syncState.isSyncing).toBe(true);
+        expect(plugin.syncState.activeBatches.has('b1')).toBe(false);
+        expect(plugin.failedSyncs.some((f: any) => f.path === 'note.md' && f.peerId === A)).toBe(true);
+        plugin.abortSync(undefined, { silent: true });
+    });
+});

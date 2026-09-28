@@ -176,3 +176,47 @@ describe('QueueManager', () => {
         expect(processCallback.mock.calls.map(c => c[0].id)).toEqual(['b', 'a']);
     });
 });
+
+describe('clearForPeer', () => {
+    test('drops only that peer\'s items; other peers and broadcasts survive', () => {
+        jest.useFakeTimers();
+        try {
+            const timeoutManager = new TimeoutManager();
+            const cb = jest.fn().mockResolvedValue(true);
+            const manager = new QueueManager(timeoutManager, cb);
+            manager.pause();
+            manager.addToQueue({ id: 'a1', peerId: 'A', retries: 0, priority: 1 });
+            manager.addToQueue({ id: 'a2', peerId: 'A', retries: 0, priority: 1 });
+            manager.addToQueue({ id: 'b1', peerId: 'B', retries: 0, priority: 1 });
+            manager.addToQueue({ id: 'any1', peerId: null, retries: 0, priority: 1 });
+
+            manager.clearForPeer('A');
+
+            const remaining = manager.getQueue().map(q => q.id).sort();
+            expect(remaining).toEqual(['any1', 'b1']);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    test('drops that peer\'s retry-parked items and does not resurrect them', async () => {
+        jest.useFakeTimers();
+        try {
+            const timeoutManager = new TimeoutManager();
+            const cb = jest.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+            const manager = new QueueManager(timeoutManager, cb);
+            manager.addToQueue({ id: 'a1', peerId: 'A', retries: 0, priority: 1 });
+            for (let i = 0; i < 10; i++) await Promise.resolve();   // fails → parked in backoff
+            expect(manager.getRetrying()).toBe(1);
+
+            manager.clearForPeer('A');
+            expect(manager.getRetrying()).toBe(0);
+
+            jest.advanceTimersByTime(5000);   // the parked retry timer fires…
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            expect(manager.getQueueSize()).toBe(0);   // …and resurrects nothing
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+});

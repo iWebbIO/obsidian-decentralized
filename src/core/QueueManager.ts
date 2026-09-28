@@ -125,6 +125,23 @@ export class QueueManager {
     }
 
     /**
+     * Drop only `peerId`'s pending work. The queue is shared by all traffic: clearing it
+     * wholesale on one sync's abort used to discard other peers' queued edits (and the
+     * persisted queue then recorded the loss). Broadcast items (peerId null) are not
+     * sync-scoped — they survive and re-target on processing.
+     */
+    public clearForPeer(peerId: string) {
+        this.epoch++;   // dropped items' pending retry timers must not resurrect them
+        this.syncQueue = this.syncQueue.filter(item => item.peerId !== peerId);
+        this.retryingItems = new Set([...this.retryingItems].filter(item => item.peerId !== peerId));
+        // Rebuild the dedup set from what remains (heap ids only — in-flight ids were
+        // released at pop time).
+        this.inQueueOrProcessing = new Set(
+            this.syncQueue.filter(item => item.id).map(item => item.id!)
+        );
+    }
+
+    /**
      * Permanently stop the queue (plugin unload). In-flight items may still settle, but their
      * retries are dropped and nothing new starts — a retry timer or a late addToQueue used to
      * restart processing inside a disabled plugin.

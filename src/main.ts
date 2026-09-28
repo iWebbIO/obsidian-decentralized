@@ -333,6 +333,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     
     // Pull-based Sync State
     private pullRetries: Map<string, number> = new Map();
+    /** Peers whose full-sync-complete we have actually DELIVERED (not merely decided):
+     *  completing the sync before our own completion message was on the wire left the
+     *  peer waiting out its whole BATCH_TIMEOUT when the send's retries then failed. */
+    private fullSyncCompleteDelivered: Set<string> = new Set();
     // Smallest-first pull order for the active sync plan, consumed via a cursor.
     private pullOrder: string[] = [];
     private pullCursor: number = 0;
@@ -1807,7 +1811,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.transitionToPhase(SyncPhase.ABORTING);
         this.syncState.isSyncing = false;
         this.currentSyncIsTwoDeviceMode = null;
-        this.queueManager.clear();
+        // Only this sync's items: the queue is shared by all traffic, and clearing it
+        // wholesale also discarded other peers' pending edits — then persisted the loss.
+        if (syncPeer) this.queueManager.clearForPeer(syncPeer);
+        else this.queueManager.clear();
+        this.fullSyncCompleteDelivered.clear();
         this.scheduleQueueSave();
         this.scheduleStateSave();
         // Only this sync's transfers. Clearing them all also discarded paused uploads to
@@ -2325,8 +2333,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const taskPath = item.task ? (item.task.taskType === 'send-rename' ? item.task.newPath : (item.task.taskType === 'send-file-batch' ? item.task.paths[0] : item.task.path)) : undefined;
                 const path = item.data?.path || taskPath || 'an item';
                 this.showNotice(`Could not transfer ${path}. Check the connection and try again.`, 'error', 8000);
-                if (this.syncState.isSyncing) this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, "Transfer failed permanently.", false, "Check peer connection."));
+                // A batch item's failure is per-path: aborting here killed the whole
+                // sync (and cleared its batch bookkeeping, so the finally below could
+                // not even report the batch) when the batch machinery exists precisely
+                // to degrade one path at a time.
+                const isBatchItem = !!(item.task && (item.task as any).batchId);
+                if (this.syncState.isSyncing && !isBatchItem) this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, "Transfer failed permanently.", false, "Check peer connection."));
                 
+                // A failed batch carries many paths but completes as ONE item; record
+                // every path it covered (they retry as individual file-updates).
+                if (item.data?.type === 'file-batch-binary' && item.task?.taskType === 'send-file-batch') {
+                    for (const path of item.task.paths) {
+                        if (!this.failedSyncs.some(f => f.path === path && f.peerId === item.peerId)) {
+                            this.failedSyncs.push({
+                                path, peerId: item.peerId, timestamp: Date.now(),
+                                type: 'file-update', reason: e.message, retryCount: 0,
+                            });
+                        }
+                    }
+                    this.scheduleStateSave();
+                }
                 if (item.data && (item.data.type === 'file-update' || item.data.type === 'file-delete' || item.data.type === 'file-delta')) {
                     // update/delta normalize to one record: a parked delta is retried
                     // via a full file-update, and the strict lookup used to file a
@@ -3094,7 +3120,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 case 'request-full-sync': await this.handleFullSyncRequest(data, conn!); break;
                 case 'sync-busy':
                     this.showNotice('The other device is already syncing. Try again in a moment.', 'important');
-                    if (this.syncState.isSyncing) {
+                    // Only the device we are actually syncing with may say so: any
+                    // connected peer used to be able to abort an unrelated in-progress
+                    // sync (and with it, the whole shared queue) with one message.
+                    if (this.syncState.isSyncing && this.syncState.peerId === conn?.peer) {
                         this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, 'The other device is already syncing.', true, 'Wait for it to finish, then try again.'));
                     }
                     break;
@@ -5118,6 +5147,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 
                 if (localItem && !remoteItem) {
                     if (localItem.type === 'file') {
+                        // Symmetric to the other direction: if the peer pruned its
+                        // tombstone for a file we still hold, our push resurrects the
+                        // deletion ON the peer — the warning covered only the reverse.
+                        if (now - localItem.mtime > retentionMs) peerPotentiallyStale = true;
                         filesReceiverWillSend.push(path);
                         fileSizes[path] = localItem.size;
                     }
@@ -5160,7 +5193,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
             
             if (peerPotentiallyStale) {
-                this.showNotice("The other device has been offline longer than this vault remembers deletions. Files you deleted here might reappear from that device.", 'warning', 15000);
+                this.showNotice("One vault has been offline longer than the other remembers deletions. A file deleted on either side more than that ago may reappear from the other. Raise tombstone retention if this matters.", 'warning', 15000);
             }
             
             this.log(`Sync plan: They pull ${filesReceiverWillSend.length}, I pull ${filesInitiatorMustSend.length}, They delete ${filesInitiatorMustDelete.length}, I delete ${filesReceiverMustDelete.length}`); 
@@ -5178,6 +5211,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
             this.syncState.allowedPulls = new Set(filesReceiverWillSend);
             this.syncState.pendingPulls = new Set(filesInitiatorMustSend);
+            // The responder's pull bytes were never summed: the progress readout
+            // divided by a bytesTotal of zero for the whole sync.
+            this.syncState.bytesTotal = filesInitiatorMustSend.reduce((sum, path) => sum + (this.peerFileSizes[path] || 0), 0);
             this.initPullOrder(this.syncState.pendingPulls);
             this.requestNextBatch(conn.peer);
             
@@ -5454,10 +5490,25 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     pending.delete(path);
                     this.pullRetries.delete(path);
                     this.log(`Failed to pull ${path} after 3 attempts. Giving up on this file.`);
+                    // A permanent give-up used to leave NO trace at all: the sync then
+                    // completed "cleanly" and the two vaults silently diverged until a
+                    // manual full sync re-diffed them. Park it so retryFailedSyncs owns
+                    // the recovery, and say so once.
+                    if (!this.failedSyncs.some(f => f.path === path && f.peerId === conn.peer)) {
+                        this.failedSyncs.push({
+                            path, peerId: conn.peer, timestamp: Date.now(),
+                            type: 'file-update', reason: 'Pull failed 3 times during sync', retryCount: 0,
+                        });
+                        this.scheduleStateSave();
+                    }
+                    this.showNotice(`Could not sync ${path} — it will retry automatically. If it keeps failing, run Force full sync.`, 'warning', 10000);
                 }
             }
             
-            if (data.failedPaths.length > 0) {
+            // Only an all-failed batch is network evidence: authorization refusals (a
+            // path that left this device's scope between plan and request) arrive as
+            // failedPaths too, and halving on them permanently throttled the sync.
+            if (data.failedPaths.length > 0 && data.receivedPaths.length === 0) {
                 this.syncState.adaptiveConfig.maxActiveBatches = Math.max(1, Math.floor(this.syncState.adaptiveConfig.maxActiveBatches / 2));
                 this.syncState.adaptiveConfig.filesPerBatch = Math.max(10, Math.floor(this.syncState.adaptiveConfig.filesPerBatch / 2));
                 this.log(`AdaptiveSync: Network issues detected (${data.failedPaths.length} failed). Decreasing limits to ${this.syncState.adaptiveConfig.maxActiveBatches} batches, ${this.syncState.adaptiveConfig.filesPerBatch} files/batch.`);
@@ -5565,10 +5616,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         if ((!pending || pending.size === 0) && !this.localSyncComplete.get(peerId)) {
             this.localSyncComplete.set(peerId, true);
-            this.sendSyncMessage(peerId, { type: 'full-sync-complete' }).catch(e => this.abortSync(e));
+            this.sendSyncMessage(peerId, { type: 'full-sync-complete' })
+                .then(() => {
+                    this.fullSyncCompleteDelivered.add(peerId);
+                    // Delivery may have been the last thing the sync was waiting on.
+                    this.checkFullSyncCompletion(peerId);
+                })
+                .catch(e => this.abortSync(e));
         }
 
-        if (this.localSyncComplete.get(peerId) && this.peerSyncComplete.get(peerId) && (!activeBatches || activeBatches.size === 0)) {
+        // "Delivered", not just "decided": tearing the sync down while our own
+        // completion message was still climbing its retry ladder left the peer
+        // holding a "he will request nothing more" that never arrived — it then
+        // burned its full BATCH_TIMEOUT before erroring out.
+        if (this.localSyncComplete.get(peerId) && this.fullSyncCompleteDelivered.has(peerId)
+            && this.peerSyncComplete.get(peerId) && (!activeBatches || activeBatches.size === 0)) {
             this.transitionToPhase(SyncPhase.COMPLETING);
             this.handleFullSyncComplete();
         }
